@@ -44,7 +44,9 @@ sudo systemctl edit inputplumber.service
 # Environment=IP_GYRO_GAIN_HANDLE=5
 ```
 
-> **⚠️ Steam Input reference** — see [steam-input-ref.png](steam-input-ref.png). **Don't forget to turn this setting off.**
+> **⚠️ Steam Input reference** — see the screenshot below. **Don't forget to turn this setting off.**
+>
+> ![steam-input-ref](steam-input-ref.png)
 
 ## Build from source
 
