@@ -19,6 +19,13 @@ INSTALLED_BINARY="$INSTALL_DIR/inputplumber-legiongo2-gyro-v4"
 OVERRIDE_DIR="/etc/systemd/system/inputplumber.service.d"
 OVERRIDE_FILE="$OVERRIDE_DIR/override.conf"
 
+# Composite device profile that routes the Legion Go 2 to the 'deck' (SteamDeck)
+# target. Without it the default Bazzite profile routes to 'xbox-elite', which
+# has NO gyroscope — so the controller must be emulated as a Steam Deck instead.
+PROFILE_DIR="/etc/inputplumber/devices.d"
+PROFILE_FILE="$PROFILE_DIR/50-legion_go_2.yaml"
+SOURCE_PROFILE="$BASE_DIR/50-legion_go_2.yaml"
+
 # Comfortable gyro gains, verified on Legion Go 2 / Bazzite (Fedora 44).
 # NOTE: the code default is 50.0 when the env var is unset — far too strong —
 # so this systemd override is REQUIRED for comfortable play.
@@ -36,6 +43,16 @@ echo "$INSTALLED_BINARY"
 
 sudo mkdir -p "$INSTALL_DIR"
 sudo install -m755 "$SOURCE_BINARY" "$INSTALLED_BINARY"
+
+if [[ -f "$SOURCE_PROFILE" ]]; then
+    echo "Installing composite device profile (Legion Go 2 -> 'deck' target, gyro-capable)..."
+    sudo mkdir -p "$PROFILE_DIR"
+    sudo install -m644 "$SOURCE_PROFILE" "$PROFILE_FILE"
+else
+    echo "WARNING: 50-legion_go_2.yaml not found next to install.sh."
+    echo "         The 'deck' (Steam Deck) routing was NOT installed —"
+    echo "         the controller may fall back to xbox-elite (no gyro)."
+fi
 
 echo "Writing systemd override with comfortable gyro gains..."
 
@@ -67,6 +84,8 @@ if [[ "$MAIN_PID" != "0" ]]; then
 fi
 
 echo "Gains: $(systemctl show inputplumber.service -p Environment --value)"
+
+echo "Composite device profile: $PROFILE_FILE"
 
 echo
 echo "Installation completed successfully."
