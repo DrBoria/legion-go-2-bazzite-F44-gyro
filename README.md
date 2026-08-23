@@ -26,22 +26,23 @@ sudo chmod +x /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v4
 sudo systemctl restart inputplumber
 ```
 
-### Settings
+### Settings (recommended)
 
-Gains are set via environment variables (per source):
+Gains are set per source via environment variables. **`install.sh` writes these automatically** to `/etc/systemd/system/inputplumber.service.d/override.conf` (with the correct `ExecStart`). The code default is `50.0` when unset — far too strong — so this override is required for comfortable play.
 
-| Variable | Controls | Default |
+| Variable | Controls | Recommended (set by install.sh) |
 |---|---|---|
 | `IP_GYRO_GAIN_CENTER` | central gyro gain | `3.0` |
 | `IP_GYRO_GAIN_HANDLE` | right-handle gyro gain | `5` |
 
-Example (systemd override):
+To tweak the values:
 
 ```bash
 sudo systemctl edit inputplumber.service
 # [Service]
-# Environment=IP_GYRO_GAIN_CENTER=5.0
+# Environment=IP_GYRO_GAIN_CENTER=3.0
 # Environment=IP_GYRO_GAIN_HANDLE=5
+sudo systemctl restart inputplumber
 ```
 
 > **⚠️ Steam Input reference** — see the screenshot below. **Don't forget to turn this setting off.**
