@@ -1,4 +1,4 @@
-л# legion-go-2-bazzite-F44-gyro
+# legion-go-2-bazzite-F44-gyro
 
 Gyroscope fix for the **Lenovo Legion Go 2** on **Bazzite (Fedora 44)**, based on a modified [InputPlumber](https://github.com/ShadowBlip/InputPlumber) build from source.
 
@@ -79,7 +79,7 @@ To fine-tune or reproduce the debugging, see [Agent.md](Agent.md) — it documen
 - `patches/inputplumber-legion-go-2-bazzite.patch` — the complete source patch (all changes vs upstream base)
 - `inputplumber-legiongo2-gyro` — prebuilt modified binary (Release asset: `inputplumber-legiongo2-gyro-v5.tar.gz`)
 - `50-legion_go_2.yaml` — composite device profile (routes the device to the `deck` target so it is seen as a Steam Deck with gyro)
-- `install.sh` — install / update script (binary + profile + gain override)
+- `install.sh` — install / update script (binary + profile + gain override + suspend/resume power fixes)
 - `Agent.md` — full debugging log: hypotheses, measurements, reproduction steps
 - `steam-input-ref.png` — Steam Input reference screenshot
 - `SOURCE_BASE_COMMIT` / `SOURCE_UPSTREAM` — exact upstream source used
