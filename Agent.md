@@ -558,3 +558,33 @@ Service state: `inputplumber.service` active, logs clean (only DEBUG dbus startu
 - Device stays "Lenovo Legion Go 2" (no rename to Steam Controller).
 - Byte map (hid_report.rs): pitch@30-31, yaw@32-33, roll@34-35. Chain: legion_go Vector3{x:pitch,y:roll,z:yaw} → steam_deck state.pitch←x, state.yaw←y, state.roll←z.
 - Gain is tunable at runtime via `IP_GYRO_GAIN_CENTER` / `IP_GYRO_GAIN_HANDLE` in the service Environment= (NO rebuild needed).
+
+### SUSPEND/WAKE BLOCKING DISCOVERY (2026-08-23 ~20:3x local) — vhci virtual Steam Controller blocks suspend, NOT our code
+SYMPTOM (user): system enters sleep ("сперва включается") then immediately wakes ("а потом сразу просыпается"); expected Steam Deck behavior (press → sleep, downloads continue, screen off).
+ROOT CAUSE (definitive, journalctl): InputPlumber's steam_deck target attaches a VIRTUAL Steam Controller (28de:1205) via `vhci_hcd`/usbip (`usbip::UsbIpDirection`, `vhci_hcd::load_vhci_hcd`). An ACTIVE usbip connection makes the kernel refuse suspend:
+    kernel: vhci_hcd vhci_hcd.0: We have 1 active connection. Do not suspend.
+    kernel: PM: Some devices failed to suspend, or early wake event detected
+    kernel: PM: failed to suspend devices: Device or resource busy  (error -16 / EBUSY)
+    systemd-sleep: Failed to put system to sleep. System resumed again: Device or resource busy
+→ suspend aborted at the vhci device → instant "wake". s2idle is the ONLY sleep state (same as Steam Deck) → NOT a C-states problem.
+FIX (built-in, present but DISABLED): `inputplumber-suspend.service` (rootfs/usr/lib/systemd/system/...) — WantedBy=sleep.target:
+    ExecStart=busctl call .../Manager org.shadowblip.InputManager HookSleep
+    ExecStop=busctl call .../Manager org.shadowblip.InputManager HookWake
+Full chain (verified in source): HookSleep → ManagerCommand::SystemSleep (manager.rs:474) → composite_device.suspend() → targets.handle_suspend() (targets.rs:539) → target.stop() → SteamDeckDevice::stop() (drops vhci connection) → 200ms sleep. HookWake → SystemWake → handle_resume() (targets.rs:582) → set_devices() recreates the virtual controller.
+
+### SUSPEND FIX APPLIED + VERIFIED (2026-08-23 ~20:32-20:35 local) — USER CONFIRMED: "супер, работает" ✅
+- `sudo systemctl enable --now inputplumber-suspend.service` → symlink /etc/systemd/system/sleep.target.wants/... (in /etc → PERSISTS across reboot). No rebuild needed.
+- HookSleep 20:33:00 → `Target devices before suspend: [keyboard, deck (Valve Steam Deck Controller), mouse]` → `Finished preparing suspending all target devices` (vhci virtual Steam Controller detached); HookWake 20:33:00 → `Preparing to resume all target devices` → CreateTargetDevice(deck) + AttachTargetDevice(gamepad0) → recreated.
+- USER TEST: real suspend → NO instant wake, sleep works like Steam Deck. CONFIRMED.
+- The suspend unit is a sleep hook (WantedBy=sleep.target), NOT a login service — do NOT add WantedBy=multi-user.target (would cause spurious HookSleep/HookWake at boot due to StopWhenUnneeded).
+
+### RESUME FIX (2026-08-24) — vhci Steam Controller NOT in Steam after wake → udev re-trigger on HookWake — USER CONFIRMED: "заебись, работает" ✅
+SYMPTOM (user): sleep+resume works (no instant wake after the suspend fix), but after wake the virtual Steam Deck controller (28de:1205, joysticks + touchpads) is MISSING from Steam ("нету в стиме джойстиков").
+ROOT CAUSE (definitive, source walk): the resume path re-creates the vhci controller but NEVER re-triggers udev. HookWake → ManagerCommand::SystemWake (manager.rs:496) → targets.handle_resume() (targets.rs:582) → set_devices() re-creates the virtual Steam Deck controller, BUT SystemWake does NOT re-trigger source/udev discovery. Steam ran through the whole suspend → only ever saw the OLD (destroyed) controller → never re-detects the re-created one.
+FIX (resume side ONLY — suspend side untouched): after HookWake, force a udev re-scan of the input/hidraw/iio nodes so Steam re-detects the re-created 28de:1205 controller:
+    udevadm trigger --subsystem-match=input --subsystem-match=hidraw --subsystem-match=iio
+  NO serial/device filter — the vhci controller's input nodes MUST be included for Steam to re-scan. (An earlier attempt with `--property-match=ID_SERIAL_SHORT=...` would EXCLUDE it → wrong.)
+  Applied live as an ExecStop override (user confirmed working), then baked into the SOURCE unit rootfs/usr/lib/systemd/system/inputplumber-suspend.service in this patch:
+    ExecStop=/bin/bash -c 'busctl call org.shadowblip.InputPlumber /org/shadowblip/InputPlumber/Manager org.shadowblip.InputManager HookWake; sleep 2; udevadm trigger --subsystem-match=input --subsystem-match=hidraw --subsystem-match=iio'
+  ExecStart/HookSleep (suspend side) is BYTE-IDENTICAL to upstream — sleep mechanism untouched.
+LESSON: any target DESTROYED on suspend and RECREATED on resume (like the vhci Steam Controller) needs a udev re-trigger on wake, otherwise clients that ran through suspend (Steam) never re-detect it.
