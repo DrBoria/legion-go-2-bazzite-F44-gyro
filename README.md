@@ -11,25 +11,26 @@ Upstream exposes a single gyro source and mixes the center/right sensors incorre
 
 ## Install (prebuilt binary)
 
-Download **`inputplumber-legiongo2-gyro-v4.tar.gz`** from the **Releases** page, extract it and run:
+Download **`inputplumber-legiongo2-gyro-v5.tar.gz`** from the **Releases** page, extract it and run:
 
 ```bash
-tar xzf inputplumber-legiongo2-gyro-v4.tar.gz
-./install.sh        # asks for sudo, installs binary + profile, restarts inputplumber
+tar xzf inputplumber-legiongo2-gyro-v5.tar.gz
+./install.sh        # asks for sudo, installs binary + profile + power fixes, restarts inputplumber
 ```
 
-`install.sh` installs **three** things:
+`install.sh` installs **four** things:
 
 1. the modified binary to `/opt/inputplumber-legiongo2-runtime/`;
 2. the composite device profile [`50-legion_go_2.yaml`](50-legion_go_2.yaml) to `/etc/inputplumber/devices.d/` — this routes the Legion Go 2 to the **`deck` (Steam Deck)** target, so Steam sees a gyro-capable controller instead of an Xbox Elite (which has no gyroscope);
-3. the systemd override with comfortable gains (see below).
+3. the systemd override with comfortable gains (see below);
+4. the suspend/resume power fix — enables `inputplumber-suspend.service` (so the device can sleep without waking from the controllers) and installs a drop-in that force-re-scans udev on wake so the virtual Steam Deck controller returns to Steam (see [Suspend / Resume fixes](#suspend--resume-fixes-included-in-this-patch)).
 
 Or manually:
 
 ```bash
 sudo mkdir -p /opt/inputplumber-legiongo2-runtime
-sudo cp inputplumber-legiongo2-gyro /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v4
-sudo chmod +x /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v4
+sudo cp inputplumber-legiongo2-gyro /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v5
+sudo chmod +x /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v5
 
 sudo mkdir -p /etc/inputplumber/devices.d
 sudo cp 50-legion_go_2.yaml /etc/inputplumber/devices.d/50-legion_go_2.yaml   # Steam Deck target routing
@@ -76,7 +77,7 @@ To fine-tune or reproduce the debugging, see [Agent.md](Agent.md) — it documen
 ## Repository contents
 
 - `patches/inputplumber-legion-go-2-bazzite.patch` — the complete source patch (all changes vs upstream base)
-- `inputplumber-legiongo2-gyro` — prebuilt modified binary (Release asset: `inputplumber-legiongo2-gyro-v4.tar.gz`)
+- `inputplumber-legiongo2-gyro` — prebuilt modified binary (Release asset: `inputplumber-legiongo2-gyro-v5.tar.gz`)
 - `50-legion_go_2.yaml` — composite device profile (routes the device to the `deck` target so it is seen as a Steam Deck with gyro)
 - `install.sh` — install / update script (binary + profile + gain override)
 - `Agent.md` — full debugging log: hypotheses, measurements, reproduction steps

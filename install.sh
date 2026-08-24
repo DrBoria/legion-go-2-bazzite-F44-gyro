@@ -69,8 +69,36 @@ echo "Reloading systemd and restarting InputPlumber..."
 sudo systemctl daemon-reload
 sudo systemctl restart inputplumber
 
+echo "Installing suspend/resume power fix (sleep + Steam re-detect after wake)..."
+
+# The virtual Steam Deck controller is attached over vhci_hcd/usbip. An active
+# usbip connection makes the kernel refuse suspend (vhci_hcd: We have 1 active
+# connection. Do not suspend.) -> instant wake. inputplumber-suspend.service
+# (WantedBy=sleep.target) drops the connection on sleep (ExecStart=HookSleep) and
+# re-creates it on wake (ExecStop=HookWake).
+#
+# On resume HookWake re-creates the controller (28de:1205) but does NOT re-trigger
+# udev, so Steam (which ran through suspend) never re-detects it. This drop-in
+# overrides the wake side (ExecStop only) to also force a udev re-scan of the
+# input/hidraw/iio nodes -> the controller returns to Steam after every wake.
+# The suspend side (ExecStart/HookSleep) is left untouched.
+SUSPEND_DROPIN_DIR="/etc/systemd/system/inputplumber-suspend.service.d"
+SUSPEND_DROPIN_FILE="$SUSPEND_DROPIN_DIR/resume-fix.conf"
+
+sudo mkdir -p "$SUSPEND_DROPIN_DIR"
+sudo tee "$SUSPEND_DROPIN_FILE" >/dev/null <<SYSTEMD
+[Service]
+ExecStop=
+ExecStop=/bin/bash -c 'busctl call org.shadowblip.InputPlumber /org/shadowblip/InputPlumber/Manager org.shadowblip.InputManager HookWake; sleep 2; udevadm trigger --subsystem-match=input --subsystem-match=hidraw --subsystem-match=iio'
+SYSTEMD
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now inputplumber-suspend.service
+
 echo
 echo "Service status: $(systemctl is-active inputplumber)"
+echo "Suspend hook (sleep fix): $(systemctl is-enabled inputplumber-suspend.service) / $(systemctl is-active inputplumber-suspend.service)"
+echo "Resume fix (Steam re-detect): $SUSPEND_DROPIN_FILE"
 
 MAIN_PID="$(
     systemctl show \
