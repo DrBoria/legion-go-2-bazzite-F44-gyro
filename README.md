@@ -11,7 +11,11 @@ Upstream exposes a single gyro source and mixes the center/right sensors incorre
 
 <div align="center">
 
-<big><strong>⚠️ STEAM INPUT REFERENCE — see the screenshot below. DON'T FORGET TO TURN THIS SETTING OFF.</strong></big>
+<big><strong>⚠️ STEAM INPUT REFERENCE — DON'T FORGET TO TURN THIS SETTING OFF.</strong></big>
+
+See the screenshot below:
+
+![Steam Input gyro — General / choose gyro button(s) — set to None (Gyro Always On)](steam-input-ref.png)
 
 </div>
 
