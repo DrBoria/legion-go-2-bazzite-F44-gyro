@@ -9,6 +9,17 @@ Gyroscope fix for the **Lenovo Legion Go 2** on **Bazzite (Fedora 44)**, based o
 
 Upstream exposes a single gyro source and mixes the center/right sensors incorrectly. This build makes the central gyro work when the controllers are attached and keeps only the right-handle gyro when they are detached.
 
+<div align="center">
+
+<big><strong>⚠️ STEAM INPUT REFERENCE — see the screenshot below. DON'T FORGET TO TURN THIS SETTING OFF.</strong></big>
+
+</div>
+
+1. Open the Steam overlay → **Gyro Behavior**.
+2. On the right side there is a dropdown and a gear icon; click the **gear icon** (it is located above the gyro sensitivity slider).
+3. At the very top where it says **GENERAL** there will be **"choose gyro button(s)"**; click it and set it to **None (Gyro Always On)**.
+4. **Reason:** by default the gyro is only enabled while a specific button is held (like Push-to-Talk), so without this change the gyro appears dead.
+
 ## Install (prebuilt binary)
 
 Download **`inputplumber-legiongo2-gyro-v5.tar.gz`** from the **Releases** page, extract it and run:
@@ -113,12 +124,23 @@ sudo systemctl enable --now inputplumber-suspend.service
 
 The suspend side (`ExecStart`/`HookSleep`) is left byte-identical to upstream.
 
-### 2. Resume fix — joysticks / touchpads return to Steam after wake
+### 2. Resume fix — the virtual Steam Controller actually returns to Steam after wake
 
-On resume `HookWake` re-creates the virtual Steam Deck controller (28de:1205) but did **not** re-trigger udev, so Steam (which ran through the whole suspend) never re-detected it — the controller was missing from Steam until a manual restart. This patch bakes a udev re-scan into the hook's `ExecStop` (resume side only):
+**Problem — the root cause.** After suspend → resume, the virtual Steam Controller (`deck`, exposed via vhci) was torn down and re-created repeatedly ("churn"). The `poll()` function in `src/input/target/steam_deck.rs` unconditionally created a new `VirtualUSBDevice` and overwrote the stored device **without stopping the old one**, leaving an orphaned vhci device behind. Steam could never finish registering it, so after detach/re-attach or resume, Steam showed **no controller** at all.
 
-```ini
-ExecStop=/bin/bash -c 'busctl call org.shadowblip.InputPlumber /org/shadowblip/InputPlumber/Manager org.shadowblip.InputManager HookWake; sleep 2; udevadm trigger --subsystem-match=input --subsystem-match=hidraw --subsystem-match=iio'
+**Fix.** `poll()` now **reuses the existing virtual device** when a new config arrives during a re-attach, instead of spawning a second vhci device. This stops the churn so Steam can finish registering the controller, and it reliably returns after wake.
+
+> **Included in:** the binary named **`inputplumber-legiongo2-gyro-v4.resumefix`**.
+
+**Controller name note.** After updating Bazzite to **44.20260831**, the controller appears in Steam as **"Steam Deck Controller"** (instead of the older identifier). This is expected — it is still the same `deck` target exposed over vhci.
+
+### 3. Steam virtual gamepad registry — IMU not initialized (dead gyro)
+
+If Steam registers the `deck` controller **without initializing its IMU**, the gyro is dead and the Steam sensitivity sliders sit at **0**.
+
+- File: `~/.local/share/Steam/config/virtualgamepadinfo.txt`
+- **Fix:** close Steam completely, delete that file, then start Steam so the controller re-registers **with the IMU initialized**:
+
+```bash
+rm -f ~/.local/share/Steam/config/virtualgamepadinfo.txt
 ```
-
-The unfiltered `udevadm trigger` (no serial filter) ensures the re-created vhci controller's `input` nodes are re-scanned so Steam re-detects it after every wake. See [`Agent.md`](Agent.md) for the full investigation and reproduction steps.
