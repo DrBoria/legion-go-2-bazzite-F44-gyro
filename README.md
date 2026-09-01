@@ -26,10 +26,10 @@ See the screenshot below:
 
 ## Install (prebuilt binary)
 
-Download **`inputplumber-legiongo2-gyro-v6.tar.gz`** from the **Releases** page, extract it and run:
+Download **`inputplumber-legiongo2-gyro-v7.tar.gz`** from the **Releases** page, extract it and run:
 
 ```bash
-tar xzf inputplumber-legiongo2-gyro-v6.tar.gz
+tar xzf inputplumber-legiongo2-gyro-v7.tar.gz
 ./install.sh        # asks for sudo, installs binary + profile + power fixes + auto gyro-reset unit, restarts inputplumber
 ```
 
@@ -45,8 +45,8 @@ Or manually:
 
 ```bash
 sudo mkdir -p /opt/inputplumber-legiongo2-runtime
-sudo cp inputplumber-legiongo2-gyro /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v6
-sudo chmod +x /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v6
+sudo cp inputplumber-legiongo2-gyro /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v7
+sudo chmod +x /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v7
 
 sudo mkdir -p /etc/inputplumber/devices.d
 sudo cp 50-legion_go_2.yaml /etc/inputplumber/devices.d/50-legion_go_2.yaml   # Steam Deck target routing
@@ -88,7 +88,7 @@ To fine-tune or reproduce the debugging, see [Agent.md](Agent.md) — it documen
 ## Repository contents
 
 - `patches/inputplumber-legion-go-2-bazzite.patch` — the complete source patch (all changes vs upstream base)
-- `inputplumber-legiongo2-gyro` — prebuilt modified binary (Release asset: `inputplumber-legiongo2-gyro-v6.tar.gz`)
+- `inputplumber-legiongo2-gyro` — prebuilt modified binary (Release asset: `inputplumber-legiongo2-gyro-v7.tar.gz`)
 - `50-legion_go_2.yaml` — composite device profile (routes the device to the `deck` target so it is seen as a Steam Deck with gyro)
 - `install.sh` — install / update script (binary + profile + gain override + suspend/resume power fixes + boot-time Steam gyro auto-reset unit)
 - `steam-deck-uhid-gyro-reset.service` — oneshot unit that clears Steam's virtual gamepad registry at boot (installed & enabled by install.sh) so the deck controller re-registers with IMU/gyro initialized after Bazzite updates
