@@ -26,10 +26,10 @@ See the screenshot below:
 
 ## Install (prebuilt binary)
 
-Download **`inputplumber-legiongo2-gyro-v5.tar.gz`** from the **Releases** page, extract it and run:
+Download **`inputplumber-legiongo2-gyro-v6.tar.gz`** from the **Releases** page, extract it and run:
 
 ```bash
-tar xzf inputplumber-legiongo2-gyro-v5.tar.gz
+tar xzf inputplumber-legiongo2-gyro-v6.tar.gz
 ./install.sh        # asks for sudo, installs binary + profile + power fixes, restarts inputplumber
 ```
 
@@ -44,8 +44,8 @@ Or manually:
 
 ```bash
 sudo mkdir -p /opt/inputplumber-legiongo2-runtime
-sudo cp inputplumber-legiongo2-gyro /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v5
-sudo chmod +x /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v5
+sudo cp inputplumber-legiongo2-gyro /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v6
+sudo chmod +x /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v6
 
 sudo mkdir -p /etc/inputplumber/devices.d
 sudo cp 50-legion_go_2.yaml /etc/inputplumber/devices.d/50-legion_go_2.yaml   # Steam Deck target routing
@@ -87,7 +87,7 @@ To fine-tune or reproduce the debugging, see [Agent.md](Agent.md) — it documen
 ## Repository contents
 
 - `patches/inputplumber-legion-go-2-bazzite.patch` — the complete source patch (all changes vs upstream base)
-- `inputplumber-legiongo2-gyro` — prebuilt modified binary (Release asset: `inputplumber-legiongo2-gyro-v5.tar.gz`)
+- `inputplumber-legiongo2-gyro` — prebuilt modified binary (Release asset: `inputplumber-legiongo2-gyro-v6.tar.gz`)
 - `50-legion_go_2.yaml` — composite device profile (routes the device to the `deck` target so it is seen as a Steam Deck with gyro)
 - `install.sh` — install / update script (binary + profile + gain override + suspend/resume power fixes)
 - `Agent.md` — full debugging log: hypotheses, measurements, reproduction steps
@@ -129,7 +129,7 @@ The suspend side (`ExecStart`/`HookSleep`) is left byte-identical to upstream.
 
 **Fix.** `poll()` now **reuses the existing virtual device** when a new config arrives during a re-attach, instead of spawning a second vhci device. This stops the churn so Steam can finish registering the controller, and it reliably returns after wake.
 
-> **Included in:** the binary named **`inputplumber-legiongo2-gyro-v4.resumefix`**.
+> **Included in:** the **v6 release** binary — shipped as `inputplumber-legiongo2-gyro` in the tarball, installed as `inputplumber-legiongo2-gyro-v6`.
 
 **Controller name note.** After updating Bazzite to **44.20260831**, the controller appears in Steam as **"Steam Deck Controller"** (instead of the older identifier). This is expected — it is still the same `deck` target exposed over vhci.
 

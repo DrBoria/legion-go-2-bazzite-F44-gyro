@@ -14,7 +14,7 @@ BASE_DIR="$(
 SOURCE_BINARY="$BASE_DIR/inputplumber-legiongo2-gyro"
 
 INSTALL_DIR="/opt/inputplumber-legiongo2-runtime"
-INSTALLED_BINARY="$INSTALL_DIR/inputplumber-legiongo2-gyro-v4"
+INSTALLED_BINARY="$INSTALL_DIR/inputplumber-legiongo2-gyro-v6"
 
 OVERRIDE_DIR="/etc/systemd/system/inputplumber.service.d"
 OVERRIDE_FILE="$OVERRIDE_DIR/override.conf"
