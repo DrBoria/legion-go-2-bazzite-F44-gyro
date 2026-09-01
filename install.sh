@@ -95,10 +95,39 @@ SYSTEMD
 sudo systemctl daemon-reload
 sudo systemctl enable --now inputplumber-suspend.service
 
+echo "Installing Steam deck controller IMU/gyro auto-reset unit..."
+
+# After a Bazzite (bootc/rpm-ostree) update, Steam can re-register the virtual
+# Steam Deck controller WITHOUT initializing its IMU, leaving a stale entry in
+# ~/.local/share/Steam/config/virtualgamepadinfo.txt -> dead gyro (sensitivity
+# sliders stuck at 0) and the controller shows as "SteamOS Handheld Controller"
+# instead of "Steam Deck Controller". This oneshot unit deletes that file
+# (idempotent `rm -f`) at boot, before the graphical session / Steam starts, so
+# Steam re-registers the controller WITH the IMU initialized on next launch.
+#
+# This script refuses to run as root (see top), so the invoking user is the real
+# desktop user. Use `id -un` (not $USER, which can be stale) to resolve it.
+STEAM_USER="$(id -un)"
+UNIT_FILE="/etc/systemd/system/steam-deck-uhid-gyro-reset.service"
+
+if [[ -f "$BASE_DIR/steam-deck-uhid-gyro-reset.service" ]]; then
+    echo "Writing unit with User=$STEAM_USER and path /home/$STEAM_USER/..."
+    sed "s/__STEAM_USER__/$STEAM_USER/g" "$BASE_DIR/steam-deck-uhid-gyro-reset.service" \
+        | sudo tee "$UNIT_FILE" >/dev/null
+    sudo chmod 644 "$UNIT_FILE"
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now steam-deck-uhid-gyro-reset.service
+else
+    echo "WARNING: steam-deck-uhid-gyro-reset.service not found next to install.sh."
+    echo "         The boot-time Steam gyro auto-reset was NOT installed."
+fi
+
 echo
 echo "Service status: $(systemctl is-active inputplumber)"
 echo "Suspend hook (sleep fix): $(systemctl is-enabled inputplumber-suspend.service) / $(systemctl is-active inputplumber-suspend.service)"
 echo "Resume fix (Steam re-detect): $SUSPEND_DROPIN_FILE"
+echo "Auto gyro reset (Steam registry cleared at boot): $(systemctl is-enabled steam-deck-uhid-gyro-reset.service) / $(systemctl is-active steam-deck-uhid-gyro-reset.service)"
 
 MAIN_PID="$(
     systemctl show \

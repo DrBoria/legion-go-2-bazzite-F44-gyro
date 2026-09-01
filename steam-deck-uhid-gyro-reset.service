@@ -1,0 +1,32 @@
+[Unit]
+# Clears Steam's virtual gamepad registry at boot so Steam re-registers the
+# virtual Steam Deck controller WITH its IMU/gyro initialized on next launch.
+#
+# WHY: after a Bazzite (bootc/rpm-ostree) update, Steam can re-register the
+# virtual Steam Deck controller WITHOUT initializing its IMU, leaving a stale
+# entry in ~/.local/share/Steam/config/virtualgamepadinfo.txt -> dead gyro
+# (Steam sensitivity sliders stuck at 0) and the controller shows as "SteamOS
+# Handheld Controller" instead of "Steam Deck Controller". Deleting that file
+# forces Steam to re-register the controller WITH the IMU initialized.
+#
+# Safe & idempotent: `rm -f` is a no-op when the file is already gone, and the
+# unit only ever runs at boot, before the graphical session / Steam starts, so
+# it can never clobber Steam's live state.
+#
+# install.sh substitutes the real desktop user name below — used both in User=
+# and in the /home/<user>/ path — e.g. User=legion and /home/legion/... .
+Description=Clear Steam virtual gamepad registry (re-init deck controller gyro/IMU)
+# Run before the graphical session starts. Steam lives inside the desktop/gaming
+# session on Bazzite/Kinoite, so completing before graphical.target is enough —
+# there is no Steam systemd unit to order against and nothing to require.
+Before=graphical.target
+
+[Service]
+Type=oneshot
+# Run as the real desktop user so the correct /home/<user> path is removed.
+User=__STEAM_USER__
+# Idempotent: rm -f tolerates a missing file and exits 0 either way.
+ExecStart=/usr/bin/rm -f /home/__STEAM_USER__/.local/share/Steam/config/virtualgamepadinfo.txt
+
+[Install]
+WantedBy=multi-user.target

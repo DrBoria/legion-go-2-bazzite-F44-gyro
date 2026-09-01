@@ -30,15 +30,16 @@ Download **`inputplumber-legiongo2-gyro-v6.tar.gz`** from the **Releases** page,
 
 ```bash
 tar xzf inputplumber-legiongo2-gyro-v6.tar.gz
-./install.sh        # asks for sudo, installs binary + profile + power fixes, restarts inputplumber
+./install.sh        # asks for sudo, installs binary + profile + power fixes + auto gyro-reset unit, restarts inputplumber
 ```
 
-`install.sh` installs **four** things:
+`install.sh` installs **five** things:
 
 1. the modified binary to `/opt/inputplumber-legiongo2-runtime/`;
 2. the composite device profile [`50-legion_go_2.yaml`](50-legion_go_2.yaml) to `/etc/inputplumber/devices.d/` — this routes the Legion Go 2 to the **`deck` (Steam Deck)** target, so Steam sees a gyro-capable controller instead of an Xbox Elite (which has no gyroscope);
 3. the systemd override with comfortable gains (see below);
-4. the suspend/resume power fix — enables `inputplumber-suspend.service` (so the device can sleep without waking from the controllers) and installs a drop-in that force-re-scans udev on wake so the virtual Steam Deck controller returns to Steam (see [Suspend / Resume fixes](#suspend--resume-fixes-included-in-this-patch)).
+4. the suspend/resume power fix — enables `inputplumber-suspend.service` (so the device can sleep without waking from the controllers) and installs a drop-in that force-re-scans udev on wake so the virtual Steam Deck controller returns to Steam (see [Suspend / Resume fixes](#suspend--resume-fixes-included-in-this-patch));
+5. the boot-time auto-reset unit [`steam-deck-uhid-gyro-reset.service`](steam-deck-uhid-gyro-reset.service) — clears Steam's virtual gamepad registry before Steam starts so the virtual Steam Deck controller re-registers **with its IMU/gyro initialized** after Bazzite updates (see [Auto-reset after updates](#4-auto-reset-after-updates-installed-by-installsh)).
 
 Or manually:
 
@@ -89,7 +90,8 @@ To fine-tune or reproduce the debugging, see [Agent.md](Agent.md) — it documen
 - `patches/inputplumber-legion-go-2-bazzite.patch` — the complete source patch (all changes vs upstream base)
 - `inputplumber-legiongo2-gyro` — prebuilt modified binary (Release asset: `inputplumber-legiongo2-gyro-v6.tar.gz`)
 - `50-legion_go_2.yaml` — composite device profile (routes the device to the `deck` target so it is seen as a Steam Deck with gyro)
-- `install.sh` — install / update script (binary + profile + gain override + suspend/resume power fixes)
+- `install.sh` — install / update script (binary + profile + gain override + suspend/resume power fixes + boot-time Steam gyro auto-reset unit)
+- `steam-deck-uhid-gyro-reset.service` — oneshot unit that clears Steam's virtual gamepad registry at boot (installed & enabled by install.sh) so the deck controller re-registers with IMU/gyro initialized after Bazzite updates
 - `Agent.md` — full debugging log: hypotheses, measurements, reproduction steps
 - `steam-input-ref.png` — Steam Input reference screenshot
 - `SOURCE_BASE_COMMIT` / `SOURCE_UPSTREAM` — exact upstream source used
@@ -143,3 +145,17 @@ If Steam registers the `deck` controller **without initializing its IMU**, the g
 ```bash
 rm -f ~/.local/share/Steam/config/virtualgamepadinfo.txt
 ```
+
+### 4. Auto-reset after updates (installed by install.sh)
+
+A Bazzite (bootc/rpm-ostree) update can make Steam re-register the virtual Steam Deck controller **without initializing its IMU** — the same dead-gyro symptom as [section 3](#3-steam-virtual-gamepad-registry--imu-not-initialized-dead-gyro), but triggered automatically by the update instead of by a suspend/resume cycle.
+
+**install.sh** installs a small oneshot systemd unit, [`steam-deck-uhid-gyro-reset.service`](steam-deck-uhid-gyro-reset.service), that runs at every boot **before the graphical session / Steam starts**. It runs as the real desktop user and simply deletes Steam's virtual gamepad registry entry:
+
+```bash
+rm -f ~/.local/share/Steam/config/virtualgamepadinfo.txt
+```
+
+Deleting a missing file is a no-op (`rm -f`), so the unit is safe and idempotent — when there is no stale entry it just exits. If an update left a stale entry (gyro dead / sliders stuck at 0 / controller shown as **"SteamOS Handheld Controller"** instead of **"Steam Deck Controller"**), the file is already gone by the time Steam starts, so Steam re-registers the controller **with the IMU initialized** and the gyro works.
+
+The unit is enabled automatically by install.sh (`systemctl enable --now steam-deck-uhid-gyro-reset.service`) — no action is needed after updates.
