@@ -16,6 +16,21 @@ that, after the fact, we can tell whether:
   * InputPlumber / gamescope / sessions change   -> "STARTUP" / "SESSION" lines
   * devices are (re)created on mode switches     -> "UDEV DEVADD/DEVREM" lines
 
+v2 (what v1 could NOT see — where the gaming-mode chain actually breaks):
+  * raw reports from the PHYSICAL Legion source -> "HID LEGION-SRC@1.2 ..." lines
+    (17EF:61EB hidraw: the input InputPlumber reads from the controller)
+  * raw reports INTO the virtual deck controller -> "HIDFLOW DECK-GAME ..." lines
+    (28DE:12F0 gaming / 28DE:12FB stale / 28DE:1205 desktop: what Steam really
+    receives, incl. decoded gyro pitch/yaw/roll at bytes 30-35)
+  * per-second liveness + FLOW STOP/RESUME        -> "HIDFLOW / FLOW" lines
+    (the exact second a source goes quiet while its device is still present)
+  * mode / attach-detach transitions             -> "STATE mode=..." lines
+    (desktop <-> gaming switch, controller attach/detach, extra kernel X-Box pad)
+  * InputPlumber's own journal                   -> "IPJ:" lines
+    (source hidraw opens, gyro calibration, attach/errors)
+  * Steam's virtual-gamepad registry + log       -> "STEAM:" lines
+    (did Steam register the FULL 12f0 controller with IMU, or a stale 12fb)
+
 Runs as root via ip-gyro-logger.service so it can read /dev/input/* and
 /sys/bus/iio. Pure Python 3 standard library — no dependencies, no rebuild.
 
@@ -108,6 +123,40 @@ IIO_DIR = "/sys/bus/iio/devices"
 IIO_RAW_GYRO_RE = re.compile(r"^in_(anglvel|gyro)(_[xyz])?_raw$")
 IIO_RAW_ACCEL_RE = re.compile(r"^in_accel(_[xyz])?_raw$")
 
+# v2 — new capture channels and their throttle cadences
+HID_FLOW_INTERVAL = 1.0     # per-device hidraw liveness summary (once/sec)
+HID_RAW_SAMPLE = 5.0        # full-report hex sample cadence per hidraw
+FLOW_STOP_AFTER = 2.0       # silence after data -> log FLOW STOP
+FLOW_NEVER_AFTER = 10.0     # attached but never delivered -> FLOW STOP
+FLOW_STOP_HB = 20.0         # re-assert a long-standing FLOW STOP only this often
+STEAM_SCAN_INTERVAL = 5.0   # Steam registry / controller-log diff cadence
+STEAM_TAIL_BYTES = 262144   # max controller.txt bytes considered per scan
+IPJ_BACKLOG_LINES = 150     # journalctl -u inputplumber -n backlog at startup
+IPJ_MAX_LINES_S = 25        # InputPlumber journal flood gate (lines/sec)
+IPJ_RE = re.compile(
+    r"(attach|detach|disconnect|connect|composite|source|target|grab|release|"
+    r"hidraw|gyro|calib|CEN-|12f0|12fb|1205|61eb|17ef|28de|deck|uhid|vhci|"
+    r"error|fail|panic|warn|exception|open|close|spawn|kill|session)",
+    re.IGNORECASE,
+)
+CTL_RE = re.compile(
+    r"(12f0|12fb|28de|1205|steam deck|steam controller|imu|gyro|haptic|"
+    r"register|error|fail)", re.IGNORECASE)
+
+HIDRAW_DIR = "/sys/class/hidraw"
+# hidraw pids we watch -> human label (physical source + virtual deck devices)
+WATCH_PIDS = {
+    0x61EB: "LEGION-SRC",   # physical Legion Go 2 composite HID = InputPlumber input
+    0x12F0: "DECK-GAME",    # virtual Steam Deck controller, GAMING mode (uhid)
+    0x12FB: "DECK-12FB",    # stale 12fb form — Steam maps it to A/B only (dead gyro)
+    0x1205: "DECK-DESK",    # virtual Steam Controller, DESKTOP mode (vhci)
+}
+DECK_PIDS = (0x12F0, 0x12FB, 0x1205)
+# readlink of /sys/class/hidraw/hidrawN -> ".../0003:VID:PID.XXXX/hidraw/hidrawN"
+HIDPATH_RE = re.compile(r"0003:([0-9A-Fa-f]{4}):([0-9A-Fa-f]{4})")
+# USB interface segment inside the sysfs path, e.g. "3-1:1.2/" -> iface 2
+USBIFACE_RE = re.compile(r":1\.([0-9]+)/")
+
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
@@ -128,6 +177,13 @@ EV_OPEN_ERR = {}
 IIO_LAST_ACTIVE = {}
 IIO_LAST_IDLE = {}
 IIO_DEVICES = []
+
+# v2 — hidraw / Steam / InputPlumber journal state
+HID_DEVICES = {}            # hidraw node -> {fd,path,label,vid,pid,iface,...}
+HID_OPEN_ERR = {}           # /dev/hidrawN -> last open-error time (anti-spam)
+STEAM_CACHE = {}            # steam file path -> {reg_sig / ctl_pos / ...}
+IPJ_FLOOD = [0.0, 0]        # InputPlumber journal flood gate [window, lines]
+LAST_STATE = None           # last computed mode/attach signature (for diffs)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -590,6 +646,499 @@ def _process_event(name, etype, code, value, entry, now):
     # EV_SYN (0x00) and everything else are intentionally ignored.
 
 # ---------------------------------------------------------------------------
+# v2 — hidraw monitor
+# ---------------------------------------------------------------------------
+# v1 could only see /dev/input (evdev) + IIO. In GAMING mode the deck
+# controller (28DE:12F0, uhid) has NO /dev/input node, so the very reports
+# Steam receives were invisible — and so was the raw input InputPlumber reads
+# from the physical Legion (17EF:61EB). v2 opens those hidraw nodes directly:
+#   LEGION-SRC = physical 17EF:61EB  -> raw reports InputPlumber consumes
+#   DECK-GAME  = virtual 28DE:12F0   -> what Steam sees in gaming mode
+#   DECK-12FB  = virtual 28DE:12FB   -> stale form (only A/B, no gyro)
+#   DECK-DESK  = virtual 28DE:1205   -> what Steam sees on desktop
+# hidraw fans each report out to EVERY open reader, so reading alongside
+# InputPlumber/Steam is passive — we never steal or acknowledge their reports.
+
+def _readlink(path):
+    try:
+        return os.readlink(path)
+    except Exception:
+        return ""
+
+def discover_hidraws():
+    """Return watched hidraw entries parsed from /sys/class/hidraw/*."""
+    found = {}
+    try:
+        nodes = sorted(os.listdir(HIDRAW_DIR))
+    except Exception as e:
+        log(f"HID: cannot list {HIDRAW_DIR}: {e}")
+        return found
+    for node in nodes:
+        if not node.startswith("hidraw"):
+            continue
+        target = _readlink(os.path.join(HIDRAW_DIR, node))
+        m = HIDPATH_RE.search(target)
+        if not m:
+            continue
+        vid = int(m.group(1), 16)
+        pid = int(m.group(2), 16)
+        if vid not in (0x17EF, 0x28DE) or pid not in WATCH_PIDS:
+            continue
+        iface = None
+        mi = USBIFACE_RE.search(target)
+        if mi:
+            iface = int(mi.group(1))
+        found[node] = {
+            "node": node, "path": "/dev/" + node,
+            "vid": vid, "pid": pid, "iface": iface,
+            "label": WATCH_PIDS[pid],
+            "syspath": target.split("/hidraw/")[0] if "/hidraw/" in target else target,
+        }
+    return found
+
+def _hid_label(e):
+    lbl = e["label"]
+    if e.get("iface") is not None:
+        lbl += f"@1.{e['iface']}"
+    return lbl
+
+def _drop_hid(node):
+    try:
+        os.close(HID_DEVICES[node]["fd"])
+    except Exception:
+        pass
+    HID_DEVICES.pop(node, None)
+
+def scan_hidraw():
+    """Open watched hidraw nodes as they appear; close them when gone.
+    Returns the current discovery so callers can reuse it (state tracker)."""
+    now = time.monotonic()
+    found = discover_hidraws()
+    for node, info in found.items():
+        if node in HID_DEVICES:
+            continue
+        path = info["path"]
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as e:
+            if now - HID_OPEN_ERR.get(path, 0.0) >= 30.0:
+                log(f"HID: cannot open {path}: {e}")
+                HID_OPEN_ERR[path] = now
+            continue
+        HID_OPEN_ERR.pop(path, None)
+        HID_DEVICES[node] = {
+            **info, "fd": fd, "buf": bytearray(),
+            "last_data": None, "count": 0, "nbytes": 0, "last_len": 0,
+            "last_hex": "", "last_dec": {}, "last_raw": 0.0,
+            "stopped": False, "stopped_at": 0.0, "never_logged_stop": True,
+            "first_attach": now, "frames_seen": {},
+        }
+        log(f"HID: capturing {path} ({_hid_label(HID_DEVICES[node])} "
+            f"vid={info['vid']:04X} pid={info['pid']:04X})")
+    for node in list(HID_DEVICES.keys()):
+        if node not in found:
+            log(f"HID: closed /dev/{node} ({_hid_label(HID_DEVICES[node])} gone)")
+            _drop_hid(node)
+    return found
+
+def _s16(raw, off):
+    if off + 2 > len(raw):
+        return None
+    return struct.unpack_from("<h", raw, off)[0]
+
+def _decode_deck(raw):
+    """Best-effort decode of a virtual-deck report. Shipped layout puts the
+    gyro at pitch=bytes 30-31, yaw=32-33, roll=34-35 (signed 16-bit LE)."""
+    if len(raw) < 36:
+        return {}
+    return {"pitch": _s16(raw, 30), "yaw": _s16(raw, 32), "roll": _s16(raw, 34)}
+
+def _maybe_decode_deck(chunk):
+    L = len(chunk)
+    if L == 0:
+        return {}
+    # single report with a gyro tail, or a tail of back-to-back 36-byte reports
+    if 36 <= L <= 40:
+        return _decode_deck(chunk)
+    if L > 40 and L % 36 == 0:
+        return _decode_deck(chunk[-36:])
+    return {}
+
+def handle_hidraw(now):
+    """select() on all open hidraw fds; count reports, keep a decode sample,
+    and note first-seen frame lengths (wrong/odd formats become visible)."""
+    if not HID_DEVICES:
+        return
+    fds = [e["fd"] for e in HID_DEVICES.values()]
+    try:
+        ready, _, _ = select.select(fds, [], [], 0.02)
+    except InterruptedError:
+        return
+    for node, e in list(HID_DEVICES.items()):
+        if e["fd"] not in ready:
+            continue
+        try:
+            chunk = os.read(e["fd"], 4096)
+        except BlockingIOError:
+            continue
+        except OSError as ex:
+            log(f"HID: read error on /dev/{node}: {ex}, dropping")
+            _drop_hid(node)
+            continue
+        if not chunk:
+            log(f"HID: EOF on /dev/{node}, dropping")
+            _drop_hid(node)
+            continue
+        t2 = time.monotonic()
+        e["count"] += 1
+        e["nbytes"] += len(chunk)
+        e["last_len"] = len(chunk)
+        if e["stopped"]:
+            e["stopped"] = False
+            log(f"HIDFLOW RESUME {_hid_label(e)} (/dev/{node} delivering data again)")
+        # first time we see a given frame length, log it (format signature)
+        if (len(chunk) <= 128 and len(chunk) not in e["frames_seen"]
+                and len(e["frames_seen"]) < 32):
+            e["frames_seen"][len(chunk)] = t2
+            log(f"HID {_hid_label(e)} FRAME len={len(chunk)} "
+                f"head={chunk[:12].hex(' ')}")
+        if t2 - e["last_raw"] >= HID_RAW_SAMPLE:
+            e["last_raw"] = t2
+            e["last_hex"] = chunk[:24].hex(" ")
+        if e["pid"] in DECK_PIDS:
+            dec = _maybe_decode_deck(chunk)
+            if dec:
+                e["last_dec"] = dec
+        e["last_data"] = t2
+
+def emit_hid_summary(now):
+    """Once per second: one liveness line per watched hidraw, plus FLOW STOP
+    when a source goes quiet while still present (connection lost HERE)."""
+    for node, e in list(HID_DEVICES.items()):
+        label = _hid_label(e)
+        reads = e["count"]
+        nbytes = e["nbytes"]
+        e["count"] = 0
+        e["nbytes"] = 0
+        if reads:
+            dec = e.get("last_dec") or {}
+            dstr = ""
+            if dec:
+                dstr = (" gyro(p,y,r)={},{},{}".format(
+                    _fmt(dec.get("pitch")), _fmt(dec.get("yaw")),
+                    _fmt(dec.get("roll"))))
+            log(f"HIDFLOW {label} {reads} rd/s {nbytes} B/s "
+                f"len={e['last_len']}{dstr}")
+            e["stopped"] = False
+            continue
+        # -- no traffic this second -> silence / flow-stop logic --------------
+        last = e["last_data"]
+        if last is None:
+            age = now - e["first_attach"]
+            if age >= FLOW_NEVER_AFTER and e["never_logged_stop"]:
+                e["never_logged_stop"] = False
+                if e["pid"] in (0x12F0, 0x12FB):
+                    log(f"FLOW STOP {label} (gaming deck present but NO data "
+                        f"since attach -- nothing reaching Steam, "
+                        f"{age:.0f}s)")
+                else:
+                    log(f"FLOW IDLE {label} (event-driven iface or nothing "
+                        f"reading it -- informational, {age:.0f}s since attach)")
+            continue
+        silent = now - last
+        if silent >= FLOW_STOP_AFTER and not e["stopped"]:
+            e["stopped"] = True
+            e["stopped_at"] = now
+            log(f"FLOW STOP {label} (no data for {silent:.1f}s, "
+                f"device still present)")
+        elif e["stopped"] and now - e["stopped_at"] >= FLOW_STOP_HB:
+            e["stopped_at"] = now
+            log(f"FLOW STOP {label} (still silent, "
+                f"{now - last:.0f}s since last data)")
+
+# ---------------------------------------------------------------------------
+# v2 — mode / attach-detach state tracker
+# ---------------------------------------------------------------------------
+# Interprets the union of evdev + hidraw + IIO as a human-readable state:
+# which mode we are in (DESKTOP / GAMING / transition), whether the physical
+# Legion controller is attached, and whether the extra kernel "Generic X-Box
+# pad" (the affected unit's extra non-HID interface) is present.
+
+def _deck_mode(found_hid):
+    game = any(h["pid"] in (0x12F0, 0x12FB) for h in found_hid.values())
+    desk = any(h["pid"] == 0x1205 for h in found_hid.values())
+    if game and desk:
+        return "TRANSITION-GAMING+DESKTOP"
+    if game:
+        return "GAMING"
+    if desk:
+        return "DESKTOP"
+    return "NO-DECK"
+
+def _fmt_state(st):
+    return ("mode={} legion_hid=[{}] xpad=[{}] iio={}".format(
+        st["mode"], ",".join(st["legion_hid"]) or "-",
+        ",".join(st["xpad"]) or "-", st["iio"]))
+
+def state_tracker(devices, found_hid):
+    """Diff the derived state against the previous scan and log transitions."""
+    global LAST_STATE
+    mode = _deck_mode(found_hid)
+    legion_hid = sorted(_hid_label(h) for h in found_hid.values()
+                        if h["vid"] == 0x17EF)
+    xpad = sorted(
+        (d.get("name") or "").strip()
+        for d in devices if "x-box pad" in (d.get("name") or "").lower())
+    st = {"mode": mode, "legion_hid": legion_hid, "xpad": xpad,
+          "iio": len(IIO_DEVICES)}
+    if LAST_STATE is None:
+        log("STATE: baseline " + _fmt_state(st))
+        LAST_STATE = st
+        return
+    if st == LAST_STATE:
+        return
+    changes = []
+    if st["mode"] != LAST_STATE["mode"]:
+        changes.append(f"mode {LAST_STATE['mode']} -> {st['mode']}")
+    for key, noun in (("legion_hid", "legion hidraw"),
+                      ("xpad", "kernel X-Box pad(evdev)")):
+        old = set(LAST_STATE[key])
+        new = set(st[key])
+        if new - old:
+            changes.append(f"{noun} attached: {', '.join(sorted(new - old))}")
+        if old - new:
+            changes.append(f"{noun} detached: {', '.join(sorted(old - new))}")
+    if st["iio"] != LAST_STATE["iio"]:
+        changes.append(f"iio devices {LAST_STATE['iio']} -> {st['iio']}")
+    log("STATE: " + "; ".join(changes) + "  [" + _fmt_state(st) + "]")
+    LAST_STATE = st
+
+# ---------------------------------------------------------------------------
+# v2 — InputPlumber journal capture (thread + one-shot backlog)
+# ---------------------------------------------------------------------------
+# Filtered so a single capture shows the InputPlumber side of the chain:
+# which hidraw the source opened, gyro calibration, attach/detach, errors.
+
+def _ipj_emit(line):
+    wall = time.monotonic()
+    if wall - IPJ_FLOOD[0] >= 1.0:
+        IPJ_FLOOD[0] = wall
+        IPJ_FLOOD[1] = 0
+    if IPJ_FLOOD[1] >= IPJ_MAX_LINES_S:
+        return
+    IPJ_FLOOD[1] += 1
+    log("IPJ: " + line.strip())
+
+def ipj_backlog():
+    """One-shot recent journal backlog, logged at startup for context."""
+    out = run_cmd(["journalctl", "-u", "inputplumber", "-n",
+                   str(IPJ_BACKLOG_LINES), "--no-pager", "-o", "short-iso"],
+                  timeout=10)
+    if not out:
+        log("IPJ: no inputplumber journal backlog available")
+        return
+    log("IPJ: --- backlog (last up to %d inputplumber journal lines) ---"
+        % IPJ_BACKLOG_LINES)
+    n = 0
+    for line in out.splitlines():
+        if IPJ_RE.search(line):
+            _ipj_emit(line)
+            n += 1
+    log(f"IPJ: --- end backlog ({n} matching lines) ---")
+
+def ipj_tail_loop():
+    """Follow `journalctl -u inputplumber -f`; log filtered lines. Runs in a
+    daemon thread and restarts journalctl if it exits unexpectedly."""
+    while not STOP:
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                ["journalctl", "-u", "inputplumber", "-f", "-n", "0",
+                 "--no-pager", "-o", "short-iso"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, bufsize=1)
+        except Exception as e:
+            log(f"IPJ: cannot start journalctl: {e} (retrying in 3s)")
+            time.sleep(3)
+            continue
+        log(f"IPJ: journalctl -u inputplumber follow started (pid={proc.pid})")
+        try:
+            for line in proc.stdout:
+                if STOP:
+                    break
+                if IPJ_RE.search(line):
+                    _ipj_emit(line)
+        except Exception as e:
+            log(f"IPJ: journal read error: {e}")
+        finally:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if not STOP:
+            log("IPJ: journalctl exited unexpectedly — restarting in 3s")
+            time.sleep(3)
+
+# ---------------------------------------------------------------------------
+# v2 — Steam virtual-gamepad registry + controller log
+# ---------------------------------------------------------------------------
+# Steam can register the deck controller WITHOUT initializing its IMU -> dead
+# gyro with the sensitivity sliders stuck at 0. Its decision is recorded in
+# ~/.local/share/Steam/config/virtualgamepadinfo.txt (stale entry => 12fb form)
+# and its own registration log in ~/.local/share/Steam/logs/controller.txt.
+
+def _steam_bases():
+    """Locate desktop-user homes (logger runs as root, Steam data is in /home)."""
+    bases = []
+    try:
+        homes = sorted(os.listdir("/home"))
+    except Exception:
+        return bases
+    for h in homes:
+        base = os.path.join("/home", h)
+        try:
+            st = os.stat(base)
+        except Exception:
+            continue
+        if getattr(st, "st_uid", 0) >= 1000:
+            bases.append(base)
+    return bases
+
+def steam_scan(now):
+    """Diff the Steam registry + controller log for every desktop user."""
+    bases = _steam_bases()
+    if not bases:
+        return
+    for base in bases:
+        _steam_registry(os.path.join(
+            base, ".local/share/Steam/config/virtualgamepadinfo.txt"))
+        _steam_controller_log(os.path.join(
+            base, ".local/share/Steam/logs/controller.txt"))
+
+def _steam_registry(path):
+    exists = os.path.exists(path)
+    sig = None
+    content = []
+    if exists:
+        try:
+            with open(path, "r", errors="replace") as f:
+                content = f.read().splitlines()
+            sig = hashlib.md5(
+                "\n".join(content).encode("utf-8", "replace")).hexdigest()
+        except Exception as e:
+            log(f"STEAM: cannot read registry {path}: {e}")
+            return
+    cur = STEAM_CACHE.get(path)
+    if cur is None:
+        cur = {"reg_sig": None}
+        STEAM_CACHE[path] = cur
+    first = cur["reg_sig"] is None
+    if sig == cur["reg_sig"]:
+        return
+    cur["reg_sig"] = sig
+    if first:
+        if exists:
+            log(f"STEAM: registry present at start "
+                f"({len(content)} lines): {path}")
+        else:
+            log(f"STEAM: registry absent at start (Steam has not registered "
+                f"the deck controller yet): {path}")
+    elif not exists:
+        log(f"STEAM: registry REMOVED (will be re-created on next Steam "
+            f"controller registration): {path}")
+    if exists:
+        # Parse real Steam format: "[slot N]" blocks with key=value lines.
+        slots, cur = [], None
+        for l in content:
+            s = l.strip()
+            if not s:
+                continue
+            if s.startswith("[") and s.endswith("]"):
+                cur = {"slot": s, "name": "", "vid": "", "pid": "",
+                       "handle": "", "type": ""}
+                slots.append(cur)
+            elif cur and "=" in s:
+                k, _, v = s.partition("=")
+                cur[k.strip().lower()] = v.strip()
+        deck = [sl for sl in slots
+                if sl.get("vid", "").lower().replace("0x", "") == "28de"
+                or "deck" in sl.get("name", "").lower()
+                or "controller" in sl.get("name", "").lower()]
+        pidmap = {
+            0x12F0: "FULL gaming deck 12f0 (gyro-capable)",
+            0x12FB: "STALE 12fb (A/B only, dead gyro)",
+            0x1205: "desktop Steam Controller 1205",
+        }
+        detail = []
+        headline = "no 28de entry"
+        for sl in deck:
+            ps = sl.get("pid", "")
+            try:
+                pid_i = int(ps, 16) if ps else 0
+            except ValueError:
+                pid_i = 0
+            verdict = pidmap.get(pid_i, f"pid={ps or '?'}")
+            if headline == "no 28de entry":
+                headline = verdict
+            detail.append(
+                f"{sl.get('slot')} name={sl.get('name') or '?'} "
+                f"VID={sl.get('vid') or '?'} PID={sl.get('pid') or '?'} "
+                f"handle={sl.get('handle') or '?'} type={sl.get('type') or '?'} "
+                f"-> {verdict}")
+        log(f"STEAM: registry lines={len(content)} verdict={headline} "
+            f"28de_slots={len(deck)}")
+        for d in detail:
+            log(f"STEAM   | {d}")
+
+def _steam_controller_log(path):
+    cur = STEAM_CACHE.get(path)
+    if cur is None:
+        cur = {"ctl_pos": 0, "ctl_present": None}
+        STEAM_CACHE[path] = cur
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        if cur.get("ctl_present") is not False:
+            cur["ctl_present"] = False
+            log(f"STEAM: controller log not present yet: {path}")
+        return
+    if cur.get("ctl_present") is not True:
+        cur["ctl_present"] = True
+        cur["ctl_pos"] = size  # start from the end: only NEW lines get logged
+        log(f"STEAM: controller log present, size={size} "
+            f"(tail-only from now): {path}")
+        return
+    pos = cur.get("ctl_pos", 0)
+    if size < pos:           # log rotated/truncated -> re-read from start
+        pos = 0
+    if size == pos:
+        return
+    if size - pos > STEAM_TAIL_BYTES:
+        pos = size - STEAM_TAIL_BYTES
+    try:
+        with open(path, "r", errors="replace") as f:
+            f.seek(pos)
+            newtext = f.read()
+    except Exception:
+        return
+    cur["ctl_pos"] = size
+    shown = 0
+    extra = 0
+    for line in newtext.splitlines():
+        if CTL_RE.search(line):
+            if shown < 10:
+                log("STEAM controller: " + line.strip())
+                shown += 1
+            else:
+                extra += 1
+    if extra:
+        log(f"STEAM controller: +{extra} more matching lines this scan")
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -627,7 +1176,18 @@ def main():
     scan_evdev(devices, build_node_map(devices))
     discover_iio()
 
-    last_snap = last_hb = last_iio = last_sess = last_iio_rescan = time.monotonic()
+    # v2: open hidraw sources, snapshot Steam state, pull an InputPlumber
+    # journal backlog, then start the journal follower thread.
+    found_hid = scan_hidraw()
+    state_tracker(devices, found_hid)
+    steam_scan(time.monotonic())
+    ipj_backlog()
+    threading.Thread(target=ipj_tail_loop, daemon=True).start()
+    log("LOGGER: v2 channels active — hidraw(17EF:61EB + 28DE:12F0/12FB/1205), "
+        "InputPlumber journal, Steam registry + controller log")
+
+    last_snap = last_hb = last_iio = last_sess = last_iio_rescan = \
+        last_flow = last_steam = time.monotonic()
 
     try:
         while not STOP:
@@ -643,6 +1203,8 @@ def main():
                         set_id = new_id
                         log_snapshot(devices, full=True)
                     scan_evdev(devices, build_node_map(devices))
+                    found_hid = scan_hidraw()
+                    state_tracker(devices, found_hid)
                 except Exception as e:
                     log(f"LOGGER: snapshot/scan error: {e}")
 
@@ -678,12 +1240,38 @@ def main():
                 except Exception as e:
                     log(f"LOGGER: session scan error: {e}")
 
-            # -- evdev event capture (select drives the loop cadence) ---------
+            # -- periodic: per-second hidraw liveness + FLOW STOP/RESUME -----
+            if now - last_flow >= HID_FLOW_INTERVAL:
+                last_flow = now
+                try:
+                    emit_hid_summary(now)
+                except Exception as e:
+                    log(f"LOGGER: hid flow summary error: {e}")
+
+            # -- periodic: Steam virtual-gamepad registry + controller log ----
+            if now - last_steam >= STEAM_SCAN_INTERVAL:
+                last_steam = now
+                try:
+                    steam_scan(now)
+                except Exception as e:
+                    log(f"LOGGER: steam scan error: {e}")
+
+            # -- evdev + hidraw event capture (select drives loop cadence) ----
             try:
                 handle_evdev(time.monotonic())
             except Exception as e:
                 log(f"LOGGER: evdev loop error: {e}")
+            try:
+                handle_hidraw(time.monotonic())
+            except Exception as e:
+                log(f"LOGGER: hidraw loop error: {e}")
     finally:
+        for node, entry in HID_DEVICES.items():
+            try:
+                os.close(entry["fd"])
+            except Exception:
+                pass
+        HID_DEVICES.clear()
         for path, entry in EV_DEVICES.items():
             try:
                 os.close(entry["fd"])

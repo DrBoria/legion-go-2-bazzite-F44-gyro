@@ -2,14 +2,27 @@
 # Passive diagnostic logger for the Legion Go 2 gyro patch.
 #
 # WHY: in gaming mode the virtual Steam Deck controller sometimes only maps A/B
-# (no joysticks, no gyro). This unit runs a session-independent, timestamped
-# logger that records device snapshots, udev add/remove events, IIO gyro/accel
-# data, evdev key/axis events and session (gamescope/desktop) transitions, so we
-# can tell whether physical input flows AND whether InputPlumber writes into the
-# virtual deck device. It runs even when there is no terminal (gaming mode).
+# (no joysticks, no gyro). This unit runs the v2 logger: a session-independent,
+# timestamped logger that records EVERYTHING relevant into ONE log —
+# /var/log/ip-gyro-logger.log. With `./install.sh --log` this single file is all
+# a remote user ever needs to send back (cat /var/log/ip-gyro-logger.log).
 #
-# Runs as root so /dev/input/* and /sys/bus/iio are readable. Output is mirrored
-# to stdout, so it is also visible via: journalctl -u ip-gyro-logger
+# Captured, all into that one log with no second command or extra artifact:
+#   - device inventory snapshots (=== SNAPSHOT === / HB) and udev add/remove
+#     (UDEV DEVADD/DEVREM, input/hidraw/iio subsystems)
+#   - IIO gyro/accel samples (IIO lines) and evdev key/axis events (EV lines)
+#   - hidraw flow: raw input from the physical Legion (LEGION-SRC 17ef:61eb) and
+#     raw reports INTO the virtual deck (DECK-GAME 28de:12f0 / DECK-12FB 28de:12fb
+#     / DECK-DESK 28de:1205) -> HIDFLOW / FLOW STOP lines: what Steam receives
+#   - Steam's virtual-gamepad registry + controller.txt verdicts (STEAM lines:
+#     FULL gaming deck 12f0 / STALE 12fb / desktop Steam Controller 1205), scanned
+#     for EVERY /home user (multi-home safe)
+#   - InputPlumber's own journal (IPJ lines, journalctl -u inputplumber)
+#   - STATE session/mode markers, gamescope/desktop SESSION transitions, heartbeat
+#
+# Runs as root so /dev/input/*, /dev/hidraw*, /sys/bus/iio and every /home user's
+# Steam data are readable, and journalctl -u inputplumber is unrestricted. Output
+# is mirrored to stdout, so it is also visible via: journalctl -u ip-gyro-logger.
 # Log file: /var/log/ip-gyro-logger.log
 Description=IP Gyro diagnostic logger (Legion Go 2 gyro patch)
 # Only order AFTER inputplumber — deliberately NOT Requires/After-strict so the
@@ -19,7 +32,8 @@ After=inputplumber.service
 
 [Service]
 Type=simple
-# Root so /dev/input/* and /sys/bus/iio are readable on every device.
+# Root so /dev/input/*, /dev/hidraw*, /sys/bus/iio are readable on every device
+# (and every /home user's Steam registry + the InputPlumber journal are readable).
 User=root
 ExecStart=/usr/bin/python3 /opt/ip-gyro-logger/ip-gyro-logger.py --log /var/log/ip-gyro-logger.log
 # The logger itself is robust (global try/except, per-device isolation), but if
