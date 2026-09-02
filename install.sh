@@ -1,6 +1,52 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ---------------------------------------------------------------------------
+# Argument parsing (two modes):
+#   ./install.sh         plain install; also ensures the diagnostic logger is OFF
+#   ./install.sh --log   plain install PLUS installs & enables the passive
+#                        diagnostic logger (ip-gyro-logger.service ->
+#                        /var/log/ip-gyro-logger.log, mirrored to journalctl)
+#   -l / --logger        aliases for --log
+# Any unknown flag prints usage and exits non-zero.
+# ---------------------------------------------------------------------------
+usage() {
+    cat <<'EOF'
+Usage: ./install.sh [--log]
+
+Installs the Legion Go 2 gyro patch (modified InputPlumber binary + composite
+device profile + gain override + suspend/resume power fix + Steam gyro
+auto-reset unit).
+
+  (no flag)   normal install; also disables & removes the diagnostic logger
+  --log       normal install PLUS installs & enables the passive diagnostic
+              logger (ip-gyro-logger.service) -> /var/log/ip-gyro-logger.log
+              (same output also in: journalctl -u ip-gyro-logger)
+  -l, --logger  aliases for --log
+
+Run as your regular user — sudo is used internally for the system changes.
+EOF
+}
+
+LOG_MODE=0
+for arg in "$@"; do
+    case "$arg" in
+        --log|-l|--logger)
+            LOG_MODE=1
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "ERROR: Unknown flag: $arg" >&2
+            echo
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
     echo "ERROR: Run this script as your regular user, not with sudo."
     exit 1
@@ -11,10 +57,44 @@ BASE_DIR="$(
     pwd
 )"
 
-SOURCE_BINARY="$BASE_DIR/inputplumber-legiongo2-gyro"
-
+# Runtime install paths.
 INSTALL_DIR="/opt/inputplumber-legiongo2-runtime"
-INSTALLED_BINARY="$INSTALL_DIR/inputplumber-legiongo2-gyro-v6"
+INSTALLED_BINARY="$INSTALL_DIR/inputplumber-legiongo2-gyro-v4.resume-gamefix"
+
+# Expected sha256 of the CURRENT fix binary (Steam Deck PID 0x12f0 + scoped
+# resume trigger). Verified after install — a mismatch only warns, never aborts.
+EXPECTED_SHA256="0618564a6194f89ca8039f4db56996ac43e05c05a23f2f80d03bbea2022689ca"
+
+# Resolve which source binary to install, in priority order:
+#   1) the fix binary shipped next to install.sh (once added to the repo/tarball)
+#   2) the current fix build in the InputPlumber workspace (used while testing)
+#   3) the legacy repo binary (kept as a last-resort fallback; sha is verified)
+SOURCE_BINARY=""
+for cand in \
+    "$BASE_DIR/inputplumber-legiongo2-gyro-v4.resume-gamefix" \
+    "/home/legion/ip-build/InputPlumber/inputplumber-legiongo2-gyro-v4.resume-gamefix" \
+    "$BASE_DIR/inputplumber-legiongo2-gyro"
+do
+    if [[ -x "$cand" ]]; then
+        SOURCE_BINARY="$cand"
+        break
+    fi
+done
+
+# Resolve which logger source directory to install from, in priority order:
+#   1) the logger/ dir shipped next to install.sh (once added to the repo/tarball)
+#   2) the logger/ dir in the InputPlumber workspace (used while testing)
+# Only a dir containing BOTH files qualifies; otherwise the logger is skipped.
+SOURCE_LOGGER_DIR=""
+for cand in \
+    "$BASE_DIR/logger" \
+    "/home/legion/ip-build/InputPlumber/logger"
+do
+    if [[ -f "$cand/ip-gyro-logger.py" ]] && [[ -f "$cand/ip-gyro-logger.service" ]]; then
+        SOURCE_LOGGER_DIR="$cand"
+        break
+    fi
+done
 
 OVERRIDE_DIR="/etc/systemd/system/inputplumber.service.d"
 OVERRIDE_FILE="$OVERRIDE_DIR/override.conf"
@@ -43,6 +123,24 @@ echo "$INSTALLED_BINARY"
 
 sudo mkdir -p "$INSTALL_DIR"
 sudo install -m755 "$SOURCE_BINARY" "$INSTALLED_BINARY"
+
+# Verify the installed binary matches the expected fix build. Warn, do NOT abort.
+source_sha="$(sha256sum "$SOURCE_BINARY" | awk '{print $1}')"
+if [[ "$source_sha" == "$EXPECTED_SHA256" ]]; then
+    echo "Source binary sha256 OK ($source_sha)"
+else
+    echo "WARNING: source binary sha256 mismatch — this is NOT the current resume-gamefix build:"
+    echo "  expected: $EXPECTED_SHA256"
+    echo "  actual:   $source_sha"
+fi
+installed_sha="$(sudo sha256sum "$INSTALLED_BINARY" | awk '{print $1}')"
+if [[ "$installed_sha" == "$EXPECTED_SHA256" ]]; then
+    echo "Installed binary sha256 OK ($installed_sha)"
+else
+    echo "WARNING: installed binary sha256 mismatch:"
+    echo "  expected: $EXPECTED_SHA256"
+    echo "  actual:   $installed_sha"
+fi
 
 if [[ -f "$SOURCE_PROFILE" ]]; then
     echo "Installing composite device profile (Legion Go 2 -> 'deck' target, gyro-capable)..."
@@ -123,11 +221,61 @@ else
     echo "         The boot-time Steam gyro auto-reset was NOT installed."
 fi
 
+# ---------------------------------------------------------------------------
+# Passive diagnostic logger (two-mode support)
+#   --log / -l / --logger  -> install & enable ip-gyro-logger.service
+#   plain                  -> disable & remove everything logger-related
+# Idempotent: re-running either mode leaves a clean state.
+# ---------------------------------------------------------------------------
+LOGGER_DIR="/opt/ip-gyro-logger"
+LOGGER_UNIT="/etc/systemd/system/ip-gyro-logger.service"
+LOGGER_LOG="/var/log/ip-gyro-logger.log"
+
+install_logger() {
+    echo
+    echo "Installing passive diagnostic logger..."
+    if [[ -z "$SOURCE_LOGGER_DIR" ]]; then
+        echo "WARNING: logger sources not found in either location:"
+        echo "           $BASE_DIR/logger"
+        echo "           /home/legion/ip-build/InputPlumber/logger"
+        echo "         (ip-gyro-logger.py AND ip-gyro-logger.service are both required.)"
+        echo "         The diagnostic logger was NOT installed."
+        return 0
+    fi
+    sudo mkdir -p "$LOGGER_DIR"
+    sudo install -m755 "$SOURCE_LOGGER_DIR/ip-gyro-logger.py" "$LOGGER_DIR/ip-gyro-logger.py"
+    sudo install -m644 "$SOURCE_LOGGER_DIR/ip-gyro-logger.service" "$LOGGER_UNIT"
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now ip-gyro-logger.service
+    echo
+    echo "Diagnostic logger enabled (runs as root via ip-gyro-logger.service)."
+    echo "  Log file:  $LOGGER_LOG"
+    echo "  Journal:   journalctl -u ip-gyro-logger"
+}
+
+remove_logger() {
+    echo
+    echo "Ensuring diagnostic logger is OFF (normal install mode)..."
+    sudo systemctl disable --now ip-gyro-logger.service 2>/dev/null || true
+    sudo rm -f "$LOGGER_UNIT"
+    sudo rm -rf "$LOGGER_DIR"
+    sudo systemctl daemon-reload
+    sudo rm -f "$LOGGER_LOG"
+    echo "  The diagnostic logger is not installed (unit, files and log removed)."
+}
+
+if [[ "$LOG_MODE" -eq 1 ]]; then
+    install_logger
+else
+    remove_logger
+fi
+
 echo
 echo "Service status: $(systemctl is-active inputplumber)"
 echo "Suspend hook (sleep fix): $(systemctl is-enabled inputplumber-suspend.service) / $(systemctl is-active inputplumber-suspend.service)"
 echo "Resume fix (Steam re-detect): $SUSPEND_DROPIN_FILE"
 echo "Auto gyro reset (Steam registry cleared at boot): $(systemctl is-enabled steam-deck-uhid-gyro-reset.service) / $(systemctl is-active steam-deck-uhid-gyro-reset.service)"
+echo "Diagnostic logger: $(systemctl is-enabled ip-gyro-logger.service 2>/dev/null || echo 'not installed') / $(systemctl is-active ip-gyro-logger.service 2>/dev/null || echo 'not running')"
 
 MAIN_PID="$(
     systemctl show \
