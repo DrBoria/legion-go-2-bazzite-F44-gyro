@@ -61,9 +61,11 @@ BASE_DIR="$(
 INSTALL_DIR="/opt/inputplumber-legiongo2-runtime"
 INSTALLED_BINARY="$INSTALL_DIR/inputplumber-legiongo2-gyro-v4.resume-gamefix"
 
-# Expected sha256 of the CURRENT fix binary (Steam Deck PID 0x12f0 + scoped
-# resume trigger). Verified after install — a mismatch only warns, never aborts.
-EXPECTED_SHA256="0618564a6194f89ca8039f4db56996ac43e05c05a23f2f80d03bbea2022689ca"
+# Expected sha256 of the CURRENT fix binary — V9 = v8.1-era baseline + FIX A
+# restored (deck-uhid virtual Steam Controller KEPT ALIVE across system sleep;
+# FIX C overlay-reload dedup retained; destructive self-heal NOT present).
+# Verified after install — a mismatch only warns, never aborts.
+EXPECTED_SHA256="c9a4bfa800a2c1bca078c41ddfcb0131351cd8f5402d8a5cdd4963ca13476e00"
 
 # Resolve which source binary to install, in priority order:
 #   1) the fix binary shipped next to install.sh (once added to the repo/tarball)
@@ -246,7 +248,13 @@ install_logger() {
     sudo install -m755 "$SOURCE_LOGGER_DIR/ip-gyro-logger.py" "$LOGGER_DIR/ip-gyro-logger.py"
     sudo install -m644 "$SOURCE_LOGGER_DIR/ip-gyro-logger.service" "$LOGGER_UNIT"
     sudo systemctl daemon-reload
-    sudo systemctl enable --now ip-gyro-logger.service
+    # ALWAYS replace a previously-running logger (its old code stays loaded in
+    # memory otherwise): 'enable --now' only starts a stopped unit and does NOT
+    # restart an already-active one, so stale logger code would keep running.
+    # Enable for persistence, then force a restart of the freshly installed
+    # logger so the new code is guaranteed to be what runs -- no manual stop.
+    sudo systemctl enable ip-gyro-logger.service
+    sudo systemctl restart ip-gyro-logger.service
     echo
     echo "Diagnostic logger enabled (runs as root via ip-gyro-logger.service)."
     echo "  Log file:  $LOGGER_LOG"

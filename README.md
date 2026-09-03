@@ -24,11 +24,78 @@ See the screenshot below:
 3. At the very top where it says **GENERAL** there will be **"choose gyro button(s)"**; click it and set it to **None (Gyro Always On)**.
 4. **Reason:** by default the gyro is only enabled while a specific button is held (like Push-to-Talk), so without this change the gyro appears dead.
 
+## What's new in v9
+
+**v9** is the current release — the **sleep-in-game fix**. It ships the `c9a4bfa8` build
+(prebuilt binary sha256:
+`c9a4bfa800a2c1bca078c41ddfcb0131351cd8f5402d8a5cdd4963ca13476e00`) together with the
+**v3.1 diagnostic logger**.
+
+### 1. Sleep-in-game fix — the virtual Steam Controller survives system sleep
+
+**Problem.** Sleeping *while a game is running* killed the controller. On suspend,
+InputPlumber's suspend handler **stopped and removed every target device** — including the
+virtual Steam Controller (`deck-uhid`, `28de:12f0`) that Steam's running-game session is
+bound to. The game kept its now-dead Steam Input session: after wake Steam logged
+`Controller device closed after hid_read failure`, the running game never re-bound, and the
+controller stayed dead in-game until a restart. This is exactly what the log showed on
+**2026-09-03 10:33:08**, before this fix.
+
+**Fix** ([`src/input/composite_device/targets.rs`](src/input/composite_device/targets.rs),
+`handle_suspend`): when the target device is the **`deck-uhid`** virtual Steam Controller it
+is now **kept alive** across the suspend instead of being torn down — it is recorded in the
+suspended set but **not stopped and not removed** (`continue`; no `stop()`, no removal from
+`target_devices`). Every other target (keyboard, mouse) still suspends as before, and
+`handle_resume` restores all of them on wake. Net effect: the physical controllers detach on
+sleep as usual, but the virtual Steam Controller that the game session is using never goes
+away → the Steam Input session survives sleep/wake and the **running game keeps accepting
+input**.
+
+**Verified on-device** (2026-09-03, in-game ESO sleep test): sleep at 12:12:18 → the physical
+Legion controllers detached/re-attached normally, while the virtual deck got a `DEVCHG` (it
+was **not** removed), InputPlumber reported `Target device deck-uhid already running, nothing
+to do` right after wake (the deck was never torn down or re-created), Steam reloaded the
+running game's config (`Loaded Config ... App ID 306130 ... controller_steamos_handheld.vdf`),
+there was **no** Steam `hid_read failure`, and input to the **same** running-game session was
+alive after wake — **confirmed by the user**.
+
+> **Honest caveat.** The explicit keep-alive log line of `handle_suspend` only appears when
+> the handler runs to completion; a suspend freeze can cut the loop short right after the
+> first target is stopped. In the 12:12:18 run the log ends immediately after
+> `Target device stopping/stopped: mouse0` (no final `Target devices before suspend:` marker),
+> so that one explicit line was not captured. The functional proof above — deck `already
+> running` after wake, no virtual-device removal, no `hid_read failure`, game config reloaded
+> — is what demonstrates the deck was not torn down, and an earlier run of the same
+> `c9a4bfa8` build (23:51:15, PID 1332) already logged the keep-alive line explicitly.
+
+### 2. Diagnostic logger v3.1
+
+Still one command (`./install.sh --log`) and one artifact (`/var/log/ip-gyro-logger.log`).
+New in **v3.1**:
+
+- **per-app Steam Input activation** capture from Steam's `controller_ui.txt` — which AppID
+  Steam applies a controller config to, and when, so a "game started but the controller is
+  not bound" case is visible as data instead of guesswork;
+- **running-game tracker** — which Steam-launched game process is active (AppID) and what
+  config Steam Input loaded for it.
+
+These are the two markers that let the sleep failure be diagnosed from the log alone: Steam's
+`Controller device closed after hid_read failure` and the per-app config reload on wake are
+now recorded, not inferred.
+
+### 3. What stayed in the binary (v8.1-era baseline)
+
+- gaming-mode `deck-uhid` registers as **`28de-12f0`** (full buttons + gyro);
+- 1000 µs poll rate (InputPlumber-added latency ~1–1.5 ms);
+- **FIX C** — overlay-profile reload dedup (proven not to affect Steam activation);
+- **no** destructive self-heal (removed in v8.8) — nothing in this build kills and re-creates
+  the deck mid-game.
+
 ## What's new in v8.1
 
-**v8.1** is the current release — a **logger-only** patch on top of v8. The InputPlumber
-binary and every v8 fix are unchanged (prebuilt binary sha256:
-`0618564a6194f89ca8039f4db56996ac43e05c05a23f2f80d03bbea2022689ca`).
+**v8.1** was the previous release (superseded by [v9](#whats-new-in-v9)) — a **logger-only**
+patch on top of v8. The InputPlumber binary and every v8 fix were unchanged (prebuilt binary
+sha256: `0618564a6194f89ca8039f4db56996ac43e05c05a23f2f80d03bbea2022689ca`).
 
 The diagnostic logger is now the **v2** logger, and **ONE command** — `./install.sh --log`
 — captures **everything** into a single log, `/var/log/ip-gyro-logger.log`, with no second
@@ -46,7 +113,7 @@ command and no extra artifact:
 
 After `./install.sh --log` the user only has to **reproduce the failure** and send back the
 single file (`cat /var/log/ip-gyro-logger.log`) — see the
-[Diagnostic logger](#diagnostic-logger-v2-optional) section below.
+[Diagnostic logger](#diagnostic-logger-v31-optional) section below.
 
 ## What's new in v8
 
@@ -65,16 +132,16 @@ single file (`cat /var/log/ip-gyro-logger.log`) — see the
 
 ### 3. Passive diagnostic logger (two-mode install)
 
-`install.sh` now supports **two modes**: a plain `./install.sh` (binary install only) and `./install.sh --log` (`-l` / `--logger` are aliases), which additionally installs and enables the passive [diagnostic logger](#diagnostic-logger-v2-optional). See the install section below.
+`install.sh` now supports **two modes**: a plain `./install.sh` (binary install only) and `./install.sh --log` (`-l` / `--logger` are aliases), which additionally installs and enables the passive [diagnostic logger](#diagnostic-logger-v31-optional). See the install section below.
 
 ## Install (prebuilt binary)
 
-Download **`inputplumber-legiongo2-gyro-v8.1.tar.gz`** from the **Releases** page, extract it and run:
+Download **`inputplumber-legiongo2-gyro-v9.tar.gz`** from the **Releases** page, extract it and run:
 
 ```bash
-tar xzf inputplumber-legiongo2-gyro-v8.1.tar.gz
+tar xzf inputplumber-legiongo2-gyro-v9.tar.gz
 ./install.sh        # plain install — binary + profile + power fixes + auto gyro-reset unit, restarts inputplumber, ensures the logger is OFF
-./install.sh --log  # ONE command: same as above PLUS installs & enables the v2 diagnostic logger, which captures EVERYTHING into /var/log/ip-gyro-logger.log
+./install.sh --log  # ONE command: same as above PLUS installs & enables the v3.1 diagnostic logger, which captures EVERYTHING into /var/log/ip-gyro-logger.log
 ```
 
 > Run `install.sh` as your regular (non-root) user — it uses `sudo` internally and refuses
@@ -88,7 +155,7 @@ tar xzf inputplumber-legiongo2-gyro-v8.1.tar.gz
 3. the systemd override with comfortable gains (see below);
 4. the suspend/resume power fix — enables `inputplumber-suspend.service` (so the device can sleep without waking from the controllers) and installs a drop-in that force-re-scans udev on wake so the virtual Steam Deck controller returns to Steam (see [Suspend / Resume fixes](#suspend--resume-fixes-included-in-this-patch));
 5. the boot-time auto-reset unit [`steam-deck-uhid-gyro-reset.service`](steam-deck-uhid-gyro-reset.service) — clears Steam's virtual gamepad registry before Steam starts so the virtual Steam Deck controller re-registers **with its IMU/gyro initialized** after Bazzite updates (see [Auto-reset after updates](#4-auto-reset-after-updates-installed-by-installsh));
-6. **optionally** the passive diagnostic logger (only with `--log`; plain `./install.sh` makes sure it is fully removed — see [Diagnostic logger](#diagnostic-logger-v2-optional)).
+6. **optionally** the passive diagnostic logger (only with `--log`; plain `./install.sh` makes sure it is fully removed — see [Diagnostic logger](#diagnostic-logger-v31-optional)).
 
 Or manually:
 
@@ -122,13 +189,13 @@ sudo systemctl edit inputplumber.service
 sudo systemctl restart inputplumber
 ```
 
-## Diagnostic logger (v2, optional)
+## Diagnostic logger (v3.1, optional)
 
-In gaming mode the virtual Steam Deck controller could previously map only A/B (no joysticks, no gyro). To make such issues diagnosable after the fact, this repo ships a **passive diagnostic logger**: pure Python 3 standard library, no dependencies, no rebuild. **v8.1** ships the **v2** logger, which captures every source into a single log (`/var/log/ip-gyro-logger.log`) via the one command `./install.sh --log`.
+In gaming mode the virtual Steam Deck controller could previously map only A/B (no joysticks, no gyro). To make such issues diagnosable after the fact, this repo ships a **passive diagnostic logger**: pure Python 3 standard library, no dependencies, no rebuild. **v9** ships the **v3.1** logger, which captures every source into a single log (`/var/log/ip-gyro-logger.log`) via the one command `./install.sh --log` — plus the new per-app Steam Input activation markers described in [What's new in v9](#2-diagnostic-logger-v31).
 
 Files in [`logger/`](logger/):
 
-- `logger/ip-gyro-logger.py` — records timestamped, greppable evidence: udev device add/remove events, `/proc/bus/input/devices` snapshots, IIO gyro/accel samples, evdev key/axis events, hidraw flow into the virtual deck, Steam registry verdicts, InputPlumber's journal, STATE session markers, and a heartbeat / session (gamescope/desktop) transitions.
+- `logger/ip-gyro-logger.py` — records timestamped, greppable evidence: udev device add/remove events, `/proc/bus/input/devices` snapshots, IIO gyro/accel samples, evdev key/axis events, hidraw flow into the virtual deck, Steam registry verdicts, InputPlumber's journal, STATE session markers, and a heartbeat / session (gamescope/desktop) transitions. **v3.1** adds: per-app Steam Input activation from Steam's `controller_ui.txt` and a running-game tracker (AppID + loaded config).
 - `logger/ip-gyro-logger.service` — systemd unit, runs as **root** (so `/dev/input/*`, `/dev/hidraw*`, `/sys/bus/iio`, every `/home` user's Steam registry and `journalctl -u inputplumber` are readable), `Restart=always`, logs to `/var/log/ip-gyro-logger.log`.
 
 ### Two install modes
@@ -197,7 +264,7 @@ The logger is fully passive: it only reads hidraw (the kernel duplicates each re
 open reader, so it never steals or acknowledges input) and tails InputPlumber's journal — it
 cannot interfere with InputPlumber or Steam.
 
-Steam registering **`28de-12f0`** (not `28de-12fb`) during the gaming-mode `deck-uhid` window is the expected v8 behaviour.
+Steam registering **`28de-12f0`** (not `28de-12fb`) during the gaming-mode `deck-uhid` window is the expected v8/v9 behaviour.
 
 ## Build from source
 
@@ -215,11 +282,11 @@ To fine-tune or reproduce the debugging, see [Agent.md](Agent.md) — it documen
 ## Repository contents
 
 - `patches/inputplumber-legion-go-2-bazzite.patch` — the complete source patch (all changes vs upstream base)
-- `inputplumber-legiongo2-gyro-v4.resume-gamefix` — prebuilt modified binary for v8.1 (Release asset: `inputplumber-legiongo2-gyro-v8.1.tar.gz`); sha256 `0618564a6194f89ca8039f4db56996ac43e05c05a23f2f80d03bbea2022689ca`
-- `inputplumber-legiongo2-gyro` — legacy filename for the same v8 binary (identical sha256), kept as the `install.sh` fallback
+- `inputplumber-legiongo2-gyro-v4.resume-gamefix` — prebuilt modified binary for **v9** (Release asset: `inputplumber-legiongo2-gyro-v9.tar.gz`); sha256 `c9a4bfa800a2c1bca078c41ddfcb0131351cd8f5402d8a5cdd4963ca13476e00`
+- `inputplumber-legiongo2-gyro` — legacy prebuilt binary (v8.1-era, sha256 `0618564a6194f89ca8039f4db56996ac43e05c05a23f2f80d03bbea2022689ca`), kept as the `install.sh` last-resort fallback (no FIX A)
 - `50-legion_go_2.yaml` — composite device profile (routes the device to the `deck` target so it is seen as a Steam Deck with gyro)
 - `install.sh` — install / update script with two modes (plain vs `--log`) for the optional diagnostic logger (binary + profile + gain override + suspend/resume power fixes + boot-time Steam gyro auto-reset unit)
-- `logger/` — passive diagnostic logger (v2: `ip-gyro-logger.py` + `ip-gyro-logger.service`), installed by `./install.sh --log` (see [Diagnostic logger](#diagnostic-logger-v2-optional))
+- `logger/` — passive diagnostic logger (v3.1: `ip-gyro-logger.py` + `ip-gyro-logger.service`), installed by `./install.sh --log` (see [Diagnostic logger](#diagnostic-logger-v31-optional))
 - `steam-deck-uhid-gyro-reset.service` — oneshot unit that clears Steam's virtual gamepad registry at boot (installed & enabled by install.sh) so the deck controller re-registers with IMU/gyro initialized after Bazzite updates
 - `Agent.md` — full debugging log: hypotheses, measurements, reproduction steps
 - `steam-input-ref.png` — Steam Input reference screenshot

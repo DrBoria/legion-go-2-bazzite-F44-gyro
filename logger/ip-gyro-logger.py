@@ -31,6 +31,32 @@ v2 (what v1 could NOT see — where the gaming-mode chain actually breaks):
   * Steam's virtual-gamepad registry + log       -> "STEAM:" lines
     (did Steam register the FULL 12f0 controller with IMU, or a stale 12fb)
 
+v3 (the full end-to-end picture — WHERE a byte actually gets lost):
+  * every 64-byte Steam Controller input report INTO the deck is DECODED per
+    report, not just counted -> "DECODE"/"MOTION" lines: named buttons
+    (a/x/b/y, shoulders/triggers, dpad, L3/R3/L4/R4/R5, menu/steam/view,
+    trackpad/stick touch), stick+trigger axes, and the IMU bytes (accel
+    24-29, gyro 30-35) that prove whether gyro motion PHYSICALLY reaches
+    Steam during a "dead" window
+  * per-direction liveness correlated once per second -> "ACTIVITY" lines
+    (EV events | LEGION-SRC reads/s | each DECK read/s + MOTION y/n) so the
+    exact direction that broke is visible on ONE line
+  * loud loss markers -> "FLOW GAP" (deck stream silent while the physical
+    source keeps delivering, frame length != 64, protocol mismatch),
+    "GENRESET" (deck report stream regenerated) and "FRAMEJUMP" (skipped
+    frames between reads)
+
+v3.1 (Steam Input activation evidence — direction D, the Steam->game hop):
+  * Steam's per-app controller UI log is tailed -> "STEAM UI:" lines
+    ("Loaded Config ... App ID <game> ..." + focus window/game AppID events),
+    i.e. WHICH game Steam Input is actually configured for right now
+  * a compact focus-transition marker -> "STEAM UI FOCUS: ..." lines
+    (game window vs Steam client UI), logged only when the focused AppID changes
+  * running game processes are read from /proc/<pid>/environ (SteamAppId) ->
+    "STEAM PROC:" lines proving the game for that AppID is REALLY running
+  Together with the existing DECK-GAME stream + ACTIVITY correlation this closes
+  the blind spot between "Steam read the reports" and "the game received input".
+
 Runs as root via ip-gyro-logger.service so it can read /dev/input/* and
 /sys/bus/iio. Pure Python 3 standard library — no dependencies, no rebuild.
 
@@ -143,6 +169,28 @@ CTL_RE = re.compile(
     r"(12f0|12fb|28de|1205|steam deck|steam controller|imu|gyro|haptic|"
     r"register|error|fail)", re.IGNORECASE)
 
+# v3.1 — Steam Input activation evidence (direction D). Steam's per-app
+# controller_ui.txt tells us WHICH app Steam Input is configured for (per-game
+# "Loaded Config ... App ID N", the focused game/client window AppID, controller
+# connect + ProductID/Serial 12f0), i.e. whether Steam Input really activated on
+# the launched game. Running game processes (SteamAppId in /proc environ) close
+# the loop. Captured tail-only, heavily filtered, capped per scan.
+STEAM_UI_TAIL_BYTES = 262144
+STEAM_UI_MAX_LINES = 8
+STEAM_UI_FOCUS_RE = re.compile(
+    r"OnFocusWindowChanged to (game window type|window type):?.*?\bAppID ([0-9]+)",
+    re.IGNORECASE)
+# coarse candidate set: per-game config loads, focus events, controller identity
+STEAM_UI_CAND_RE = re.compile(
+    r"(OnFocusWindowChanged|Controller [0-9]+ (connected|disconnected|attributes)|"
+    r"ProductID|Serial|Custom SDL Mapping|Loaded Config)", re.IGNORECASE)
+# background config loads that fire for EVERY controller / client UI / desktop
+# shell constantly (chord/basicui/desktop) — the per-GAME selection is the real
+# signal, so these are excluded from the raw capture.
+STEAM_UI_NOISE_RE = re.compile(
+    r"(Last Resort Path|basicui_neptune|chord_neptune|desktop_neptune|"
+    r"App ID (769|443510|413080)|AppID (769|443510|413080))", re.IGNORECASE)
+
 HIDRAW_DIR = "/sys/class/hidraw"
 # hidraw pids we watch -> human label (physical source + virtual deck devices)
 WATCH_PIDS = {
@@ -156,6 +204,14 @@ DECK_PIDS = (0x12F0, 0x12FB, 0x1205)
 HIDPATH_RE = re.compile(r"0003:([0-9A-Fa-f]{4}):([0-9A-Fa-f]{4})")
 # USB interface segment inside the sysfs path, e.g. "3-1:1.2/" -> iface 2
 USBIFACE_RE = re.compile(r":1\.([0-9]+)/")
+
+# ---------------------------------------------------------------------------
+# v3 — per-direction flow correlation / gap-detection cadence
+# ---------------------------------------------------------------------------
+FLOW_GAP_AFTER = 2.0        # deck silent this long before a FLOW GAP is flagged
+FLOW_GAP_HB = 20.0          # re-assert a long-lived FLOW GAP only this often
+FLOW_EV_WINDOW = 2.0        # an EV event this recent counts as "user active"
+HID_MOTION_LOG_MIN = 0.5    # at most ~2 MOTION lines/sec/deck while moving
 
 # ---------------------------------------------------------------------------
 # Global state
@@ -184,6 +240,17 @@ HID_OPEN_ERR = {}           # /dev/hidrawN -> last open-error time (anti-spam)
 STEAM_CACHE = {}            # steam file path -> {reg_sig / ctl_pos / ...}
 IPJ_FLOOD = [0.0, 0]        # InputPlumber journal flood gate [window, lines]
 LAST_STATE = None           # last computed mode/attach signature (for diffs)
+
+# v3.1 — Steam Input activation on the running game (direction D)
+STEAM_UI_FOCUS = None       # last focused AppID label logged (change-only)
+STEAM_APP_SUMMARY = None    # last "running Steam games" summary (change-only)
+STEAM_PROC_SET = {}         # pid -> (appid, name, cmd) of running Steam games
+
+# v3 — physical-input activity signal (fed by _process_event; reset in the
+# per-second HIDFLOW pass). Drives the FLOW GAP "deck silent while active"
+# marker so the loss point is visible even without decoding the source proto.
+EV_ACT_COUNT = 0            # EV KEY/ABS events since the last ACTIVITY line
+EV_ACT_LAST = 0.0           # monotonic time of the most recent EV event
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -634,11 +701,16 @@ def handle_evdev(now):
 
 def _process_event(name, etype, code, value, entry, now):
     """Log EV_KEY presses (value 1) and EV_ABS changes (throttled)."""
+    global EV_ACT_COUNT, EV_ACT_LAST
     if etype == EV_KEY:
         if value == 1:
             kname = KEY_NAMES.get(code, f"0x{code:03x}")
             log(f"EV {name} KEY {kname} DOWN")
+        EV_ACT_COUNT += 1
+        EV_ACT_LAST = now
     elif etype == EV_ABS:
+        EV_ACT_COUNT += 1
+        EV_ACT_LAST = now
         if now - entry["last_abs"] >= EV_THROTTLE:
             aname = ABS_NAMES.get(code, f"0x{code:02x}")
             log(f"EV {name} ABS {aname} {value}")
@@ -732,6 +804,11 @@ def scan_hidraw():
             "last_hex": "", "last_dec": {}, "last_raw": 0.0,
             "stopped": False, "stopped_at": 0.0, "never_logged_stop": True,
             "first_attach": now, "frames_seen": {},
+            # v3 per-report decode / motion / frame-continuity state
+            "dec_count": 0, "mot_count": 0, "mot_last": 0.0, "mot_log": 0.0,
+            "btn_prev": "", "last_frame": None,
+            "gap_active": False, "gap_at": 0.0,
+            "bad_len_logged": False, "bad_hdr_logged": False, "jump_log": 0.0,
         }
         log(f"HID: capturing {path} ({_hid_label(HID_DEVICES[node])} "
             f"vid={info['vid']:04X} pid={info['pid']:04X})")
@@ -746,27 +823,121 @@ def _s16(raw, off):
         return None
     return struct.unpack_from("<h", raw, off)[0]
 
-def _decode_deck(raw):
-    """Best-effort decode of a virtual-deck report. Shipped layout puts the
-    gyro at pitch=bytes 30-31, yaw=32-33, roll=34-35 (signed 16-bit LE)."""
-    if len(raw) < 36:
-        return {}
-    return {"pitch": _s16(raw, 30), "yaw": _s16(raw, 32), "roll": _s16(raw, 34)}
+def _u16(raw, off):
+    if off + 2 > len(raw):
+        return None
+    return struct.unpack_from("<H", raw, off)[0]
 
-def _maybe_decode_deck(chunk):
-    L = len(chunk)
-    if L == 0:
+def _u32_le(raw, off):
+    if off + 4 > len(raw):
+        return None
+    return struct.unpack_from("<I", raw, off)[0]
+
+# ---------------------------------------------------------------------------
+# v3 — full 64-byte Steam Controller input-report decode.
+#
+# Byte-layout source of truth = InputPlumber's on-wire struct
+# `PackedInputDataReport` in src/drivers/steam_deck/hid_report.rs:262-473:
+#   #[packed_struct(bit_numbering = "msb0", size_bytes = "64")]
+# msb0 numbering over a 64-byte struct => bit 64 is byte 8's MSB, so a
+# field's byte-mask is 0x80 >> (bit % 8). Each report is serialized by
+# `self.state.pack()` — steam_deck.rs:440 (USB/vhci, DECK-DESK) and
+# steam_deck_uhid.rs:107 (UHID, DECK-GAME/12FB). Masks cross-checked against
+# SDL_hidapi_steamdeck.c (SteamDeckButtons).
+#
+# Header: [0]=0x01 major_ver, [1]=0x00 minor_ver, [2]=0x09 report_type,
+# [3]=0x40 report_size, [4..7]=u32 LE frame counter.
+# ---------------------------------------------------------------------------
+
+# Named buttons by byte index -> (byte-mask, name). Reserved/unnamed bits are
+# kept as None and never logged.
+DECK_BTN_BYTES = {
+    # byte 8, bits 64-71   (hid_report.rs:280-295)
+    8: ((0x80, "a"), (0x40, "x"), (0x20, "b"), (0x10, "y"),
+        (0x08, "l1"), (0x04, "r1"), (0x02, "l2"), (0x01, "r2")),
+    # byte 9, bits 72-79   (hid_report.rs:298-313)
+    9: ((0x80, "l5"), (0x40, "menu"), (0x20, "steam"), (0x10, "view"),
+        (0x08, "down"), (0x04, "left"), (0x02, "right"), (0x01, "up")),
+    # byte 10, bits 80-87  (hid_report.rs:316-331)
+    10: ((0x80, None), (0x40, "l3"), (0x20, None), (0x10, "r_pad_touch"),
+         (0x08, "l_pad_touch"), (0x04, "r_pad_press"),
+         (0x02, "l_pad_press"), (0x01, "r5")),
+    # byte 11, bits 88-95  (hid_report.rs:334-349) — only r3 (bit 93 = 0x04)
+    11: ((0x80, None), (0x40, None), (0x20, None), (0x10, None),
+         (0x08, None), (0x04, "r3"), (0x02, None), (0x01, None)),
+    # byte 13, bits 104-111  (hid_report.rs:370-385)
+    13: ((0x80, "r_stick_touch"), (0x40, "l_stick_touch"),
+         (0x20, None), (0x10, None), (0x08, None),
+         (0x04, "r4"), (0x02, "l4"), (0x01, None)),
+    # byte 14, bits 112-119  (hid_report.rs:388-403) — quick_access bit 117
+    14: ((0x80, None), (0x40, None), (0x20, None), (0x10, None),
+         (0x08, None), (0x04, "quick_access"), (0x02, None), (0x01, None)),
+}
+
+# stable display/compare order for a pressed-button set
+DECK_BTN_ORDER = (
+    "a", "b", "x", "y", "l1", "r1", "l2", "r2", "l3", "r3", "l4", "r4",
+    "l5", "r5", "steam", "menu", "view", "quick_access",
+    "up", "down", "left", "right",
+    "l_pad_touch", "r_pad_touch", "l_pad_press", "r_pad_press",
+    "l_stick_touch", "r_stick_touch",
+)
+
+# deck-protocol signature: byte0 = 0x01 major_ver, byte2 = 0x09 report_type
+DECK_HEADER_BYTES = (0x01, 0x09)
+
+# gyro raw-count magnitude below this counts as "quiet" (no real rotation)
+DECK_MOTION_MIN = 50
+
+def _deck_buttons(raw):
+    """Pressed named buttons in a 64-byte deck report (deterministic order)."""
+    if len(raw) < 15:
+        return []
+    pressed = set()
+    for bi, table in DECK_BTN_BYTES.items():
+        b = raw[bi]
+        for mask, name in table:
+            if name and (b & mask):
+                pressed.add(name)
+    return [n for n in DECK_BTN_ORDER if n in pressed]
+
+def decode_deck_report(raw):
+    """Decode one 64-byte virtual-deck input report into a dict, or None when
+    the frame does not match the deck protocol (so a 64-byte LEGION-SRC frame
+    is never mis-decoded). Axes are unpacked from the bytes cited above:
+      sticks  l_stick_x/y = 48-51, r_stick_x/y = 52-55  (i16 LE)
+      triggers l_trigg/r_trigg = 44-47                   (u16 LE)
+      accel accel_x/y/z = 24-29                          (i16 LE)
+      gyro   pitch/yaw/roll = 30-35                      (i16 LE)
+    The report's own "pitch/yaw/roll" labels ARE the gyro stream (they map to
+    SDL's sGyroX/Y/Z) — that is the MOTION a gyro fix must deliver."""
+    if len(raw) < 64:
+        return None
+    if raw[0] != DECK_HEADER_BYTES[0] or raw[2] != DECK_HEADER_BYTES[1]:
+        return None
+    return {
+        "frame": _u32_le(raw, 4),
+        "buttons": _deck_buttons(raw),
+        "lsx": _s16(raw, 48), "lsy": _s16(raw, 50),
+        "rsx": _s16(raw, 52), "rsy": _s16(raw, 54),
+        "lt": _u16(raw, 44), "rt": _u16(raw, 46),
+        "ax": _s16(raw, 24), "ay": _s16(raw, 26), "az": _s16(raw, 28),
+        "gx": _s16(raw, 30), "gy": _s16(raw, 32), "gz": _s16(raw, 34),
+    }
+
+def _decode_deck(raw):
+    """v2-compatible single-report decode hook (kept for back-compat; the real
+    64-byte decode lives in decode_deck_report())."""
+    dec = decode_deck_report(raw)
+    if dec is None:
         return {}
-    # single report with a gyro tail, or a tail of back-to-back 36-byte reports
-    if 36 <= L <= 40:
-        return _decode_deck(chunk)
-    if L > 40 and L % 36 == 0:
-        return _decode_deck(chunk[-36:])
-    return {}
+    return {"pitch": dec["gx"], "yaw": dec["gy"], "roll": dec["gz"]}
 
 def handle_hidraw(now):
-    """select() on all open hidraw fds; count reports, keep a decode sample,
-    and note first-seen frame lengths (wrong/odd formats become visible)."""
+    """select() on all open hidraw fds; count reports, keep a raw/decode
+    sample, note first-seen frame lengths (format signature), and for the
+    virtual-deck pids DECODE every report (buttons/axes/IMU) so a press or a
+    gyro blip is visible the instant it reaches Steam."""
     if not HID_DEVICES:
         return
     fds = [e["fd"] for e in HID_DEVICES.values()]
@@ -796,6 +967,11 @@ def handle_hidraw(now):
         if e["stopped"]:
             e["stopped"] = False
             log(f"HIDFLOW RESUME {_hid_label(e)} (/dev/{node} delivering data again)")
+        # v3: close an open FLOW GAP the moment the deck delivers again
+        if e["gap_active"]:
+            e["gap_active"] = False
+            e["gap_at"] = 0.0
+            log(f"FLOW GAP CLOSED {_hid_label(e)} (deck stream delivering again)")
         # first time we see a given frame length, log it (format signature)
         if (len(chunk) <= 128 and len(chunk) not in e["frames_seen"]
                 and len(e["frames_seen"]) < 32):
@@ -805,31 +981,124 @@ def handle_hidraw(now):
         if t2 - e["last_raw"] >= HID_RAW_SAMPLE:
             e["last_raw"] = t2
             e["last_hex"] = chunk[:24].hex(" ")
+        # -- v3: decode / inspect every virtual-deck report -------------------
         if e["pid"] in DECK_PIDS:
-            dec = _maybe_decode_deck(chunk)
-            if dec:
-                e["last_dec"] = dec
+            _handle_deck_reports(e, chunk, t2)
         e["last_data"] = t2
 
+def _handle_deck_reports(e, chunk, t2):
+    """Per-report decode + anomaly/gap flags for a virtual-deck hidraw.
+    Real deck reports are one 64-byte frame per hidraw read; a read may
+    occasionally contain several back-to-back 64-byte frames."""
+    label = _hid_label(e)
+    L = len(chunk)
+    if L and (L == 64 or (L > 64 and L % 64 == 0)):
+        reports = [chunk[i:i + 64] for i in range(0, L, 64)]
+    else:
+        # expected 64 bytes; any other length on a deck pid is an anomaly
+        # (flagged only once a normal 64-byte frame has already been seen)
+        if L and 64 in e["frames_seen"] and not e["bad_len_logged"]:
+            e["bad_len_logged"] = True
+            log(f"FLOW GAP {label} anomalous frame len={L} "
+                f"(deck reports are 64 bytes) head={chunk[:12].hex(' ')}")
+        reports = [] if L == 0 else [chunk]
+    for raw in reports:
+        dec = decode_deck_report(raw)
+        if dec is None:
+            if len(raw) == 64 and not e["bad_hdr_logged"]:
+                e["bad_hdr_logged"] = True
+                log(f"FLOW GAP {label} 64-byte frame with non-deck header "
+                    f"head={raw[:12].hex(' ')} (protocol mismatch?)")
+            continue
+        e["last_dec"] = dec
+        e["dec_count"] += 1
+        # -- button-set change -> a DECODE line proving a press reached Steam
+        sig = ",".join(dec["buttons"])
+        if sig != e["btn_prev"]:
+            e["btn_prev"] = sig
+            log(f"DECODE {label} frame={dec['frame']} btn=[{sig or '-'}] "
+                f"ls=({dec['lsx']},{dec['lsy']}) rs=({dec['rsx']},{dec['rsy']}) "
+                f"lt={dec['lt']} rt={dec['rt']} "
+                f"gyr=({dec['gx']},{dec['gy']},{dec['gz']})")
+        # -- gyro/accel motion present -> a MOTION line proving IMU reaches deck
+        mag = _mag(dec["gx"], dec["gy"], dec["gz"])
+        if mag > DECK_MOTION_MIN:
+            e["mot_count"] += 1
+            e["mot_last"] = t2
+            if t2 - e["mot_log"] >= HID_MOTION_LOG_MIN:
+                e["mot_log"] = t2
+                log(f"MOTION {label} frame={dec['frame']} mag={mag} "
+                    f"gyr=({dec['gx']},{dec['gy']},{dec['gz']}) "
+                    f"acc=({dec['ax']},{dec['ay']},{dec['az']})")
+        # -- frame-counter continuity (bytes 4-7, u32 LE) --------------------
+        # Both deck targets increment the counter once per poll() and emit one
+        # report per poll, so consecutive reads normally show delta 0 or 1.
+        # A backwards jump = new generation; a monotonic jump > 1 = dropped
+        # reports (only flagged for the UHID pids, which emit every poll).
+        fr = dec["frame"]
+        prev = e["last_frame"]
+        e["last_frame"] = fr
+        if prev is not None and fr is not None and fr != prev:
+            if fr < prev:
+                if t2 - e["jump_log"] >= 1.0:
+                    e["jump_log"] = t2
+                    log(f"GENRESET {label} frame {prev} -> {fr} "
+                        f"(new generation: counter went backwards)")
+            elif fr - prev > 1 and e["pid"] in (0x12F0, 0x12FB):
+                if t2 - e["jump_log"] >= 1.0:
+                    e["jump_log"] = t2
+                    log(f"FRAMEJUMP {label} frame {prev} -> {fr} "
+                        f"(skipped {fr - prev - 1} report(s) between reads)")
+
 def emit_hid_summary(now):
-    """Once per second: one liveness line per watched hidraw, plus FLOW STOP
-    when a source goes quiet while still present (connection lost HERE)."""
+    """Once per second, per watched hidraw:
+      - v2 HIDFLOW liveness line (markers/behaviour preserved);
+      - v3 FLOW GAP: a GAMING deck that went silent while the physical source
+        is still active -> the exact direction/instant input stopped;
+      - v3 ACTIVITY: ONE compact cross-direction correlation line
+        (EV | LEGION-SRC reads | per-DECK reads + MOTION presence)."""
+    global EV_ACT_COUNT
+    # -- pre-pass: is the physical source (LEGION-SRC) still delivering? ------
+    # (computed before the per-device loop so the result is order-independent)
+    src_alive = False
+    src_rd = 0
+    for e in HID_DEVICES.values():
+        if e["vid"] != 0x17EF:
+            continue
+        src_rd += e["count"]
+        if e["count"] or (e["last_data"] is not None
+                          and now - e["last_data"] < FLOW_EV_WINDOW):
+            src_alive = True
+    ev_active = bool(EV_ACT_LAST) and (now - EV_ACT_LAST) <= FLOW_EV_WINDOW
+    ev_count = EV_ACT_COUNT
+    EV_ACT_COUNT = 0
+
+    deck_parts = []
     for node, e in list(HID_DEVICES.items()):
         label = _hid_label(e)
         reads = e["count"]
         nbytes = e["nbytes"]
         e["count"] = 0
         e["nbytes"] = 0
+        # v3 per-second decode counters (consumed here, then reset)
+        dec_rd = e["dec_count"]
+        mot_rd = e["mot_count"]
+        e["dec_count"] = 0
+        e["mot_count"] = 0
         if reads:
             dec = e.get("last_dec") or {}
-            dstr = ""
-            if dec:
-                dstr = (" gyro(p,y,r)={},{},{}".format(
-                    _fmt(dec.get("pitch")), _fmt(dec.get("yaw")),
-                    _fmt(dec.get("roll"))))
+            dstr = mstr = ""
+            if e["pid"] in DECK_PIDS and dec:
+                dstr = (" gyr(p,y,r)={},{},{}".format(
+                    _fmt(dec.get("gx")), _fmt(dec.get("gy")),
+                    _fmt(dec.get("gz"))))
+                if mot_rd:
+                    mstr = " mot={}/{}".format(mot_rd, dec_rd or reads)
             log(f"HIDFLOW {label} {reads} rd/s {nbytes} B/s "
-                f"len={e['last_len']}{dstr}")
+                f"len={e['last_len']}{dstr}{mstr}")
             e["stopped"] = False
+            if e["pid"] in DECK_PIDS:
+                deck_parts.append((label, reads, mot_rd, dec_rd))
             continue
         # -- no traffic this second -> silence / flow-stop logic --------------
         last = e["last_data"]
@@ -844,8 +1113,44 @@ def emit_hid_summary(now):
                 else:
                     log(f"FLOW IDLE {label} (event-driven iface or nothing "
                         f"reading it -- informational, {age:.0f}s since attach)")
+            # v3 FLOW GAP: gaming deck attached but never delivered while the
+            # user is physically active (input blocked before Steam)
+            if (e["pid"] in (0x12F0, 0x12FB) and age >= FLOW_NEVER_AFTER
+                    and ev_active and not e["gap_active"]):
+                e["gap_active"] = True
+                e["gap_at"] = now
+                log(f"FLOW GAP {label} attached {age:.0f}s, NEVER delivered "
+                    f"while PHYSICAL EV ACTIVE -- input reaching Steam "
+                    f"blocked here")
+            elif (e["pid"] in (0x12F0, 0x12FB) and e["gap_active"]
+                    and now - e["gap_at"] >= FLOW_GAP_HB):
+                e["gap_at"] = now
+                log(f"FLOW GAP {label} (still never delivered "
+                    f"{age:.0f}s after attach)")
+            if e["pid"] in DECK_PIDS:
+                deck_parts.append((label, 0, mot_rd, dec_rd))
             continue
         silent = now - last
+        if e["pid"] in DECK_PIDS:
+            deck_parts.append((label, 0, mot_rd, dec_rd))
+        # -- v3 FLOW GAP: gaming deck quiet while source/EV still active ------
+        # This is the loud "data lost HERE" marker: physical side is alive
+        # (EV events and/or LEGION-SRC still delivering) but the deck stream
+        # that Steam reads has stopped.
+        if (e["pid"] in (0x12F0, 0x12FB) and silent >= FLOW_GAP_AFTER
+                and (ev_active or src_alive)):
+            if not e["gap_active"]:
+                e["gap_active"] = True
+                e["gap_at"] = now
+                log(f"FLOW GAP {label} deck silent {silent:.1f}s while "
+                    f"source continues (EV={'active' if ev_active else 'idle'}"
+                    f" src={'alive' if src_alive else 'quiet'}) -- input "
+                    f"reaching Steam STOPPED here")
+            elif now - e["gap_at"] >= FLOW_GAP_HB:
+                e["gap_at"] = now
+                log(f"FLOW GAP {label} (still silent {silent:.0f}s while "
+                    f"source continues)")
+        # -- v2 FLOW STOP / IDLE (unchanged behaviour) ------------------------
         if silent >= FLOW_STOP_AFTER and not e["stopped"]:
             e["stopped"] = True
             e["stopped_at"] = now
@@ -855,6 +1160,20 @@ def emit_hid_summary(now):
             e["stopped_at"] = now
             log(f"FLOW STOP {label} (still silent, "
                 f"{now - last:.0f}s since last data)")
+
+    # -- v3: one compact cross-direction ACTIVITY correlation line ------------
+    if HID_DEVICES or ev_count or ev_active:
+        act = ["EV={}{}".format(
+            ev_count if ev_count < 100 else "100+",
+            "!" if ev_active else "")]
+        act.append("src={}rd/s{}".format(
+            src_rd, "" if src_alive else "(quiet)"))
+        for label, reads, mot, dec in deck_parts:
+            if reads:
+                act.append(f"{label}={reads}rd/s mot={mot}/{dec or reads}")
+            else:
+                act.append(f"{label}=0rd/s SILENT")
+        log("ACTIVITY " + " | ".join(act))
 
 # ---------------------------------------------------------------------------
 # v2 — mode / attach-detach state tracker
@@ -1009,7 +1328,9 @@ def _steam_bases():
     return bases
 
 def steam_scan(now):
-    """Diff the Steam registry + controller log for every desktop user."""
+    """Diff the Steam registry + controller log + controller_ui (per-app Steam
+    Input activation, direction D) for every desktop user, and scan the running
+    Steam game processes."""
     bases = _steam_bases()
     if not bases:
         return
@@ -1018,6 +1339,9 @@ def steam_scan(now):
             base, ".local/share/Steam/config/virtualgamepadinfo.txt"))
         _steam_controller_log(os.path.join(
             base, ".local/share/Steam/logs/controller.txt"))
+        _steam_controller_ui_log(os.path.join(
+            base, ".local/share/Steam/logs/controller_ui.txt"))
+    _steam_procs()
 
 def _steam_registry(path):
     exists = os.path.exists(path)
@@ -1138,6 +1462,160 @@ def _steam_controller_log(path):
     if extra:
         log(f"STEAM controller: +{extra} more matching lines this scan")
 
+def _steam_ui_focus(kind, appid):
+    """Human-readable focus label for a controller_ui OnFocusWindowChanged."""
+    if kind == "game window type":
+        return f"focused AppID {appid} (GAME window — Steam Input on the game)"
+    if appid == "769":
+        return "focused AppID 769 (Steam client UI)"
+    if appid == "413080":
+        return "focused AppID 413080 (Steam Big Picture / desktop shell)"
+    return f"focused AppID {appid} ({kind})"
+
+def _steam_ui_focus_from_text(lines):
+    """Most recent OnFocusWindowChanged event in `lines` -> label or None."""
+    last = None
+    for line in lines:
+        m = STEAM_UI_FOCUS_RE.search(line)
+        if m:
+            last = _steam_ui_focus(m.group(1), m.group(2))
+    return last
+
+def _steam_ui_focus_from_tail(path, size):
+    """Read the file tail (up to STEAM_UI_TAIL_BYTES) purely for the startup
+    baseline focus label."""
+    try:
+        with open(path, "r", errors="replace") as f:
+            if size > STEAM_UI_TAIL_BYTES:
+                f.seek(size - STEAM_UI_TAIL_BYTES)
+            return _steam_ui_focus_from_text(f.read().splitlines())
+    except Exception:
+        return None
+
+def _steam_controller_ui_log(path):
+    """v3.1 — tail-diff Steam's controller_ui.txt (per-app Steam Input
+    activation evidence, direction D). Filtered to per-game config loads, focus
+    events and controller identity; logs a compact FOCUS marker on AppID change
+    only. Nothing before logger start is replayed."""
+    global STEAM_UI_FOCUS
+    cur = STEAM_CACHE.get(path)
+    if cur is None:
+        cur = {"ui_pos": 0, "ui_present": None}
+        STEAM_CACHE[path] = cur
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        if cur.get("ui_present") is not False:
+            cur["ui_present"] = False
+            log(f"STEAM UI: controller_ui log not present yet: {path}")
+        return
+    if cur.get("ui_present") is not True:
+        cur["ui_present"] = True
+        cur["ui_pos"] = size   # start from the end: only NEW lines get logged
+        log(f"STEAM UI: controller_ui log present, size={size} "
+            f"(tail-only from now): {path}")
+        focus = _steam_ui_focus_from_tail(path, size)
+        if focus:
+            STEAM_UI_FOCUS = focus
+            log("STEAM UI FOCUS: baseline " + focus)
+        return
+    pos = cur.get("ui_pos", 0)
+    if size < pos:             # rewritten/rotated -> start from scratch
+        pos = 0
+    if size == pos:
+        return
+    if size - pos > STEAM_UI_TAIL_BYTES:
+        pos = size - STEAM_UI_TAIL_BYTES
+    try:
+        with open(path, "r", errors="replace") as f:
+            f.seek(pos)
+            newtext = f.read()
+    except Exception:
+        return
+    cur["ui_pos"] = size
+    newlines = newtext.splitlines()
+    # -- compact focus transition (only when the focused AppID actually changed)
+    focus = _steam_ui_focus_from_text(newlines)
+    if focus and focus != STEAM_UI_FOCUS:
+        STEAM_UI_FOCUS = focus
+        log("STEAM UI FOCUS: " + focus)
+    # -- raw filtered evidence lines (bounded, noise excluded) ----------------
+    shown = 0
+    extra = 0
+    for line in newlines:
+        if (STEAM_UI_CAND_RE.search(line)
+                and not STEAM_UI_NOISE_RE.search(line)):
+            if shown < STEAM_UI_MAX_LINES:
+                log("STEAM UI: " + line.strip())
+                shown += 1
+            else:
+                extra += 1
+    if extra:
+        log(f"STEAM UI: +{extra} more matching lines this scan")
+
+def _steam_procs():
+    """v3.1 — running game processes launched by Steam, read from the
+    SteamAppId/SteamGameId env of every /proc/<pid>/environ. Logs pid-level
+    add/end lines plus a compact summary when the active game set changes."""
+    global STEAM_APP_SUMMARY, STEAM_PROC_SET
+    procs = {}                 # pid -> (appid, name, cmd)
+    games = {}                 # appid -> [pids]
+    try:
+        entries = os.listdir("/proc")
+    except Exception:
+        return
+    for p in entries:
+        if not p.isdigit():
+            continue
+        try:
+            with open(f"/proc/{p}/environ", "rb") as f:
+                data = f.read()
+        except Exception:
+            continue
+        appid = None
+        for kv in data.split(b"\x00"):
+            k, _, v = kv.partition(b"=")
+            if k in (b"SteamAppId", b"SteamGameId"):
+                appid = v.decode("ascii", "replace").strip() or None
+                break
+        if not appid:
+            continue
+        name = ""
+        cmd = ""
+        try:
+            with open(f"/proc/{p}/comm") as f:
+                name = f.read().strip()
+        except Exception:
+            pass
+        try:
+            with open(f"/proc/{p}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\x00", b" ").decode(
+                    "utf-8", "replace").strip()
+        except Exception:
+            pass
+        procs[p] = (appid, name, cmd[:160])
+        games.setdefault(appid, []).append(p)
+    # -- pid-level transitions -------------------------------------------------
+    old = STEAM_PROC_SET
+    for p in sorted(set(procs) - set(old)):
+        appid, name, cmd = procs[p]
+        log(f"STEAM PROC: AppID {appid} running pid={p} name={name} "
+            f"cmd={cmd or '(no cmdline)'}")
+    for p in sorted(set(old) - set(procs)):
+        appid, name, _cmd = old[p]
+        log(f"STEAM PROC: AppID {appid} process ended (pid={p} name={name})")
+    for p in sorted(set(old) & set(procs)):
+        if procs[p][0] != old[p][0]:
+            log(f"STEAM PROC: pid={p} AppID {old[p][0]} -> {procs[p][0]}")
+    STEAM_PROC_SET = procs
+    # -- compact summary when the active set changes ---------------------------
+    summary = ", ".join(f"{a}[{len(ps)}]" for a, ps in sorted(games.items()))
+    if not summary:
+        summary = "(none)"
+    if summary != STEAM_APP_SUMMARY:
+        STEAM_APP_SUMMARY = summary
+        log("STEAM PROC: running Steam games: " + summary)
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -1185,6 +1663,11 @@ def main():
     threading.Thread(target=ipj_tail_loop, daemon=True).start()
     log("LOGGER: v2 channels active — hidraw(17EF:61EB + 28DE:12F0/12FB/1205), "
         "InputPlumber journal, Steam registry + controller log")
+    log("LOGGER: v3.1 decode active — 64-byte deck reports decoded per report "
+        "(DECODE/MOTION), cross-direction ACTIVITY + FLOW GAP loss markers")
+    log("LOGGER: v3.1 Steam Input activation tracking — controller_ui focus "
+        "(STEAM UI / STEAM UI FOCUS) + running-game AppID (STEAM PROC) — "
+        "direction D (Steam -> game)")
 
     last_snap = last_hb = last_iio = last_sess = last_iio_rescan = \
         last_flow = last_steam = time.monotonic()

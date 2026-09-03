@@ -567,24 +567,412 @@ ROOT CAUSE (definitive, journalctl): InputPlumber's steam_deck target attaches a
     kernel: PM: failed to suspend devices: Device or resource busy  (error -16 / EBUSY)
     systemd-sleep: Failed to put system to sleep. System resumed again: Device or resource busy
 → suspend aborted at the vhci device → instant "wake". s2idle is the ONLY sleep state (same as Steam Deck) → NOT a C-states problem.
-FIX (built-in, present but DISABLED): `inputplumber-suspend.service` (rootfs/usr/lib/systemd/system/...) — WantedBy=sleep.target:
+ANSWER TO "могли ли staged-изменения сломать пробуждение": NO. Verified: `git diff --cached` has NO line touching suspend/vhci/usbip/stop()/resume/load_vhci_hcd in ANY staged file (grep on staged steam_deck.rs diff returned nothing). Staged = gyro mapping (driver.rs, legion_state.rs, lego/driver.rs), attach-state detection, IIO center filtering, device naming → cosmetic. None can affect suspend.
+FIX (built-in, present but DISABLED): `inputplumber-suspend.service` (rootfs/usr/lib/systemd/system/...) — `systemctl is-enabled` = disabled, is-active = inactive. WantedBy=sleep.target:
     ExecStart=busctl call .../Manager org.shadowblip.InputManager HookSleep
     ExecStop=busctl call .../Manager org.shadowblip.InputManager HookWake
-Full chain (verified in source): HookSleep → ManagerCommand::SystemSleep (manager.rs:474) → composite_device.suspend() → targets.handle_suspend() (targets.rs:539) → target.stop() → SteamDeckDevice::stop() (drops vhci connection) → 200ms sleep. HookWake → SystemWake → handle_resume() (targets.rs:582) → set_devices() recreates the virtual controller.
-
+Full chain (verified in source): HookSleep → ManagerCommand::SystemSleep (manager.rs:474) → composite_device.suspend() (mod.rs:521-543) → targets.handle_suspend() (targets.rs:539) → target.stop() → SteamDeckDevice::stop() → device.stop() (drops vhci connection) → 200ms sleep. HookWake → SystemWake → handle_resume() (targets.rs:582) → set_devices() recreates the virtual controller. RUNNING daemon (PID 116247, v4) exposes HookSleep/HookWake (busctl introspect confirmed) → fix works WITHOUT rebuild.
+NEXT STEP (user-approved order, ONE action at a time): `sudo systemctl enable --now inputplumber-suspend.service`, then test suspend (journalctl should show vhci connection dropped before sleep, NO -EBUSY). Restores Steam Deck-like suspend.
 ### SUSPEND FIX APPLIED + VERIFIED (2026-08-23 ~20:32-20:35 local) — USER CONFIRMED: "супер, работает" ✅
-- `sudo systemctl enable --now inputplumber-suspend.service` → symlink /etc/systemd/system/sleep.target.wants/... (in /etc → PERSISTS across reboot). No rebuild needed.
-- HookSleep 20:33:00 → `Target devices before suspend: [keyboard, deck (Valve Steam Deck Controller), mouse]` → `Finished preparing suspending all target devices` (vhci virtual Steam Controller detached); HookWake 20:33:00 → `Preparing to resume all target devices` → CreateTargetDevice(deck) + AttachTargetDevice(gamepad0) → recreated.
+- `sudo systemctl enable --now inputplumber-suspend.service` → symlink /etc/systemd/system/sleep.target.wants/inputplumber-suspend.service (in /etc → PERSISTS across reboot). No rebuild needed.
+- Manual `--now` start proved the mechanism end-to-end in daemon log (PID 116247):
+  - HookSleep 20:33:00 → `Target devices before suspend: [keyboard, deck (Valve Steam Deck Controller), mouse]` → `Finished preparing suspending all target devices` (vhci virtual Steam Controller detached);
+  - HookWake 20:33:00 → `Preparing to resume all target devices` → CreateTargetDevice(deck) + AttachTargetDevice(gamepad0) → recreated; 20:33:17 composite gamepad recreated.
 - USER TEST: real suspend → NO instant wake, sleep works like Steam Deck. CONFIRMED.
-- The suspend unit is a sleep hook (WantedBy=sleep.target), NOT a login service — do NOT add WantedBy=multi-user.target (would cause spurious HookSleep/HookWake at boot due to StopWhenUnneeded).
+- REBOOT persistence: BOTH services already enabled & persistent — inputplumber.service (daemon) symlink in multi-user.target.wants since Aug 21 (auto-start at login), inputplumber-suspend.service in sleep.target.wants (auto-trigger on every sleep). Nothing more to configure; the suspend unit is a sleep hook (WantedBy=sleep.target), NOT a login service — do NOT add WantedBy=multi-user.target (would cause spurious HookSleep/HookWake at boot due to StopWhenUnneeded).
 
 ### RESUME FIX (2026-08-24) — vhci Steam Controller NOT in Steam after wake → udev re-trigger on HookWake — USER CONFIRMED: "заебись, работает" ✅
 SYMPTOM (user): sleep+resume works (no instant wake after the suspend fix), but after wake the virtual Steam Deck controller (28de:1205, joysticks + touchpads) is MISSING from Steam ("нету в стиме джойстиков").
-ROOT CAUSE (definitive, source walk): the resume path re-creates the vhci controller but NEVER re-triggers udev. HookWake → ManagerCommand::SystemWake (manager.rs:496) → targets.handle_resume() (targets.rs:582) → set_devices() re-creates the virtual Steam Deck controller, BUT SystemWake does NOT re-trigger source/udev discovery. Steam ran through the whole suspend → only ever saw the OLD (destroyed) controller → never re-detects the re-created one.
+ROOT CAUSE (definitive, source walk): the resume path re-creates the vhci controller but NEVER re-triggers udev. HookWake → ManagerCommand::SystemWake (manager.rs:496) → targets.handle_resume() (targets.rs:582) → set_devices() re-creates the virtual Steam Deck controller (fresh vhci/uinput nodes), BUT SystemWake does NOT re-trigger source/udev discovery. Steam ran through the whole suspend → it only ever saw the OLD (destroyed) controller → never re-detects the re-created one.
 FIX (resume side ONLY — suspend side untouched): after HookWake, force a udev re-scan of the input/hidraw/iio nodes so Steam re-detects the re-created 28de:1205 controller:
     udevadm trigger --subsystem-match=input --subsystem-match=hidraw --subsystem-match=iio
   NO serial/device filter — the vhci controller's input nodes MUST be included for Steam to re-scan. (An earlier attempt with `--property-match=ID_SERIAL_SHORT=...` would EXCLUDE it → wrong.)
-  Applied live as an ExecStop override (user confirmed working), then baked into the SOURCE unit rootfs/usr/lib/systemd/system/inputplumber-suspend.service in this patch:
+  Applied live as an ExecStop override (user confirmed working):
+    [Service]
+    ExecStop=
     ExecStop=/bin/bash -c 'busctl call org.shadowblip.InputPlumber /org/shadowblip/InputPlumber/Manager org.shadowblip.InputManager HookWake; sleep 2; udevadm trigger --subsystem-match=input --subsystem-match=hidraw --subsystem-match=iio'
-  ExecStart/HookSleep (suspend side) is BYTE-IDENTICAL to upstream — sleep mechanism untouched.
+  VERIFICATION (live): user restarted inputplumber + applied the drop-in → joysticks/touchpads back in Steam. CONFIRMED.
+NOW IN THE PATCH (2026-08-24): the fix is baked into the SOURCE unit rootfs/usr/lib/systemd/system/inputplumber-suspend.service — ExecStop is the exact `/bin/bash -c '...HookWake; sleep 2; udevadm trigger...'` above. ExecStart/HookSleep (suspend side) is BYTE-IDENTICAL to upstream — the sleep mechanism is untouched. Fresh builds get the fix via the package; the already-running system keeps its /etc drop-in (same content, no conflict).
 LESSON: any target DESTROYED on suspend and RECREATED on resume (like the vhci Steam Controller) needs a udev re-trigger on wake, otherwise clients that ran through suspend (Steam) never re-detect it.
+
+## BAZZITE 44.20260831 GYRO REGRESSION — OGUI 0.46.0-11 FORCES deck-uhid (2026-09-01, INVESTIGATION RECORD)
+### Task
+READ-ONLY root-cause: gyro stopped after Bazzite update 44.20260825→44.20260831 on Legion Go 2 (DMI 83N0). Deliverables: what the update changed, root cause, minimal /etc fix (exact commands), update-resilient auto-reapply notes. Do NOT modify suspend side (ExecStart/HookSleep) of inputplumber-suspend.service. No destructive commands.
+
+### What the Bazzite update changed
+- opengamepadui (OGUI) **0.46.0-11.fc44** (Terra repo, packager Cappy Ishihara <cappy@fyralabs.com>, Build 2026-08-24 21:58, Install 2026-08-31 18:28). Files: `/usr/bin/opengamepadui`, `/usr/share/opengamepadui/` = `libopengamepadui-core.linux.template_release.x86_64.so` + `opengamepad-ui.pck` (COMPRESSED Godot → `strings` no-op) + `opengamepad-ui.x86_64` + `reaper` + `scripts/{make_nice,manage_input}`.
+- stock inputplumber **0.78.1-2.fc44** installed but NOT a service. Our custom binary (v0.77.4, git bb7424f) runs as `inputplumber.service` via override → `/opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v4`.
+
+### Root cause (CONFIRMED)
+OGUI resolved target gamepad = **"deck-uhid"** and called `set_target_devices(["deck-uhid","keyboard","mouse"])` on our custom inputplumber (PID 1546; journal artifact `cmd-1788276136197.txt` lines 2532-2634 at 16:26:47). This STOPPED `gamepad0(deck)` = vhci Steam Controller 28de:1205 (the device carrying Steam IMU via our patch) and CREATED `gamepad1(deck-uhid)` = UHID "Lenovo Legion Go 2 Controller" 0x12fb (**NO Steam IMU**). deck-uhid cannot trigger Steam IMU → gyro dead. Repeats: 3rd deck-uhid set at 16:26:52 ("already running, nothing to do").
+
+### Boot timing (who resolved what)
+- **16:14:44** OGUI#1 starts (`godot2026-09-01T16.14.44.log`, 6.2MB). "Spawning inputplumber" → spawned STOCK inputplumber (custom service did NOT exist yet). Resolved deck-uhid EVERY time, 2868ms(16:14:47)…1981509ms, via BOTH LaunchManager + GamepadSettings paths.
+- **16:26:41** `inputplumber.service` (custom v4, PID 1546) STARTS. config-load set#1 `[deck,keyboard,mouse,touchpad]` → gamepad0=deck created 16:26:42 (journal 405-410, 1504-1668).
+- **16:26:43-44** massive source teardown (controller re-enum; NO target-stop lines). Journal SILENT 16:26:44→16:26:47.
+- **16:26:44** OGUI#2 starts (`godot.log` 96KB NEW instance; "Spawning inputplumber" @46ms; line 2 ERROR "Couldn't find mapping for device (1)").
+- **16:26:46.5 (2491ms)** [LaunchManager] "Loading gamepad profile: .../global_default_overlay.json" → "Modified current profile with additional Steam Deck capabilities." → "Map Touchpad:CenterPad:Motion" → "**deck-uhid** needs no additional target devices." → "Setting target devices to: [\"deck-uhid\", \"keyboard\", \"mouse\"]".
+- **16:26:46.9 (2891ms)** [GamepadSettings] "Setting **Lenovo Legion Go 2** to profile: ..." → SAME deck-uhid resolution (SEPARATE code path!).
+- **16:26:47** PID 1546 processes deck-uhid set#2: stops gamepad0/touchpad0, creates gamepad1(deck-uhid). **16:26:52** 3rd set "already running".
+
+### Profile mtimes (PROOF deck NOT re-discovered this boot)
+- `global_default_overlay_deck.json` 816B mtime **Aug 28 15:35** (old, NOT touched this boot)
+- `global_default_overlay_deck-uhid.json` 816B mtime **Sep 1 16:26** (THIS boot)
+- Both identical content (deck & deck-uhid modifiers map CenterPad→RightPad per input_plumber.gd).
+- ⇒ If OGUI discovery had found live gamepad0(deck), it would have REWRITTEN deck.json at 16:26:46. It did NOT → discovery did NOT return "deck".
+
+### Settings fallback (CONFIRMED EMPTY — dead end)
+- `/home/legion/.local/share/opengamepadui/settings.cfg` = 37 bytes, mtime Sep 1 16:26, content ONLY `[general]\n\nenable_local_library=true`. NO `[input]` section → `gamepad_profile_target` fallback returns "".
+
+### Code proof: device_type == creation type_id (gamepad0 CANNOT report "deck-uhid")
+- `src/dbus/interface/target/mod.rs`: `TargetInterface::new(&TargetDeviceTypeId)` sets `device_type: device_type.as_str().to_owned()`; `#[zbus(property)] async fn device_type` returns it.
+- `src/input/target/mod.rs:511` `TargetDriver::run`: `TargetInterface::new(&self.type_id)`.
+- ⇒ gamepad0 created as "deck" reports device_type="deck". Discovery reading gamepad0 CANNOT yield "deck-uhid".
+
+### OGUI v0.46.0 resolution logic (GitHub source, verbatim structure)
+`launch_manager.gd` `set_gamepad_profile(path, target_gamepad="")`:
+- discovery: `for device in get_composite_devices()`: if target empty → `for target in device.get_target_devices()`: skip unless `dbus_path.contains("target/gamepad")`; `target_gamepad = target.get("device_type")`; break; if non-empty break.
+- fallback: `target_gamepad = settings_manager.get_value("input","gamepad_profile_target", target_gamepad)`.
+- `InputPlumber.load_target_modified_profile(device, path, target_gamepad)` → writes `<path>_<target>.json`.
+- if target non-empty: `target_devices=[target,"keyboard","mouse"]`; `match target:` touchpad-types append "touchpad"; else `logger.debug(target, "needs no additional target devices.")`; `device.set_target_devices(target_devices)`.
+`input_plumber.gd` `load_target_modified_profile`: "deck-uhid" and "deck" both → CenterPad→RightPad mod, write `<profile>_<modifier>.json`.
+
+### Hypotheses TESTED and EXCLUDED
+1. gamepad0(deck) reports device_type="deck-uhid" → **EXCLUDED** (device_type=type_id="deck", code proof).
+2. settings fallback `gamepad_profile_target="deck-uhid"` → **EXCLUDED** (settings.cfg has no [input]).
+3. discovery found gamepad0(deck) and resolved "deck" → **EXCLUDED** (deck.json mtime Aug 28, not rewritten this boot).
+4. "deck-uhid" passed explicitly from a game/app profile → **partially excluded** for LaunchManager path (global profile `set_gamepad_profile("")`, no explicit target).
+
+### CURRENT HYPOTHESIS (under verification)
+"deck-uhid" enters via ONE of TWO external paths (both visible in godot.log):
+- **(a) [GamepadSettings] path** — "Setting Lenovo Legion Go 2 to profile:" (2891ms) is a SEPARATE autoload that may explicitly pass target="deck-uhid" for device name "Lenovo Legion Go 2" (hardcoded device→target map in packaged OGUI, possibly Terra/Bazzite-patched).
+- **(b) OGUI-spawned stock inputplumber** — godot.log "Spawning inputplumber" @46ms; if the spawned stock 0.78.1 momentarily won `org.shadowblip.InputPlumber` or OGUI queried IT, discovery could read device_type="deck-uhid" from stock's composite (stock config may prefer deck-uhid for Legion Go 2).
+NOTE: PID 1546 DID receive set#2 at 16:26:47 → it owned the name by then; open question = what discovery returned at 16:26:46.5.
+
+### Next verification (read-only)
+- `busctl --system/--user status org.shadowblip.InputPlumber` → name owner PID (is stock inputplumber running / who answers OGUI).
+- grep OGUI settings/data for `gamepad_profile_target` / `deck-uhid`.
+- `strings` on `libopengamepadui-core...so` + `opengamepad-ui.x86_64` for "deck-uhid"/"needs no additional"/"Setting...to profile" (.pck compressed → strings no-op).
+- locate GamepadSettings source: `core/systems/input` listing; `gamepad_settings.gd` 404 on v0.46.0 → different path (search repo tree).
+
+### Fix implication (pending knob resolution)
+- If settings-based → fix = `[input] gamepad_profile_target=deck` in settings.cfg.
+- If hardcoded Lenovo→deck-uhid in packaged OGUI → need prevent-deck-uhid selection or a re-assert-deck watcher (OGUI kills deck every time it sets deck-uhid).
+
+## ⚠️ 2026-09-01 16:5x–17:1x — "OGUI kills Steam IMU" root cause OVERTURNED (LIVE PROOF) — new direction = INSIDE Steam
+### What the live tests PROVED (this session, read-only, /dev/hidraw18 world-readable via ACL → safe passive read)
+1. **deck-uhid DOES carry a live, motion-responsive Steam IMU.** Captured /dev/hidraw18 (28de:12fb, "Legion Go 2 Controller"):
+   - 64-byte reports, NO report-id byte, header bytes 0-3 = `01 00 09 40` (major_ver=0x01, minor_ver=0x00, report_type=0x09, report_size=64), frame counter bytes 4-7 (u32 LE).
+   - At rest: gyro≈(40,3,5) drift, accel≈gravity (−25,−1987,−569).
+   - PHASE A (device in motion): gyro swung **−1155…+1349**, accel >1g (−3078…+521) = real acceleration. ~371–460 reports/sec.
+   - PHASE B (held still): gyro settled to ±257 drift, accel back to pure gravity ≈−2034.
+   - ⇒ InputPlumber v4 → deck-uhid → hidraw18 → Steam path FULLY WORKS. Candidate (a) "source dead / pipeline not delivering" DISPROVEN.
+2. **Steam reads the data**: `/proc` fd scan → PID **6626** = `ubuntu12_32/steam` client holds **fd 109 → /dev/hidraw18** (opened 16:37). (Our InputPlumber root fds invisible — worked around via same-user fd scan.)
+3. **Steam never logs gyro handling**: `controller.txt` (1.5MB) grep `gyro|motion|imu|MotionSensor|sensor` = **ZERO matches** on BOTH days → no log-based gyro comparison possible; failure is purely in Steam's surfacing, not in data delivery.
+4. **No gyro binding in the active Steam Input config** — [`localconfig.vdf`] tail (mtime Sep 1 19:06, no .bak, controller_configs/ EMPTY):
+   - `apps → "306130"` = only `UseSteamControllerConfig "2"`, `SteamControllerRumble "-1"`, `SteamControllerRumbleIntensity "320"` — NO gyro action.
+   - `controller_registration → "28de-1205-73e3f64_12345678" → registration_complete "1"` — the vhci 28de:1205 WAS registered with Steam at some point (serial 73e3f64 matches deck-uhid), but that's a one-time flag, NOT an active binding.
+   - `controller_config → "306130" → usetime "255.1079…"` (cumulative use-time counter, no binding content).
+   - `compat.vdf` = only `platform_overrides` (Windows→Linux), irrelevant to controllers.
+5. **udev imu_bypass_enable warnings are benign**: `ATTR{left_handle/imu_bypass_enable}="true": Could not chase sysfs attribute` on 17ef:61eb interfaces (attr absent on this kernel) — IMU flows regardless.
+
+### Report byte layout (decode keys, from src/drivers/steam_deck/hid_report.rs)
+- gyro = bytes **30–35**: pitch 30-31, yaw 32-33, roll 34-35 (i16 LE); accel = bytes **24–29** (x/y/z i16 LE); no report-id.
+
+### Consequence for the OLD root-cause record
+The old record (lines 598-660) claimed "deck-uhid cannot trigger Steam IMU → gyro dead". That is **WRONG** — deck-uhid delivers a live Steam-Controller-protocol IMU report and Steam reads it. The vhci-deck theory was ALSO already overturned (Steam only ever saw deck-uhid on both days; deck→deck-uhid lifecycle + OGUI sequence identical).
+
+### New differentiator candidates (todo #5)
+- **(b1) Active per-game Steam Input config gyro binding** → **DISPROVEN** (no bindings, no per-game configs, no backup to diff).
+- **(b2) Steam runtime IMU fusion for "Unrecognized controller using V1 HID protocol"** — runtime-only; still the umbrella candidate; concrete sub-candidate = (b4) below.
+- **(b3) PRE-UPDATE regression** → **DISPROVEN** by user: "Сломалось ПОСЛЕ перезагрузки/обновления 1 сентября ~16:26 — до этого в тот же день работал" (broke AFTER the 16:26 reboot; worked earlier same day).
+- **(b4) deck-uhid Steam gyro calibration corrupted on boot -1 (16:25:32)** — NEW, see section below. ONLY file changed at the break boundary.
+- Next: user runtime test (Steam Input test screen + exact symptom) → confirm (b4) → /etc fix.
+
+## 2026-09-01 17:2x — DIFFERENTIATOR FOUND? deck-uhid gyro calibration `28de-12fb-73e3f64_gyro.vdf` rewritten on boot -1 (16:25:32) with ANOMALOUS drift values
+### User answer (RU): "Сломалось ПОСЛЕ перезагрузки/обновления 1 сентября ~16:26 — до этого в тот же день работал" → (b3) EXCLUDED. Break = boot 0 (16:26:44+).
+### Corrected boot timeline (verified via stat mtimes + kernel cmdline + rpm-ostree status)
+- boot -2: Aug 30 19:38 → Sep 1 16:13 (OLD deployment 44.20260825) — gyro WORKED ("работал в тот же день").
+- boot -1: Sep 1 16:14:44 → 16:26:44 (FIRST boot of NEW deployment 44.20260831) — **NO game launched** (Circuit Superstars 1097130 / Deadlock 1422450 `.acf` touched at 16:15/16:16 = Steam DOWNLOADS only, BytesToDownload>0, LastPlayed=Aug 22). OGUI+Steam started, deck-uhid resolved (godot2026-09-01T16.14.44.log).
+- boot 0: Sep 1 16:26:44+ (SECOND boot of same deployment) — ESO (306130) launched 16:34:35 (LastPlayed in appmanifest_306130.acf) → gyro BROKEN. ⇒ NEW deployment's ONLY gyro test (boot 0) was broken; boot -1 never gyro-tested.
+- Kernel cmdline: boot -1 `ostree=/ostree/boot.1/4008955000…`, boot 0 `ostree=/ostree/boot.0/4008955000…` = SAME commit 40089550. rpm-ostree status: BOTH deployments = 44.20260831, digest sha256:404c04a5… (old pruned).
+- journal `--list-boots` hour offsets are unreliable (clock jumped during boot -1: first entry 18:14:29 vs last 16:25:46) — trust filesystem stat mtimes instead.
+### Steam client EXCLUDED as differentiator
+- Installed client version 1785799196 (steamdeck_stable branch, package/beta=steamdeck_stable); `.installed`/`.manifest` mtime Aug 21 00:18 (BEFORE the working day Aug 30). bootstrap_log.txt 16:27:20 (boot 0): "Download skipped: version 1785799196, installed version 1785799196 … Nothing to do" → SAME client as working day.
+### THE DIFFERENTIATOR (runtime-state; the ONLY file changed at the break boundary)
+- `/home/legion/.local/share/Steam/config/28de-12fb-73e3f64_gyro.vdf` (deck-uhid Steam gyro calibration) **mtime 2026-09-01 16:25:32 +0200** (DURING boot -1, ~1 min before the 16:26 reboot) — stored drift: **x=-18.9475, y=-40.9227, z=-43.3948**.
+- All other devices' `_gyro.vdf` drift values: 28de-1205 (vhci Steam Controller) x=-3.49,y=-4.73,z=1.44 (mtime Aug 28 15:36); 28de-12ff x=-2.11,-3.43,0.78; f0d-1ab x=-1.49,2.93,-0.05; DSE3553 x=-1.34,2.81,-0.31. ⇒ deck-uhid values are **5–40× larger** than every other device.
+- SAME underlying lego IMU feeds BOTH vhci (28de:1205, calibrated Aug 28 = NORMAL) and deck-uhid (28de:12fb, calibrated Sep 1 16:25 = ANOMALOUS) → the Sep 1 calibration captured BAD data (device in motion / source teardown / first-boot-of-update startup race), NOT a real sensor change.
+- boot 0 did NOT re-write it (mtime still 16:25:32) → Steam LOADED the bad calibration at boot 0 and fused with it → gyro dead/wrong in ESO (16:34).
+- Corroborating unchanged files (NOT the differentiator): configset_28de-12fb-73e3f64.vdf EMPTY (`"controller_config" {}`, mtime Aug 21 01:03); preferences_28de-12fb-73e3f64.vdf name "SteamOS Handheld Controller", imu_one_euro_filter_enabled "0" (mtime Aug 21 00:52); steam_autocloud.vdf mtime Sep 1 16:30 (cloud sync ran on boot 0, harmless).
+### Test to CONFIRM (user, runtime — the only way)
+- Steam → Settings → Controller → Test screen: does the gyro visualization respond to physical movement NOW (boot 0)? + exact symptom: completely dead / drifts by itself / wrong axis?
+  - Test screen NOT responding (or wildly drifting) → Steam fusion mis-calibrated → (b4) CONFIRMED → FIX: delete `28de-12fb-73e3f64_gyro.vdf` (+ `28de-1205-73e3f64_gyro.vdf`) so Steam re-calibrates on next start.
+  - Test screen responding → Steam fusion OK; problem is game config/binding (re-open b1 with the actual ESO layout source).
+### /etc fix design (pending confirmation)
+- Tiny boot-time unit/script under /etc that sanity-checks deck-uhid `_gyro.vdf` drift magnitude (|x|,|y|,|z| > ~10) and deletes it if anomalous → Steam re-calibrates. Lives in /etc ⇒ survives OSTree/bootc updates; no Steam-side change; /etc/inputplumber-legiongo2-gyro-fix/.
+
+## 2026-09-01 18:3x — CORRECTION + USER CONFIRMATION (b4 STRENGTHENED) + vhci→deck-uhid TIMELINE
+### User feedback (RU, 3 points)
+1. Challenged "boot -1 and boot 0 = ONE AND THE SAME deployment 44.20260831" — insists a NEW bazzite build was installed and that vhci was used before / OGUI changed in the new build.
+2. Demanded everything be recorded in agent.md ("ужасная потеря логики").
+3. CONFIRMED: "экран теста действительно не реагирует на движения" → Steam Input controller test screen does NOT respond → Steam fusion is BROKEN NOW.
+### Deployment identity — VERIFIED (correctly stated, but clarified)
+- YES, a NEW build was installed: boot -2 ran OLD 44.20260825; boot -1 + boot 0 run NEW 44.20260831 (that NEW build IS the break vs the OLD deployment). So "новый билд установлен" = TRUE.
+- boot -1 and boot 0 are the SAME deployment: kernel cmdline `ostree=/ostree/boot.1/4008955000a8f4768f050502d83ade0fc8c2b831c60f4170a817918b472c7101` (boot -1) vs `/ostree/boot.0/…40089550…` (boot 0) = SAME commit; rpm-ostree: BOTH deployments = 44.20260831, digest sha256:404c04a5… (old pruned). ⇒ no boot-to-boot file change; the differentiator is a runtime/state artifact, not a second update.
+### vhci → deck-uhid TIMELINE (what device Steam saw when)
+- vhci Steam Controller 28de:1205 was the device ~Aug 21–28 (its `28de-1205-73e3f64_gyro.vdf` mtime Aug 28 15:36 = NORMAL drift -3.49/-4.73/1.44; configset Aug 24).
+- deck-uhid 28de:12fb was ALREADY the device on the WORKING day Aug 30 (controller.txt 2026-08-30T00:30:00 block: "Unrecognized controller using V1 HID protocol", serial 28de-12fb; OGUI resolved deck-uhid every boot). Steam only ever saw deck-uhid on both days (Aug 30 working / Sep 1 broken).
+- ⇒ "раньше использовался vhci, а сейчас OGUI в новой версии билда" is NOT the differentiator: deck-uhid (with live V1 IMU report) was already the active path when gyro WORKED (Aug 30).
+### CORRECTION: custom v4 inputplumber ran on BOTH boots (NOT stock on boot -1)
+- journalctl -b -1: 16:14:40 `systemd[1]: Starting inputplumber.service`; `inputplumber-legiongo2-gyro-v4[1567]: [2026-09-01T14:14:40Z INFO inputplumber] Starting InputPlumber v0.77.4` → **custom v4 ran on boot -1 (PID 1567)**.
+- Current boot: inputplumber.service active since 16:26:41, Main PID 1546 = v4. /etc/systemd/system/inputplumber.service.d/override.conf (Aug 23 01:53) intact: `ExecStart=` + `ExecStart=/opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v4` + `Environment=IP_GYRO_GAIN_CENTER=3.0` + `Environment=IP_GYRO_GAIN_HANDLE=5`.
+- ⇒ The 16:25:32 bad calibration was NOT caused by "stock inputplumber on boot -1" — deck-uhid on boot -1 HAD v4 IMU data. The anomalous calibration was captured from real-but-motion/teardown-state v4 data at 16:25 on the FIRST boot of the new deployment (device moving / re-enum / startup race), then LOADED (not re-written) by boot 0.
+### b4 status: USER CONFIRMED test screen is DEAD → b4 is the LEADING (testable) mechanism
+- Live IMU data flow to Steam PROVEN (Steam PID 6626 fd 109 → /dev/hidraw18, 64-byte V1 report gyro bytes 30-35) — data arrives, yet test screen dead → consistent with Steam fusing with the bad calibration.
+- DECISIVE TEST (user runs, next): back up + delete the bad calibration, restart Steam, re-check test screen:
+  - `cp /home/legion/.local/share/Steam/config/28de-12fb-73e3f64_gyro.vdf ~/28de-12fb-73e3f64_gyro.vdf.bak`
+  - `rm /home/legion/.local/share/Steam/config/28de-12fb-73e3f64_gyro.vdf`
+  - (optionally also delete `28de-1205-73e3f64_gyro.vdf`)
+  - restart Steam → open Controller Test screen → move device. If gyro now responds → b4 CONFIRMED.
+
+## 2026-09-01 20:5x — FIX APPLIED (reversible) + refined understanding (user demanded direct fix, refuses to run commands himself)
+### User instruction (RU): "твоя задача исправить, а не мне команды давать" + "работало вчера, сегодня я проверял только после полной перезагрузки и установки новой версии" → user wants ME to apply the fix; he only tests after update+reboot, so old-vs-new is the only boundary he cares about.
+### NEW: gain (IP_GYRO_GAIN_HANDLE=5 / IP_GYRO_GAIN_CENTER=3) applies ONLY in `src/input/target/steam_deck.rs` (`SteamDeckDevice` = vhci 28de:1205 path, `scale_gyro` line 91). `src/input/target/steam_deck_uhid.rs` (`SteamDeckUhidDevice` = deck-uhid 28de:12fb, what Steam actually uses) is NOT gain-scaled.
+- ⇒ Comparing deck-uhid `_gyro.vdf` drift vs vhci `_gyro.vdf` drift is NOT apples-to-apples (different units/scale paths). The earlier "5-40x anomalous" framing (b4) is WEAKENED — the values may simply be in a different unit space, not corrupt. The empirical reset test is still valid.
+### NEW: Steam exited 20:52:12 (app-steam@autostart.service, status 0); deck-uhid `_gyro.vdf` was RE-WRITTEN 20:53:10 (during Steam shutdown flush, after main PID exited) with x=-14.198879, y=-2.165266, z=+2.414565 (y/z now NORMAL; only x elevated) — the 16:25 all-axes-huge values are already replaced by a later calibration. So the calibration is FRESH, not stale.
+### localconfig.vdf: NO gyro enable/disable key (only `Deck_ConfiguratorInterstitialsVersionSeen_Gyro "4"` — a seen-flag); localconfig.vdf + compat.vdf both written 20:53:08-09 (shutdown flush). No user-side gyro toggle changed.
+### APPLIED (reversible, no sudo, user-level Steam config):
+- `mv /home/legion/.local/share/Steam/config/28de-12fb-73e3f64_gyro.vdf /home/legion/.local/share/Steam/config/28de-12fb-73e3f64_gyro.vdf.bak-20260901-2056`
+- `systemctl --user start app-steam@autostart.service` → active. Steam will re-calibrate deck-uhid on next device connection — device must be at REST (flat on table ~10 s).
+### PENDING user verification: Controller test screen response with device at rest. If still dead → calibration NOT the cause → look deeper at Steam V1-IMU fusion path / OGUI resolution.
+
+## 2026-09-01 21:19 — Steam Controller Configs dir CLOSED + FIX APPLIED (rootless, user-approved) — pending user check
+### Steam Controller Configs dir check (the ONE place I had not looked — closed, NOT the differentiator)
+- `steamapps/common/Steam Controller Configs/121519972/config/configset_28de-12fb-73e3f64.vdf` = empty `"controller_config" {}`, mtime **Aug 21 01:03** (pre-working-day) — NOT changed at the break.
+- `configset_controller_steamos_handheld.vdf` (58 B) mtime Aug 21 01:03; `preferences_28de-12fb-73e3f64.vdf` (990 B) mtime **Aug 21 00:52** (`imu_one_euro_filter_enabled "0"`, name "SteamOS Handheld Controller") — same as on working day.
+- ⇒ ALL per-device config/preferences files PREDATE the working day Aug 30 and are unchanged ⇒ config binding/set state is NOT the differentiator. (Earlier session only checked `config/`, missed this dir; now closed.)
+### FIX APPLIED 21:18-21:19 (user-approved "применяй сразу всё"; rootless — no sudo needed)
+- Backed up + deleted `config/virtualgamepadinfo.txt` → `.bak-20260901-2117` (Steam virtual-gamepad device registry).
+- Stopped Steam cleanly (`systemctl --user stop app-steam@autostart.service`; old PID 45198 confirmed gone).
+- Started Steam (`systemctl --user start app-steam@autostart.service`; NEW PID 53294). Steam REBUILT the registry from scratch: `[slot 0] SteamOS Handheld Controller VID=0x28de PID=0x12fb handle=0x028de12fb73e3f64 type=unknown` — fresh re-registration. Steam fd 108 → /dev/hidraw0 (device open in new session). controller.txt 21:19:09: `ConfigSet - found config set file on-disk: ...configset_28de-12fb-73e3f64.vdf` + `configset_controller_steamos_handheld.vdf` (both pre-working-day, benign).
+- SKIPPED `systemctl restart inputplumber` (needs sudo password): REDUNDANT for re-init — deck-uhid already present carrying clean IMU; cleared registry + fresh Steam start = full device re-initialization. Kept as NEXT lever if this fails.
+### PENDING user check: Steam Controller test screen NOW (Steam restarted 21:19, registry rebuilt fresh). Device at rest ~10 s first. If gyro responds → FIXED (diagnosis confirmed: Steam registry/runtime re-init). If still dead → next lever: sudo `systemctl restart inputplumber` (recreate deck-uhid) + re-check.
+
+## 2026-09-01 21:25 — ✅ FIXED + ROOT CAUSE CONFIRMED (user: "Гироскоп ОЖИЛ — на тест-экране контроллера реагирует на движения. Проблема решена!")
+### ROOT CAUSE (final)
+- The differentiator was Steam's per-session virtual-gamepad runtime state for the deck-uhid instance, materialized in `~/.local/share/Steam/config/virtualgamepadinfo.txt` (the device registry: `[slot 0] SteamOS Handheld Controller VID=0x28de PID=0x12fb handle=0x028de12fb73e3f64 type=unknown`). On the new deployment's first boot (Sep 1 ~16:2x) Steam registered the deck-uhid in a state where it read the device (fd 108) but did NOT fuse its IMU (dead test screen + dead ESO). NOT any file under the control of inputplumber, NOT the calibration (`_gyro.vdf` — proven unnecessary), NOT the data path (clean V1 IMU verified live), NOT the config sets (all pre-working-day).
+### FIX THAT WORKED (applied BY ME, user-approved, rootless — no sudo)
+1. Backed up `config/virtualgamepadinfo.txt` → `.bak-20260901-2117` (reversible).
+2. Stopped Steam: `systemctl --user stop app-steam@autostart.service` (old PID 45198 gone).
+3. Deleted `config/virtualgamepadinfo.txt` (cleared registry).
+4. Started Steam: `systemctl --user start app-steam@autostart.service` (new PID 53294). Steam REBUILT the registry fresh (same entry re-created automatically) and re-initialized the deck-uhid IMU → gyro responds on the test screen. Steam fd 108 → /dev/hidraw0.
+- `systemctl restart inputplumber` was NOT needed (deck-uhid already present with clean IMU; cleared registry + fresh Steam start performed the re-init). Registry is auto-rebuilt by Steam, so clearing it is safe and settings-free.
+### DURABILITY / next steps
+- UNTESTED: whether a REBOOT re-corrupts the registry (the corruption appeared on the FIRST boot of the new deployment, possibly a first-boot/startup-race artifact, possibly recurring). User's history: broke after update+reboot. → Recommend a reboot test to confirm the fix persists.
+- If it recurs after reboot: the fix is 100% reproducible (clear `virtualgamepadinfo.txt` + restart Steam). For AUTOMATION (deliverable d/e), an /etc oneshot unit that deletes the registry early in boot (before Steam starts) makes each boot re-initialize the deck-uhid fresh — see /etc fix design below.
+
+## 2026-09-01 21:1x — b4 REFUTED + FULL DATA-PATH PROOF + Steam-registry EXHAUSTION (read-only validation)
+### b4 (bad calibration) DEFINITIVELY REFUTED — two independent proofs
+- PROOF 1 (file history): `28de-12fb-73e3f64_gyro.vdf` did NOT exist on the WORKING day Aug 30 (only vhci `28de-1205` mtime Aug 28 15:36 + other devices pre-Aug 21). Working day = NO calibration file + gyro WORKED ⇒ the calibration file is NOT required for gyro to work and its absence/presence is NOT the gate.
+- PROOF 2 (empirical): I moved the file → `.bak-20260901-2056` (20:53) + user restarted Steam himself (PID 45198, 20:59:24) → we are in EXACTLY the Aug 30 file-state (no `_gyro.vdf`) → gyro STILL dead AND Steam did NOT re-create the file. Restoring the working-day file-state does NOT restore gyro ⇒ calibration is NOT the cause.
+- The 16:25:32 file was a red herring: content = plausible drift x=-14.198879/y=-2.165266/z=+2.414565 (the 20:53:10 rewrite, which is the file I .bak'ed) — small bias values, NOT a fusion gate.
+### Live data-path PROOF (raw /dev/hidraw0 capture, device at rest) — CLEAN IMU IS reaching Steam
+- Report bytes: header `01 00 09 40` (major_ver=1, minor_ver=0, type=0x09, size=64); frame 4-7 increments (0x000CB742→0x000CB767); **accel 24-29 = `42 00 32 00 18 F8` = (66, 50, -2024 ≈ 1g down ✓ flat)**; **gyro 30-35 = `FF FF 02 00 01 00` = (pitch=-1, yaw=2, roll=1 ≈ 0 ✓ at rest)**; sticks 48-55 = `82 02 80 FF 80 00 FF 00` = (642, -128, 128, 255).
+- CORRECTED earlier misalignment: `82 02 80 ff 80 00` previously read as "gyro" is actually **l_stick_x=642 / l_stick_y=-128 / r_stick_x=128 at bytes 48-55**, NOT gyro. Real gyro (30-35) at rest ≈ 0. (Field map from `src/drivers/steam_deck/hid_report.rs` `PackedInputDataReport`: accel 24-29, pitch/yaw/roll 30-35, sticks 48-55.)
+- hidraw0 = 28DE:12FB virtual deck-uhid (DRIVER=hid-generic, empty HID_PHYS/UNIQ); Steam PID 45198 fd 108 → /dev/hidraw0; **NO 28DE:1205 vhci present now or on Aug 30**.
+### controller.txt — working day (Aug 30, lines 21908-21951) IDENTICAL to today
+- Same block: "Legion Go 2 Controller" → "Unrecognized controller using V1 HID protocol" → "!! Steam controller device opened for index 0" → "Steam Controller reserving XInput slot 0" → serial 28de-12fb-73e3f64, type `28de 12fb / /dev/hidraw7`. No gyro/imu lines ever; all recent `type:` entries are `28de 12fb` (no 28de 1205 since Aug 28).
+### journal — deck-uhid WAS the composite target on the working day
+- Aug 30 journal: `Setting target devices: [TargetDeviceTypeId { id: "deck-uhid", ... }]` + profile `global_default_overlay_deck-uhid.json` ⇒ deck-uhid (NOT vhci) was the active Steam path when gyro WORKED.
+### Steam per-device state — EXHAUSTIVELY ruled out (read-only)
+- NO `configset_28de-12fb-73e3f64.vdf`; NO `preferences_28de-12fb-73e3f64.vdf`; `controller.vdf` empty; `steamcontroller.vdf` empty.
+- localconfig.vdf: only `Deck_ConfiguratorInterstitialsVersionSeen_Gyro "4"` (UI seen-counter, not functional).
+- `virtualgamepadinfo.txt`: `[slot 0] name=SteamOS Handheld Controller VID=0x28de PID=0x12fb handle=0x028de12fb73e3f64 type=unknown` ⇒ device IS registered as the handheld's own controller (gyro-bearing class); type=unknown is normal for V1-protocol devices.
+- grep `73e3f64` / `12fb` across config+userdata: hits only virtualgamepadinfo.txt, localconfig.vdf, ESO remotecache.vdf (app 241100 per-device configset/preferences list), htmlcache (UI caches). ⇒ NO Sep 1-written per-device Steam state disables gyro.
+### PID 1546 fd note
+- `ls /proc/1546/fd` → 0 fds visible (root system service vs my user shell); cannot confirm /dev/uhid holder that way. Inconclusive, non-blocking.
+### NET STATE / distilled diagnosis (5-7 sources → 1-2)
+- Sources considered: (a) b4 calibration — REFUTED; (b) data path/IMU injection — REFUTED (clean live IMU); (c) Steam device presentation — REFUTED (identical); (d) Steam per-device persistent state — REFUTED (none exists); (e) Steam runtime fusion for this deck-uhid instance — REMAINS; (f) config binding b1 — REFUTED; (g) binary/deployment change — REFUTED (same v4, same kernel, same client 1785799196, same descriptor, same report, same deck-uhid target, Steam Input reserving XInput slot 0).
+- ⇒ EVERYTHING observable is byte-identical to the working day; Steam reads hidraw0 (fd 108) but does NOT fuse the IMU (dead test screen + dead ESO). The differentiator is Steam's RUNTIME (in-memory, per-instance) IMU-fusion decision for this deck-uhid — unobservable from Steam logs (zero gyro content in controller.txt).
+- FIX to apply (pending user confirm, applied BY ME): force Steam to re-initialize the deck-uhid instance. PRIMARY: recreate the virtual device while Steam runs (`systemctl restart inputplumber` ⇒ deck-uhid hotplug ⇒ Steam forced to re-detect/re-init the device). FALLBACK if hotplug alone is ignored: clear Steam's device registry (`virtualgamepadinfo.txt`) + full Steam restart with inputplumber already up (device present before Steam).
+
+## 2026-09-01 23:5x — FIX A (in-game suspend/resume controller loss) + FIX B (right-handle gyro slower than center) — ROOT CAUSES + combined build `inputplumber-legiongo2-gyro-v4.resume-gamefix`
+### FIX A — ROOT CAUSE (suspend→resume while a game is running ⇒ controller dead in-game; non-game case OK)
+- Resume flow ALWAYS destroys + re-creates the virtual Steam Controller as a **NEW vhci device**: SystemWake → `targets.handle_resume()` (clears `target_devices_suspended`) → `set_devices()` → `CreateTargetDevice(deck)` + `AttachTargetDevice` → `on_composite_device_attached` sets `config_rx` → `SteamDeckDevice::poll()` creates a brand-new `VirtualUSBDevice` (new serial `28de-1205-1ae1c0b`, deterministic). The existing poll() "reuse device" branch (`self.device.is_some()`) NEVER fires on this path — it is dead code for suspend/resume.
+- The systemd `inputplumber-suspend.service` (WantedBy=sleep.target) does `HookWake; sleep 2; udevadm trigger --subsystem-match=input --subsystem-match=hidraw --subsystem-match=iio` on wake. This **blind `sleep 2` RACES** with InputPlumber's async device re-creation: with a game running, resume is slower ⇒ the trigger often fires BEFORE the new vhci device exists ⇒ its `add` event is silently lost ⇒ Steam Input's active in-game session never re-associates the re-created controller ⇒ controller dead in-game. Non-game case works because Steam's controller manager periodically re-scans.
+- FIX (implemented in `src/input/target/steam_deck.rs`): fire the SAME `udevadm trigger --action add --subsystem-match=input --subsystem-match=hidraw --subsystem-match=iio` from WITHIN InputPlumber immediately AFTER the virtual device is created in `poll()`, gated by module-level `static DECK_CONTROLLER_STOPPED: AtomicBool` (set in `stop()`). ⇒ trigger runs only after a stop→recreate cycle (resume/reorder), never at initial startup, and guaranteed AFTER the device exists ⇒ race eliminated. Safe: "Steam Controller" NOT in `VIRT_DEVICE_WHITELIST` (manager.rs:62-67) ⇒ re-trigger won't make the manager re-manage the virtual device as a source. The service's own trigger can stay (harmless double-trigger, still covers iio).
+- New helpers: `mark_deck_controller_stopped()` (sets flag; called in `stop()`), `trigger_udev_after_recreation()` (swap(false) check + `std::thread::spawn` `Command::new("udevadm")...output()`; called in poll() creation branch). `AtomicOrdering` aliased to avoid clash with `cmp::Ordering`.
+### FIX B — ROOT CAUSE (right-handle gyro felt ~30% slower than center despite IP_GYRO_GAIN_HANDLE=5 > IP_GYRO_GAIN_CENTER=3.0)
+- Handle effective gain = `RIGHT_GYRO_SCALE(0.105) × IP_GYRO_GAIN_HANDLE(5.0) = 0.525` per unit raw; center = `CENTER_GYRO_SCALE(1.0) × IP_GYRO_GAIN_CENTER(3.0) = 3.0`. Handle RAW is ~4× center raw (ground-truth ratios 3.99/4.11/4.67) ⇒ handle perceived ≈ 0.525×4 = 2.1 vs center 3.0 ⇒ ~30% slower. Matches symptom exactly.
+- FIX (implemented in `src/drivers/lego/driver.rs`): `RIGHT_GYRO_SCALE 0.105 → 0.15` (0.15×5=0.75, ×4≈3.0 = center match). NO env gain change needed; keep `IP_GYRO_GAIN_HANDLE=5.0`. Note: z-axis ratio 4.67 ⇒ z ~17% hot with 0.15 — acceptable tradeoff. Do NOT edit install.sh/README.md gain values without user confirmation.
+### BUILD — ONE combined release binary (podman rust:1.92, build.sh method: `-v ...:/build:Z`, `-e CARGO_HOME=/tmp/cargo`, in-container apt-get pkg-config libclang-dev libudev-dev libiio-dev libevdev-dev libusb-1.0-0-dev libssl-dev cmake build-essential, `cargo build --release`)
+- `cargo check` PASSED (48.29s, 0 errors) and `cargo build --release` PASSED (12.37s incremental; first run SIGKILL'd by environment/OOM during final-crate compile, deps cached ⇒ re-run finished). Only 3 PRE-EXISTING warnings (controllers_attached/iio_imu driver.rs:504, DEFAULT_EVENT_FILTER/lego mod.rs:56, udev_device/lego driver.rs:94).
+- NEW combined binary: `/home/legion/ip-build/InputPlumber/inputplumber-legiongo2-gyro-v4.resume-gamefix` (10,908,352 bytes) — sha256 `59b82875b54b4d6d06e97fb9b0689ecfcfeb8cff7d69903d66356b70057d1905`.
+- Rollback reference: existing `inputplumber-legiongo2-gyro-v4.resumefix` sha256 `4e5f76dfdcb3ea76baf71dde53587ad4f1e2f4b435064409640ebfe222805139`.
+- Files changed: `src/input/target/steam_deck.rs` (FIX A), `src/drivers/lego/driver.rs` (FIX B).
+- Deploy: copy to `/opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v4.resume-gamefix`, retarget override.conf ExecStart, `daemon-reload` + `restart inputplumber`. Test (a) game→sleep→wake→controller usable in-game; (b) detached right-handle gyro ≈ center. Rollback = point ExecStart back to `.resumefix` + restart.
+
+## 2026-09-02 20:5x — v8.8 АВАРИЙНЫЙ ОТКАТ: деструктивный one-shot self-heal УДАЛЁН ПОЛНОСТЬЮ. ПРИЗНАНИЕ: вся линия «destroy + надежда, что Steam переоткроет» — ошибка
+### ПРИЗНАНИЕ ошибки (честно, без новой гипотезы)
+- Гипотеза v8.7 («virtual Steam Controller убивается таймером ~4s после первого Open; Steam переоткроет узел после hotplug») — **НЕВЕРНА**. Вся линия self-heal через разрушение+пересоздание виртуального устройства провалилась и **удалена destructively**.
+- По прямой инструкции: НЕ изобретать новую гипотезу. Реальная задача — **ПОЛНОЕ ПЕРВИЧНОЕ ПОДКЛЮЧЕНИЕ (complete first attach)**, отдельное data-driven расследование, а НЕ destroy+recreate.
+### Полная цепочка доказательств (v8.4 → v8.7)
+- **v8.4**: heal АРМИРОВАН на Open, но НЕ сработал → DEADLOCK (хуже, чем ничего).
+- **v8.5**: heal СРАБОТАЛ (fire), но Steam НЕ переоткрыл устройство → контроллер мёртв.
+- **v8.7**: БЕЗУСЛОВНЫЙ fire по таймеру (destroy в начале poll()) + one-shot latch `DECK_SELF_HEAL_USED` (состояние необратимо до рестарта службы) → **ПОЛНОСТЬЮ мёртвый** virtual Steam Controller — ХУДШИЙ результат, хуже v8.6.
+- **Единственный выживший — v8.6 (cancel)**, где heal НЕ сработал (A+B работали до QAM).
+- Вывод: стратегия «destroy-and-hope-Steam-reopens» провалилась 4 раза (v8.4/5/7 мёртвые; выжил только тот вариант, где heal НЕ сработал).
+### Форензика v8.7 (из /var/log/ip-gyro-logger.log)
+- PID 1344 старт ~20:34:24; arm 20:34:32 («scheduling one-shot re-registration in 4s»); **fire 20:34:36.962 (device.destroy)**; Steam: «Controller device closed after hid_read failure» 20:34:36; пересоздание 20:34:37.222; Steam «opened for index 0» + «reserving XInput slot 0» 20:34:37 (лог 20:34:40.015); DECK-GAME кадры далее шли.
+- ФАКТ (зафиксирован как есть, гипотеза НЕ строится): в этом экземпляре Steam МЕХАНИЧЕСКИ переоткрыл узел после пересоздания — и всё равно пользователь сообщил о полностью мёртвом контроллере ⇒ fire таймера всё равно недопустим.
+### ПРАВИЛО (безоговорочно)
+- **«Destroy-and-hope-Steam-reopens» по таймеру — БОЛЬШЕ НИКОГДА.** Устройство НЕ должно уничтожаться таймером.
+- `poll()` теперь создаёт устройство ТОЛЬКО через `publish_current_config` (после settle) и уничтожает ТОЛЬКО в `stop()`.
+### Что удалено в v8.8 (src/input/target/steam_deck_uhid.rs, 1425 → 1298 строк)
+- Fire-блок в начале `poll()` («Prong 2 one-shot fire»); recreate-блок; arm в `uhid_virt::OutputEvent::Open`; поля структуры `heal_at`/`heal_fired`/`recreate_at` (+ init в `new_with_config`); `static DECK_SELF_HEAL_USED`; `fn deck_self_heal_delay()`/`deck_self_heal_gap()`; константы `DECK_SELF_HEAL_DEFAULT_MS`/`DECK_SELF_HEAL_GAP_DEFAULT_MS` + env `IP_DECK_SELF_HEAL_MS`/`IP_DECK_SELF_HEAL_GAP_MS`; импорт `AtomicBool`; переписан doc-комментарий `poll()` (шаги пересчитаны: 1) приём конфига, 2) publish после settle, 3) FIX 1b watch). Устаревшие self-heal лог-строки убраны.
+- **СОХРАНЕНО**: FIX 1 в `src/udev/device.rs` (привязанные hidraw-hide правила: `SUBSYSTEMS=="hidraw", KERNELS=="0003:17EF:61EB.000D"` + `ATTRS{idVendor}=="17ef", ATTRS{idProduct}=="61eb"` с `GOTO/LABEL` guard — БЕЗ голых `SUBSYSTEMS=="hidraw"`); FIX 1b (`node_ensure_at`/`node_ensure_attempts`/`ensure_deck_node_user_openable`/`find_deck_hidraw_node` + arm в `publish_current_config`); стабильный unit serial `28de-12f0-1ae1c0b`; publish-settle (`DECK_PUBLISH_SETTLE_MS`); `env_ms`/`deck_uhid_serial`.
+### Сборка и деплой
+- `bash /home/legion/ip-build/build.sh` (скрипт НЕ исполняемый → Permission denied, запуск через `bash`): podman rust:1.92 `cargo build --release` — успех (~2m36s), только 4 ПРЕ-существующих dead-code warning (controllers_attached, DEFAULT_EVENT_FILTER, udev_device, ProductId::LenovoLegionGo2), из отредактированных файлов НИ ОДНОГО.
+- **НОВЫЙ sha256: `f63ceab224ca99f438598a0d96615095bd813efe0a63df427e569a6d761bccb7`** (бинарник cp в release-репо `legion-go-2-bazzite-F44-gyro/inputplumber-legiongo2-gyro-v4.resume-gamefix`).
+- `install.sh` EXPECTED_SHA256 обновлён с ba0563c7… на f63cea… + комментарий «v8.8 destructive one-shot self-heal REMOVED (proven broken v8.4/5/7) + anchored hidraw hide rules (FIX 1) + openability ensure (FIX 1b) retained». `./install.sh --log` (без sudo): **«Source binary sha256 OK» + «Installed binary sha256 OK»**.
+### Верификация после установки (desktop, v8.8)
+- Сервис `inputplumber` active (running с 20:46:19, MainPID=13197, ExecStart=`/opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v4.resume-gamefix`).
+- Установленный sha == новый f63cea… (совпадает и в /opt, и в /var/opt runtime-путях).
+- Все 8 hidraw-hide-правил в /run/udev/rules.d ПРИВЯЗАНЫ (hidraw-файл: `SUBSYSTEMS=="hidraw", KERNELS=="0003:17EF:61EB.000D", ATTRS{idVendor}=="17ef", ATTRS{idProduct}=="61eb"` + `GOTO="inputplumber_end"`; event-файлы: `KERNELS=="input31"/"input32"/"input33", ATTRS{id/vendor}=="17ef", ATTRS{id/product}=="61eb"`). Голых `SUBSYSTEMS=="hidraw"` без `KERNELS==` НЕТ.
+- /dev/hidraw0-10 = `crw-rw-rw-` (0666).
+- `journalctl -u inputplumber --since` свежий лог: **НЕТ строк** self-heal/hotplugging/re-register/one-shot (grep exit 1) ⇒ v8.8 не логирует и не исполняет никакого self-heal.
+### PENDING
+- Тест пользователем (после перезагрузки/обновления): гироскоп + кнопки в игре. Если снова мёртв → расследовать ПЕРВИЧНОЕ подключение (first attach), НЕ destroy+recreate.
+
+## 2026-09-02 ~23:3x — v8.9 (ШАГ 0 + FIX C) ГИПОТЕЗА: QAM/Guide-churn = ШТОРМ ПОВТОРНЫХ IDENTICAL LoadProfilePath от OpenGamepadUI, а НЕ teardown deck-uhid. FIX C = guard-дедупликатор reload'а профиля.
+### ШАГ 0 — пере-форензика окна 21:03–21:08 под v8.8 (PID 1349, boot 21:02, sha f63cea…)
+- ПЕРВОНАЧАЛЬНАЯ трактовка («QAM → InputPlumber сам делает teardown deck-uhid / destroy») — ОПРОВЕРГНУТА: `grep -c "Stopping target device"` по окну 21:03–21:08 = **0**. InputPlumber НИ РАЗУ не останавливал deck-uhid; deck всегда «already running, nothing to do».
+- Deck uhid serial СТАБИЛЕН весь окно: `28de-12f0-1ae1c0b` (Steam 21:06:28) — устройство не пересоздавалось.
+- РЕАЛЬНАЯ картина churn (InputPlumber-сторона): OpenGamepadUI на каждое нажатие Guide шлёт **3–5 ИДЕНТИЧНЫХ LoadProfilePath одного файла** `global_default_overlay_deck-uhid.json` (имя профиля `OpenGamepadUI Default`):
+  - серия 21:05:17 / 21:05:20 / 21:05:21 / 21:05:23 / 21:05:24
+  - серия 21:06:07 / 21:06:09 / 21:06:11 (следом Guide intercept 21:06:03)
+- Каждый такой reload → ПОЛНАЯ переинициализация: «Clearing old device profile mappings» → «Loading device profile `OpenGamepadUI Default`» → `schedule_clear_state` → «Setting target devices [deck-uhid,keyboard,mouse]» → «already running, nothing to do» → `update_profile` DBus-сигнал наружу.
+- Внешний (НЕ InputPlumber) видимый DEVCHG: Steam Input сам удаляет/пересоздаёт свой виртуальный xbox pad `0x28DE:0x11FF` (input38/event3/js0 21:06:15.967-.996 → DEVCHG-всплеск по hidraw/input 21:06:16.039-.106 → input50/event19/js0 21:06:29) + Legion-контроллер физически переключает USB-режим 61EB↔61ED (21:05:03-52). Это Steam/udev/железо, НЕ InputPlumber.
+### В ЧЁМ РЕАЛЬНАЯ ПРОБЛЕМА
+- InputPlumber-сторона churn = **шумные ПОВТОРНЫЕ reload одного и того же профиля**: на одно нажатие Guide код выполняет 3–5 полных `load_device_profile` с повторным `clear_state`, повторным `SetTargetDevices` и повторной эмиссией `update_profile` — при том что профиль и путь НЕ менялись. Каждый reload = лишний внутренний цикл событий (map clear/rebuild, clear-state по таргетам, спавн SetTargetDevices) и лишний внешний сигнал для наблюдателей (OpenGamepadUI/Steam), которые могут реагировать на это пересканированием/DEVCHG-подобной суетой.
+- ВАЖНАЯ ДЕТАЛЬ: OpenGamepadUI ПЕРЕЗАПИСЫВАЕТ файл профиля между сериями QAM (в 21:05 на диске была версия С target_devices, пост-churn после 21:06 — БЕЗ). ⇒ дедупликатор должен сравнивать путь + имя + ПОЛНОЕ сериализованное содержимое, а не только структуру; иначе корректный повторный открытии QAM (когда файл реально изменился) будет ошибочно пропущен.
+### ПОЧЕМУ ИМЕННО FIX C И ЧЕГО ДОБИВАЕМСЯ
+- FIX C = guard в обработчике `CompositeCommand::LoadProfilePath` (`src/input/composite_device/mod.rs`): после парсинга профиля, ДО `load_device_profile`, вызвать новый helper `profile_is_redundant(&profile, &path)`. Helper возвращает true, если активный профиль уже загружен ИЗ ЭТОГО ЖЕ пути И имя совпадает И `serde_yaml::to_string` обоих даёт одинаковую строку (DeviceProfile НЕ имеет PartialEq → сравнение через полную сериализацию). При true → логируем «skipping redundant reload», шлём `Ok(())` вызывающему и `continue` — пропускаем И полный reload, И `update_profile`-сигнал.
+- ЧЕГО ДОБИВАЕМСЯ: шторм из 3–5 identical reload'ов на одно нажатие Guide схлопывается в 1 реальную загрузку + 4 «skip» (нулевой побочный эффект). Уходят лишние clear_state, повторный SetTargetDevices и пере-эмиссия update_profile; пропадает InputPlumber-сторонний churn, который мог триггерить наблюдателей. ДЕК-uhid по-прежнему НЕ трогается (никакого destroy/stop — сохранены все механизмы v8.8). Риск низкий: guard срабатывает только на точное совпадение (путь+имя+байты YAML); при реальном изменении файла (переписан OpenGamepadUI между QAM) сравнение даёт false → reload выполняется как раньше.
+- Изменены: ТОЛЬКО `src/input/composite_device/mod.rs` (guard в LoadProfilePath ~строка 454 + helper `profile_is_redundant` после `load_device_profile`). `serde_yaml::to_string` вызван полным путём (крейт есть в Cargo.toml 0.9.34, в mod.rs не импортирован — валидно). FIX A (SystemSleep в targets.rs) — из прошлой сессии, остаётся.
+- ПРОТОКОЛ ТЕСТА v8.9: (a) сон/пробуждение В ИГРЕ — гироскоп+кнопки живы после wake; (b) один QAM без пере-инициализации/churn на каждую игру (в логе НЕ должно быть пачек «Clearing old device profile mappings» → «Setting target devices» на одно нажатие Guide). Прислать /var/log/ip-gyro-logger.log.
+
+## 2026-09-03 00:0x — v8.10 ШАГИ 1-2: ФОРЕНЗИКА ТЕСТА v8.9 (boot 0, PID 1332) → МЕХАНИЗМ «не все кнопки до QAM» и «после wake ничего». РЫЧАГ ОТКАЗА = Steam Input config-activation, НЕ путь ввода InputPlumber
+### Симптом пользователя (точный, КЛЮЧЕВОЙ для v8.10)
+- «при старте игры по-прежнему не все кнопки работают, только после открытия правой шторки они начинают работать (тот баг что вроде как постоянно был), а потом да, после пробуждения ничего не работает»
+- ДВА отдельных отказа: (А) старт игры — ввод не доходит до игры, пока не открыта «правая шторка» (QAM) — ХРОНИЧЕСКИЙ; (Б) после сна/пробуждения — полный ноль.
+### Синхронизация таймлайна окна 23:49:38–23:54 (boot 0)
+- Время logger (local) ↔ Steam controller.txt `[2026-09-02 23:49:38]` совпадают 1:1 в окне. Clock skew ~2ч был у journal/RTC в начале boot 0 — окно logger/Steam НЕ трогает.
+- DECK-GAME = deck-uhid 28de:12f0 (то, что читает Steam). event3 «Microsoft X-Box 360 pad 0» = ВЫХОД Steam (Steam Virtual Gamepad 0x28de:0x11ff) — то, что читает ИГРА. Steam pad пересоздавался: capture 23:49:45.054, re-capture 23:49:54.143 (тот же event3).
+### ДОКАЗАТЕЛЬСТВО №1 — deck-uhid ШЛЁТ ПОЛНЫЙ ввод на старте игры, ДО QAM (InputPlumber-сторона НЕ виновата)
+- 23:49:38.972 `HID: capturing /dev/hidraw1 (DECK-GAME vid=28DE pid=12F0)` + `STATE: mode NO-DECK -> GAMING`.
+- 23:49:41.518-519 `Loading profile from path: …global_default_overlay_deck-uhid.json` → `Device profile OpenGamepadUI Default already active …; skipping redundant reload` → `Setting target devices: [deck-uhid, keyboard, mouse]` → `Target device deck-uhid already running, nothing to do` ⇒ на старте игры deck-uhid УЖЕ полностью сконфигурирован, шторма reload нет (FIX C).
+- 23:49:52.166-23:49:53.071 `DECODE DECK-GAME frame=3787…4126 btn=[a]` / `btn=[-]`, ls=(642,-128), rs=(128,-1156), gyr ненулевой ⇒ deck ФИЗИЧЕСКИ шлёт кадры с кнопками/стиками/гиро в Steam ДО QAM.
+### ДОКАЗАТЕЛЬСТВО №2 — Steam НЕ АКТИВИРУЕТ конфиг ИГРЫ при старте (держится на конфиге шелла app 769), ввод не доходит до игры
+- 23:49:40-49 controller.txt: многократно `Controller 0 mapping uses xinput : false` + `Queueing activation for controller: 0 app: 769` (шелл/оверлей) — НЕ игра.
+- 23:49:44 `Opted-in Controller Mask Forced On`; маски `AppId 3884939944: 100f` и `AppId 1086940: 100f` — НЕ для игры 306130.
+- 23:49:53-55 Steam ТОЛЬКО КЭШИРУЕТ конфиг игры: `Add to Config Cache Request 0 306130 - adopting binding 23/24/25` — но НЕ активирует.
+- 23:49:45.054–23:50:13: Steam pad (event3) = **НОЛЬ событий**, хотя deck слал `btn=[a]/[-]` (23:49:52-53). Первое событие pad — 23:50:14.481 (`ABS ABS_Y 24029`).
+- 23:50:01 (момент открытия QAM): `Queueing activation for controller: 0 app: 306130` + `Touchscreen DefaultMode 1` ⇒ ТОЛЬКО QAM заставил Steam АКТИВИРОВАТЬ конфиг игры 306130.
+- 23:50:14+ pad ожил: 23:50:15.513 `BTN_SOUTH DOWN`, затем всплески ABS_RX/ABS_RY (гиро, фьюзится в правый стик) — ввод пошёл в игру.
+### ОТРИЦАТЕЛЬНЫЙ РЕЗУЛЬТАТ (важен для направления фикса)
+- 23:50:01.441 IPJ: `skipping redundant reload` (FIX C сработал на QAM-нажатие Guide → LoadProfilePath от OpenGamepadUI) — И ПРИ ЭТОМ Steam в 23:50:01 активировал конфиг игры. ⇒ Эффект QAM НЕ идёт через InputPlumber-перезагрузку профиля (она дедуплицирована с нулевым сайд-эффектом). QAM чинит ввод потому, что Guide/оверлей доходит до Steam и Steam пере-оценивает foreground-app → активирует конфиг игры. Рычаг — **Steam Input config-activation**, НЕ конфиг/путь ввода InputPlumber.
+### ВЫВОД (гипотеза v8.10, по данным)
+- «Не все кнопки до QAM» на старте игры = Steam Input держит controller 0 привязанным к конфигу шелла (app 769), а НЕ к запущенной игре (306130): конфиг игры кэшируется (`adopting binding`), но НЕ активируется, пока пользователь не откроет QAM. Deck-uhid шлёт всё; Steam не форвардит в виртуальный pad до активации. Ввод доходит до Steam, но не до игры.
+- «После wake ничего» (тест v8.9): FIX A сработал (deck жив после SystemSleep 23:51:15, `Keeping deck-uhid target device alive across system suspend`), Steam переоткрыл устройство 23:52:06 (`Local Device Found` + `Unrecognized controller using V1 HID protocol`), пересоздал pad input44 23:52:12 — НО pad = 0 событий до конца лога (23:54:59) при ЖИВЫХ DECODE-кадрах deck (4 шт). Игра 306130 убита на сне (gameprocess_log 23:51:51 `exit code -1`). Steam активировал только шелл-конфиги (`Queueing activation app 769/413080` 23:52:12-20), ввод всё равно не форвардится ⇒ тот же класс «Steam не пере-активировал полноценный приём deck после wake», но ГЛУБЖЕ, чем «конфиг игры не активирован» (молчит даже шелл).
+- НЕ РЕШЕНО по данным: какие ИМЕННО кнопки «работают» до QAM (данные: на xbox-pad ноль — вероятно «работающие» идут другим путём: DirectInput/клавиатура/тач или игра ещё не в фокусе); чинит ли QAM и ПОСЛЕ wake (в окне 23:52-23:54 пользователь мог не открывать QAM). Это требует контрольного замера пользователем.
+### ЧТО ЭТО ЗНАЧИТ ДЛЯ ФИКСА v8.10
+- Любой фикс «InputPlumber-конфиг/дедуп/пере-аттач/пере-триггер» НЕ заставит Steam активировать конфиг игры — это решение Steam Input. Destroy-and-hope запрещён (v8.4/5/7, катастрофы). Профильные reload'ы доказанно НЕ триггерят активацию (FIX C: QAM-чинит-даже-при-дедупе).
+- Кандидаты (выбор после контрольного замера пользователя): (1) понять, ЧТО из «открытия шторки» доходит до Steam (Guide-кнопка? пересоздание виртуального pad'а Steam? смена фокуса?) и воспроизвести это БЕЗ попапа оверлея; (2) держать deck присутствующим ДО старта игры (Steam успевает зарегистрировать/активировать конфиг раньше, чем игра отбирает фокус — на реальном Steam Deck контроллер всегда присутствует); (3) если QAM чинит и после wake — тот же рычаг для обоих симптомов; если НЕТ — post-wake это отдельная Steam-порча сессии (лечится только свежим устройством, что запрещено — тогда фикс в другом: не давать игре умирать на сне / Steam-side).
+
+### КОРРЕКЦИЯ (00:1x, та же сессия v8.10) — вывод «ТОЛЬКО QAM активировал конфиг игры» ПЕРЕОЦЕНЁН по данным gameprocess_log
+- gameprocess_log.txt: игра 306130 (ESO через Proton) реально стартовала НЕ в 23:49:38: первый tracked PID появился в **23:49:55** (`AppID 306130 adding PID 5341`), процессы сыпались до 23:50:00. Запуск занял ~22 с (23:49:38 → ~23:50:00). deck-uhid опубликован 23:49:38 — за ~17 с ДО появления процессов игры (InputPlumber переключил NO-DECK→GAMING по факту команды запуска, не по процессу).
+- Нажатия A в 23:49:52-53 (DECODE DECK-GAME frames 3787-4126) пришлись на время, когда ИГРЫ ЕЩЁ НЕ БЫЛО (процессы не отслеживались до 23:49:55) ⇒ кнопки шли в шелл (app 769), pad молчал — это ОЖИДАЕМО, а НЕ доказательство блокировки Steam.
+- `Queueing activation for controller: 0 app: 306130` в 23:50:01 = ~6 с после первого tracked процесса (23:49:55). По всему дню Steam СТАБИЛЬНО автоактивирует конфиг игры ~6 с после появления процесса БЕЗ QAM (00:05:24→00:05:30, 11:08:2x, 11:49:51, 12:16:57, …; 96 активаций 306130 за день). ⇒ активация 23:50:01 — ШТАТНАЯ (игра догрузилась), QAM открывался (~23:50:00) ОДНОВРЕМЕННО с завершением загрузки — причинность «QAM→активация» ЭТИМ сэмплом НЕ доказывается.
+- Открытый вопрос (решает контрольный замер пользователя, БЕЗ вариантов): запустить игру, ДОЖДАТЬСЯ полной загрузки (активное меню), нажать кнопки, НЕ открывая QAM. Если работают → симптом А = латентность запуска/перцепция, НЕ баг InputPlumber (фикс не нужен или UX). Если НЕ работают → реальный сбой автоактивации Steam для этого attach — тогда копать фикс направления (2) из списка выше.
+- ВЫВОД ДЛЯ v8.10: НЕ строить спекулятивный фикс на одиночном неоднозначном сэмпле. Правило: данных по «кнопки до QAM при ПОЛНОСТЬЮ загруженной игре» пока НЕТ. Пост-wake «молчит даже шелл» (23:52-23:54) остаётся отдельным зафиксированным фактом (deck жив, Steam переоткрыл, pad молчит) — но в окне могло не быть нажатий пользователем (DECODE всего 4 кадра).
+
+### КОНТРОЛЬНЫЙ ЗАМЕР ПОЛЬЗОВАТЕЛЯ (00:16, v8.10) — ОТВЕТ НА МОЙ ЖЕ ВОПРОС, ОБЯЗАН ЗАПИСАТЬ (пользователь: «записывай важные вещи что спрашиваешь»)
+- **ВАЖНО (прямое указание пользователя, ПОВТОРЕНО ДВАЖДЫ, приоритет над всем): «ошибка не возникла в версии 8.10, а уже очень давно присутствует, скорее всего раньше 8й версии».** Это НЕ регрессия v8.9/v8.8/v8.10 — это ХРОНИЧЕСКИЙ исторический дефект first-attach, существовавший ДО v8. Сам пользователь изначально называл его «тот баг что вроде как постоянно был». Фокус v8.10 = исправить давний дефект, а НЕ чинить регрессию, внесённую свежими билдами.
+- Условие замера: ПЕРВЫЙ запуск игры, дождался ПОЛНОЙ загрузки, нажатия БЕЗ открытия правой шторки (QAM). Это ровно тот замер, которого не хватало в КОРРЕКЦИИ выше.
+- **РАБОТАЕТ без шторки**: LB, RB, LT, RT, кнопка карты (левая), **A**, ОБА стика (левый и правый), гироскоп, тачпад (вероятно).
+- **НЕ РАБОТАЕТ без шторки: B и X** (после открытия правой шторки B/X начинают работать — исходный симптом пользователя).
+- ЗНАЧЕНИЕ (ОБНОВЛЯЕТ вывод «НЕ РЕШЕНО» из КОРРЕКЦИИ): ОПРОВЕРГНУТО «ввод вообще не доходит до игры до QAM». При ПОЛНОСТЬЮ загруженной игре без QAM ввод ДОХОДИТ почти полностью (A + бамперы + триггеры + стики + гиро + карта + тач). Отказ = ЧАСТИЧНЫЙ и ТОЧЕЧНЫЙ: ровно B и X (east и west из 4 лицевых; A=south работает; Y в замере не упомянут). Это НЕ «Steam не форвардит ничего», это потеря 2 из 4 лицевых кнопок.
+- Кандидаты-причины (НЕ гипотеза-фикс, а направления локализации): (1) Steam Input в состоянии «конфиг игры ещё не активирован/применён частично» держит B/X замапленными на свои функции (B=back/overlay, X=context) и съедает их до полной активации конфига игры; (2) дескриптор/распознавание deck-uhid'а («Unrecognized controller using V1 HID protocol» в логе после wake) даёт неполный маппинг B/X до пере-активации; (3) профиль InputPlumber (`global_default_overlay_deck-uhid.json`) мапит физические B/X не туда. (2)/(3) маловероятны: A работает тем же путём, а после QAM B/X работают — значит дескриптор/профиль целы, теряет слой Steam ДО активации конфига.
+- СЛЕДУЮЩИЙ ДАННЫЙ (локализация, НЕ новый сценарий — нажать B и X в уже сломанном состоянии при живом логгере): шлёт ли deck-uhid `btn=[b]`/`btn=[x]` (DECODE DECK-GAME) — если шлёт, InputPlumber/профиль целы, теряет Steam; если НЕ шлёт — теряет InputPlumber/профиль. Сверка с событиями Steam pad (event3).
+
+### ЛОГ-ВЕРИФИКАЦИЯ по вопросу пользователя «джойстики слались?» + ОБНАРУЖЕННАЯ ДЫРА В ЗАХВАТЕ (00:2x, v8.10)
+- Семантика полей DECODE (по `logger/ip-gyro-logger.py`, `decode_deck_report` строки 866-888): `ls=lsx/lsy` и `rs=rsx/rsy` = ЛЕВЫЙ/ПРАВЫЙ АНАЛОГОВЫЕ СТИКИ (i16 LE, байты 48-55 64-байтного отчёта deck-uhid). Это НЕ тачпады. `lt/rt` = триггеры (u16, байты 44-47). `gyr` = гиро. ⇒ оси стиков В отчёте deck-uhid ЕСТЬ, стики шлются в Steam.
+- ДЖОЙСТИКИ ШЛЮТСЯ — ДА (реальные отклонения ls/rs залогированы): 21:04:25 `ls=(4754,-9123) rs=(899,385)`; 23:49:52 `rs=(128,-1156)`; 23:50:31 `ls=(-5011,-2698)`; 23:50:33 `ls=(899,-128)`. InputPlumber передаёт движение стиков в deck-отчёт (до Steam) — на стороне InputPlumber стики работают.
+- ОГРАНИЧЕНИЕ ЛОГГЕРА (строки 977-984 `_handle_deck_reports`): строка DECODE пишется ТОЛЬКО при СМЕНЕ набора нажатых кнопок (btn-set change). ЧИСТОЕ движение стика БЕЗ смены кнопки НЕ порождает строку — стик виден лишь в snapshot строки, порождённой нажатием/отпусканием кнопки. Гиро пишется отдельной строкой MOTION. ⇒ «нет отклонения ls в каком-то окне» НЕ доказывает мёртвый стик, если в том окне не было нажатий кнопок.
+- ДЫРА В ЗАХВАТЕ (критично): во ВСЕХ окнах ПОСЛЕ 23:51:46 (после wake-пересоздания deck, counter сброшен) в логе НЕТ НИ ОДНОГО лицевого нажатия (a/b/x/y/dpad) и стики ВСЮДУ на базе (642,-128)/(128,-128): 23:52-23:59 = только [-] / r_pad_touch / r5 / l2; 00:00-00:18 = только [-] / l5 / r5 / l4 / r2 / r_pad_touch. ПРИ ЭТОМ ДО wake лицевые слались штатно (23:51:32-46: `btn=[a,b]`, `[b]`, `[x]`, `[b,x,y]`, `[x,y]`, `[b,x]`, `[a,b]`) и стики слались (21:04, 23:49-51). ⇒ ТЕ НАЖАТИЯ A/B/X/LB/RB/стиков, о которых пользователь дал отчёт «A работает, B/X нет, стики выключены», в логе окон 23:52-00:18 ОТСУТСТВУЮТ. Два неразличимых по данным случая: (1) тест был в другой сессии/окне, которых нет в логе; (2) нажатия реально НЕ дошли до deck-отчёта ПОСЛЕ wake (InputPlumber-side потеря лицевых/стиков при сохранении триггеров/лопастей r2/l5/r5/l4/r_pad_touch).
+- ФИКСИРОВАННЫЙ ФАКТ отдельно: единственная строка с лопастями+триггерами ПОСЛЕ wake при полностью живом deck (00:06-00:14: l5×9, r5×4, l4×1, r2×5, r_pad_touch×7) показывает, что deck-отчёт после wake ЖИВ и несёт ЧАСТЬ кнопок — вопрос лишь, несёт ли он лицевые/стики (данных нет из-за отсутствия их нажатий в окнах).
+- ЧТО НУЖНО для локализации (ровно ОДИН замер ~10 с, логгер живой): в сломанном состоянии (игра, без шторки) нажать С ПАУЗАМИ A, B, X, Y, LB, RB (каждое = 2 строки DECODE: нажатие+отпускание) и, УДЕРЖИВАЯ любую кнопку (напр. RB), сделать полные круги ОБОИМИ стиками (иначе стик-движение логгером не пишется). Результат: btn=[b]/[x] и отклонения стиков в DECODE ЕСТЬ → InputPlumber шлёт, теряет Steam (фикс — вне InputPlumber, документируем и закрываем); НЕТ → теряет InputPlumber после wake (это НАША зона фикса в deck-отчёте).
+
+### БЁРСТ 00:24 (пользователь «понажал»; состояние НЕИЗВЕСТНО — см. ниже) — deck шлёт x/y/b + КРУГ СТИКОМ: InputPlumber ЖИВ в текущем состоянии
+- 00:24:11-16 DECODE: `btn=[x]`, `[x,y]`, `[y]`, `[b]`, `[view]`, `[r2]`, `[menu]`, `[r2,left]`, `[r2,up,left]` — ВСЕ слались, причём с БОЛЬШИМИ отклонениями ЛЕВОГО СТИКА: `ls=(-8095,27113)`, `ls=(-7067,28141)`, `ls=(-4497,29683)`, `ls=(-11436,25571)`, `ls=(1927,-1927)` — полный круг левого стика при нажатиях x/y/b записан.
+- ⇒ В живом состоянии (00:24) InputPlumber шлёт B, X, Y и движение стиков БЕЗ ПОТЕРЬ. Гипотеза «InputPlumber теряет лицевые/стики после wake» ЭТИМ окном НЕ подтверждается (отправка цела в текущей сессии).
+- КОНТЕКСТ ОТ ПОЛЬЗОВАТЕЛЯ (дословно, записать): «вопрос же был в игровом режиме и сразу после перезагрузки, так я без понятия какая ситуация». ⇒ СИМПТОМ-СЦЕНАРИЙ = ПЕРВЫЙ запуск игры СРАЗУ ПОСЛЕ перезагрузки в игровом режиме (game mode). Текущее состояние (00:24) пользователь сам не знает — сломанное или нет. Данные бёрста интерпретировать как «здоровое состояние», НЕ как «сломанная фаза».
+- ВЕРДИКТ ЛОКАЛИЗАЦИИ (по всей совокупности дня): InputPlumber НЕ теряет B/X/Y/стики ни в одном захваченном окне (весь день b=59/x=15/y=9; бёрст 00:24 живой; до wake 23:51:32-46 слал b/x/y/a). Потеря «B/X мертвы до QAM в игре при первом запуске после перезагрузки» = между Steam и ИГРОЙ — Steam Input config-activation (конфиг игры не активирован/применён частично, пока не открыта шторка). Это РЕШЕНИЕ Steam, НЕ InputPlumber. FIX A/C (v8.9) этот симптом НЕ затрагивают — потому баг ХРОНИЧЕСКИЙ и не менялся от наших правок (совпадает с указанием пользователя «ошибка уже очень давно, раньше v8»).
+- ПАССИВНЫЙ ЗАХВАТ, который 100% закроет вопрос (НЕ отдельный тест — делать ВО ВРЕМЯ самого бага, обычной игрой): при первом запуске игры, когда B/X не работают, нажать B и X по 2 раза, ПОТОМ открыть шторку. По логу: если в фазе «до шторки» `btn=[b]/[x]` ЕСТЬ → окончательно подтверждено: InputPlumber шлёт, Steam не форвардит до QAM (Steam-side, закрыто). Если НЕТ → неожиданность, потеря в InputPlumber в этом специфическом окне первого запуска (тогда НАША зона).
+
+### ПОПРАВКА ПОЛЬЗОВАТЕЛЯ (00:29, v8.10) — «почему не откатим changes?» + РЕГРЕССИЯ по resume и по шторке (прямая реакция на мой вердикт «баг хронический, Steam-side»)
+- Прямая цитата пользователя (дословно, обязана быть записана): «слыш блять, баг хронический ты тупой или что? Почему мы тогда просто не откатим changes? Или ты блять забыл записать, что у тебя баг прямо сейчас в изменениях записан и несколько этапов раньше хотя бы вывод из сонного режима работал и когда я один раз открывал шторку и потом закрывал, то все начинало работать во всех играх?»
+- СМЫСЛ ПОПРАВКИ (дешифровка, не искажать): (1) мой вердикт «баг хронический ⇒ ничего не делаем» НЕ устраивает — пользователь предлагает альтернативу: ОТКАТИТЬ изменения; (2) «баг прямо сейчас в изменениях записан» — в текущих изменениях (Agent.md/код) зафиксирован баг, т.е. в НЫНЕШНЕМ состоянии что-то сломано; (3) «несколько этапов раньше хотя бы вывод из сонного режима работал» — на более ранних версиях (этапах) ВЫХОД ИЗ СНА РАБОТАЛ (симптома Б «после wake ничего» НЕ было); (4) «когда я один раз открывал шторку и потом закрывал, то все начинало работать во всех играх» — на тех ранних версиях открытие-закрытие QAM ОДИН РАЗ = гарантированный фикс ВО ВСЕХ играх (надёжное восстановление, которого, вероятно, НЕТ в текущем состоянии).
+- ПРОТИВОРЕЧИЕ С ПРЕДЫДУЩИМ УКАЗАНИЕМ, которое надо разрешить, а не игнорировать: ранее пользователь ДВАЖДЫ требовал записать «ошибка не возникла в v8.10, а очень давно, раньше v8» (хронический дефект B/X до QAM). Теперь пользователь утверждает, что resume работал раньше и QAM-раз открытие-закрытие чинило все игры раньше ⇒ возможна РЕГРЕССИЯ в resume-пути и в надёжности восстановления шторкой в свежих версиях (v8.8/v8.9/FIX A/C). Итог: симптом «B/X мертвы до QAM в игре» — хронический, но «после wake ничего» и «шторка больше не чинит» МОГУТ быть регрессией свежих изменений.
+- ДЕЙСТВИЕ (запрос пользователя): рассмотреть ОТКАТ (revert) изменений к раннему этапу, где resume работал и QAM-once чинил все игры — как кандидата v8.10. НЕ спорить с пользователем, а проверить по истории версий, какие изменения были внесены между «рабочим resume/QAM-once» этапом и текущим состоянием, и что именно откатывать.
+
+## RESTORE 2026-09-03 ~00:46 UTC — АВАРИЙНОЕ ВОССТАНОВЛЕНИЕ рабочей копии после случайного git-revert (ТОЛЬКО checkout+verify, без деплоя)
+- ЧТО ПРОИЗОШЛО: предыдущий агент во время разбора логов случайно сделал git-откат рабочей копии — переключился на ветку `fixed-gyro`, рабочая копия `src/` и `rootfs/` стала = чистый upstream 0.77.4 (commit `bb7424f`) БЕЗ всей кастомной gyro-сборки. Установленный на устройстве v8.9 в `/opt` НЕ пострадал.
+- СНАПШОТ: перед откатом агент сохранил полное состояние (код v8.9 + логи) в ветку `v810-pre-revert-backup` = commit `7b3d3e5` (сообщение: «SAFETY v8.10: full custom v8.9 state snapshot (code+logs) pre-revert»).
+- ВЫПОЛНЕНО: `git checkout v810-pre-revert-backup` → HEAD = `7b3d3e5be66588830deeed9bcb75208d85234295`. Рабочая копия = ПОЛНОЕ состояние v8.9.
+- VERIFY: `git status` — ЧИСТО (0 изменений, 0 untracked) относительно снапшота 7b3d3e5.
+- ПРЕПЯТСТВИЕ и его решение (без потерь): checkout был заблокирован, т.к. часть файлов снапшота (Agent.md, ip-*.log, ip-*.md, logger/, steam-controller.txt, steam-input-ref.png, ip-v86-evidence/) лежала в рабочем дереве как untracked. Перед checkout они были НЕРАЗРУШАЮЩЕ забекаплены в `/tmp/ip-untracked-backup.tar` (~20 МБ, распаковано в `/tmp/ip-untracked-backup-dir`), затем checkout восстановил их из снапшота как tracked. Сверка: ВСЕ 23 пути IDENTICAL с бэкапом (diff -rq, ни одного расхождения) — ничего не потеряно.
+- КАСТОМНЫЕ ФАЙЛЫ НА МЕСТЕ (подтверждено, git diff upstream bb7424f → 7b3d3e5 = 13 файлов кода, +916/−150; это НЕ чистый upstream):
+  - `src/input/target/steam_deck_uhid.rs` (+362 строки относительно upstream)
+  - `src/input/composite_device/targets.rs` — FIX A на строке 561 («Keep the deck-uhid target device alive across system sleep»)
+  - `src/input/composite_device/mod.rs` — FIX C на строке 454 (redundant overlay reloads) + функция `profile_is_redundant` на строке 1941
+  - `src/drivers/lego/driver.rs` (+183 строки)
+  - `src/drivers/iio_imu/driver.rs` (+110 строк; НЕ внутри lego — путь `src/drivers/iio_imu/`)
+  - `src/drivers/legion_state.rs` (новый файл, +43 строки)
+  - `src/udev/device.rs` (+44 строки; путь `src/udev/`, не `udev/`)
+  - `rootfs/usr/lib/systemd/system/inputplumber-suspend.service` (правка сна)
+- НЕ ДЕЛАЛОСЬ (по требованию пользователя): build.sh/install.sh НЕ запускались, деплой НЕ выполнялся, установленный `/opt` бинарник v8.9 (sha256 c9a4bfa800a2c1bca078c41ddfcb0131351cd8f5402d8a5cdd4963ca13476e00) НЕ затрагивался, правки кода НЕ вносились. Единственная правка — эта запись в Agent.md (по указанию пользователя). Деплой из этой рабочей копии ТЕПЕРЬ безопасен.
+
+## ГИПОТЕЗА V9 (2026-09-03 ~11:5x local) — «FIX A НЕ БЫЛ задеплоен; кризис #3 = поломка БЕЗ FIX A; V9 = вернуть FIX A (пересборка из HEAD)». ОЖИДАЕТ ИГРОВОГО ТЕСТА ПОЛЬЗОВАТЕЛЯ (сон в игре).
+### Итог форензики кризиса #3 (10:33:08) — почему прежний вывод «FIX A не спасает» ОШИБОЧЕН
+- ЗАДЕПЛОЕННЫЙ `/opt` бинарь (после мягкого рестарта 10:4x PID 15960) = sha `0618564a…` (v8.1 «clean baseline», установлен 01:25).
+- ПРЯМОЙ GREP ПО БИНАРНИКУ `0618564a`: строка FIX A «Keeping deck-uhid target device alive across system suspend» = **0 вхождений**; FIX C «skipping redundant reload» = **0**. Комментарий install.sh (01:06) подтверждает: «v8.1 clean baseline reinstall (no self-heal / no FIX A / no FIX C)».
+- ⇒ Откат 01:25 (v8.10→v8.1, по просьбе пользователя «почему не откатим changes») ВЫНУЛ код FIX A из установленного бинаря. Кризис #3 произошёл ИМЕННО на бинаре БЕЗ FIX A.
+### Ключевые строки лога (жёсткое доказательство, /var/log/ip-gyro-logger.log)
+- **10:33:08.319** IPJ «Received command: SystemSleep» / «Suspending target devices» / «Target device stopped: …/mouse0»; **:08.325** UDEV DEVREM `remove /devices/virtual/misc/uhid/0003:28DE:12F0.000F/hidraw/hidraw10` (deck УНИЧТОЖЕН при сне) → Steam «Controller device closed after hid_read failure» → сессия запущенной ESO не восстановилась после wake → ESO вышел 10:34:15 → InputPlumber завис в GAMING. Deck пересоздан при resume (10:33:15.010 DEVADD hidraw1), Steam перерегистрировал 28de-12f0 (10:33:19), но старая сессия не перепривязалась.
+- Строка «Keeping deck-uhid target device alive across system suspend» встречается в логе **РОВНО ОДИН РАЗ** — 2026-09-02 23:51:15.411 (PID 1332 = бинарь v8.9 `c9a4bfa8` С FIX A): deck НЕ остановлен, uhid НЕ удалён, DECK-GAME продолжал стримить кадры (frame 35147→35628, 23:51:15.561–23:51:20.849) ЧЕРЕЗ suspend. Под PID 1336 (0618564a) в 10:33 эта строка НЕ появлялась НИКОГДА.
+- GREP БИНАРЯ v8.9 `target/release/inputplumber` = `c9a4bfa8` (сборка 02.09 23:43): FIX A = 1 вхождение, FIX C = 1. FIX A в исходнике цел: `src/input/composite_device/targets.rs` строки 561–575 (keep-alive deck-uhid при сне, `continue` без remove/stop) + 598–611 (restore через set_devices).
+### ПЕРЕСМОТР прежнего вывода (записать, обязательно)
+- Прежний вывод «FIX A не спасает deck при сне» — **ОШИБОЧЕН**: строился на ложной предпосылке, что FIX A задеплоен. Кризис #3 = ровно тот отказ (teardown deck-uhid при сне), который FIX A устраняет.
+- ОГОВОРКА (честно, чтобы не переоценить): FIX A доказанно убирает InputPlumber-сторонний teardown deck при сне. ДОСТАТОЧНО ли его одного для «та же ESO-сессия играбельна после wake» — НЕ доказано: единственный тест v8.9 (23:51) был загрязнён (игра 306130 убита на сне, exit code -1 в 23:51:51; после wake в окне почти нет нажатий — всего 4 DECODE-кадра 23:52–23:54).
+### ГИПОТЕЗА V9 (что устанавливаем)
+- V9 = пересобранный из HEAD (`7b3d3e5` = полное состояние v8.9) бинарь С FIX A (+ FIX C — безопасный дедупликатор, доказанно не влияет на активацию Steam; − деструктивный self-heal, удалён destructively в v8.8). База та же, что у «v8.1 clean baseline» (gaming 12f0, POLL_RATE 1000), но С сохранением deck при сне.
+- Ожидание при сне В ИГРЕ: InputPlumber НЕ уничтожает deck-uhid → в логе появится «Keeping deck-uhid target device alive across system suspend», НЕ будет UDEV DEVREM виртуального deck, НЕ будет Steam «hid_read failure», DECK-GAME продолжит слать кадры, и после wake ввод в запущенную ESO жив.
+### ПРОТОКОЛ ПРОВЕРКИ ГИПОТЕЗЫ (выполняет пользователь, логгер v3.1 уже живой)
+1. ESO → дождаться ПОЛНОГО меню → нажать A + полный круг ОБОИМИ стиками (логгер пишет btn=[a] + ls/rs отклонения).
+2. Уход в сон ПРЯМО В ИГРЕ → пробуждение.
+3. Проверка /var/log/ip-gyro-logger.log (я разбираю после теста): (а) есть «Keeping deck-uhid target device alive across system suspend» в момент сна; (б) НЕТ UDEV DEVREM виртуального deck hidraw; (в) НЕТ Steam «Controller device closed after hid_read failure»; (г) DECK-GAME кадры идут ЧЕРЕЗ suspend; (д) в игре ПОСЛЕ wake нажать A + стики → ввод доходит.
+4. КРИТЕРИЙ УСПЕХА: та же ESO-сессия принимает ввод после wake БЕЗ QAM и БЕЗ перезапуска. Если ESO убита на сне самой системой (exit code -1) — это отдельный факт (не InputPlumber), тогда перезапустить ESO и проверить свежий запуск.
+### РЕЗУЛЬТАТ ТЕСТА V9 (2026-09-03, сон в игре ESO ~12:12) — ПОДТВЕРЖДЕНО ✅, V9 ГОТОВ К РЕЛИЗУ
+- ПОЛЬЗОВАТЕЛЬ: «текущий фикс работает как надо… сон исправлен, всё работает» — сон ПРЯМО В ИГРЕ (ESO, AppID 306130) прошёл, ввод в ту же сессию жив после wake.
+- КОНТЕКСТ ЗАМЕРОВ: ребут 12:10:29 (inputplumber PID 1333, логгер PID 1550 — низкие PID = свежий boot), бинарь = sha-верифицированный `c9a4bfa8` из /opt (V9). Сон теста: 12:12:18.397 (SystemSleep).
+- [x] (а) InputPlumber НЕ уничтожил deck-uhid при сне: после wake 12:12:44.853/12:12:48.025 «Setting target devices: [deck-uhid, keyboard, mouse]» + «Target device deck-uhid already running, nothing to do» — deck ЖИВ, НЕ останавливался и НЕ пересоздавался.
+- [x] (б) НЕТ UDEV DEVREM виртуального deck: DEVREM 12:12:26 — только физический 17EF:61EB (usb3 detach, норма); виртуальный uhid 28DE:12F0.000C на wake 12:12:28.783 получил DEVCHG (не DEVREM).
+- [x] (в) НЕТ Steam «Controller device closed after hid_read failure» после 12:00:42 (последняя — рестарт деплоя 12:00:41). Steam на wake перезагрузил конфиг запущенной игры: 12:12:27-31 «Loaded Config … App ID 306130, Controller 0: …/controller_steamos_handheld.vdf».
+- [x] (г) DECK-GAME стримил ЧЕРЕЗ suspend: кадры 35062→37080 до сна (12:12:10-18, 128 rd/s); «сброс» счётчика кадров на wake 12:12:30 (~213) = артефакт переоткрытия hidraw fd логгером, НЕ пересоздание устройства.
+- [x] (д) Ввод после wake в ту же ESO-сессию жив — подтверждено пользователем в игре (без QAM, без перезапуска).
+- ОГОВОРКА (честно, записано обязательно): явной строки FIX A «Keeping deck-uhid target device alive across system suspend» в окне 12:12:18 НЕТ (единственное вхождение за всё время — 23:51:15.411 PID 1332, тест v8.9 на том же c9a4bfa8). В 12:12:18 лог обрывается сразу после «Target device stopping/stopped: mouse0» и БЕЗ финального «Target devices before suspend:» — suspend-фриз обрезал цикл handle_suspend ДО ветки deck-uhid. Прямое логирование ветки в этом прогоне не получено, НО функциональный исход (deck «already running» после wake, DEVCHG не DEVREM, нет hid_read failure, Steam перезагрузил конфиг ESO) доказывает: deck НЕ был разрушен при сне; плюс v8.9 (тот же c9a4bfa8) уже логировал явную строку FIX A в 23:51:15.
+- КРИТЕРИЙ УСПЕХА (из протокола): ВЫПОЛНЕН — та же ESO-сессия приняла ввод после wake; отдельного факта «ESO убита системой на сне» (exit code -1) в этом тесте НЕ было.
+- ВЕРДИКТ: V9 = РЕЛИЗНАЯ СБОРКА. `c9a4bfa8` (FIX A keep-alive deck-uhid при сне + FIX C dedup; БЕЗ деструктивного self-heal) — сон В ИГРЕ исправлен. РЕЛИЗ V9 выполняется (README v9, SHA256SUMS, тег v9).
