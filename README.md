@@ -24,9 +24,36 @@ See the screenshot below:
 3. At the very top where it says **GENERAL** there will be **"choose gyro button(s)"**; click it and set it to **None (Gyro Always On)**.
 4. **Reason:** by default the gyro is only enabled while a specific button is held (like Push-to-Talk), so without this change the gyro appears dead.
 
+## What's new in v10.1
+
+**v10.1** is the current release — a **logger-only** upgrade to the **v3.3 diagnostic
+logger** (per-frame decode of EVERY field of the physical Legion XInput report). The
+InputPlumber binary is **unchanged** — still the same `c9a4bfa8` build as v9/v10 (prebuilt
+sha256:
+`c9a4bfa800a2c1bca078c41ddfcb0131351cd8f5402d8a5cdd4963ca13476e00`).
+
+**What v3.3 adds.** v3.2 already decoded the two IMU triads and shipped complete raw frames;
+v3.3 makes the decode **exhaustive** — every field of the 60-byte `XInputDataReport` (inside
+the 64-byte hidraw frame) is decoded by name on a `DECODE LEGION-SRC ... XFULL` line whenever
+it changes, so a single remote log can tell whether ANY field carries data on that unit:
+
+- both enums — `mode=` (xinput/dinput/fps) and `state=` (attached/detached/connecting);
+- both controller battery levels, the sticks (`sticks=(lsx,lsy,rsx,rsy)`) and **all 32
+  buttons by name** (`btn=[a,b,x,y,lb,rb,y1,y2,y3,m1,m2,m3,view,menu,...]`);
+- analog triggers (`trig=`), mouse wheel (`wheel=`), touch-pad coordinates (`touch=`),
+  both low-quality gyros (`lqgyro=`) and both IMU timestamps (`ts=`);
+- both full accelerometer + gyroscope triads by name — `accel_l` / `left_gyro` (bytes 35–46)
+  and `accel_r` / `right_gyro` (bytes 48–59, printed in the exact `(y,x,z)` order
+  InputPlumber reads them in [`hid_report.rs`](src/drivers/lego/hid_report.rs));
+- the raw trailer (`tr=`) plus the complete raw frame in hex on every decode line.
+
+This closes the last capture gap from the "log EVERYTHING" requirement: nothing in the Legion
+XInput frame is left undecoded.
+
 ## What's new in v10
 
-**v10** is the current release — a **logger-only** upgrade to the **v3.2 diagnostic logger**
+**v10** was the previous release (superseded by [v10.1](#whats-new-in-v101)) — a
+**logger-only** upgrade to the **v3.2 diagnostic logger**
 (needed to diagnose a "gyro dead in-game" report from ANOTHER machine). The InputPlumber
 binary is **unchanged** — still the same `c9a4bfa8` build as v9 (prebuilt sha256:
 `c9a4bfa800a2c1bca078c41ddfcb0131351cd8f5402d8a5cdd4963ca13476e00`).
@@ -45,11 +72,11 @@ single log:
 - complete raw 64-byte XInput frames periodically and on motion;
 - IIO ↔ LEGION-SRC ↔ DECK correlation (fast IIO sampling + coalesced DECK reads during motion).
 
-**For a remote tester with dead gyro** (the open SamTsuki case): install v10 with
+**For a remote tester with dead gyro** (the open SamTsuki case): install v10.1 with
 `./install.sh --log`, start the same game, rotate the device ~15 s in-game, then send back
 `/var/log/ip-gyro-logger.log` — the `DECODE LEGION-SRC ... right_gyro=` lines tell
 immediately whether his IMU reaches the controller (see
-[Diagnostic logger](#diagnostic-logger-v32-optional)).
+[Diagnostic logger](#diagnostic-logger-v33-optional)).
 
 ## What's new in v9
 
@@ -140,7 +167,7 @@ command and no extra artifact:
 
 After `./install.sh --log` the user only has to **reproduce the failure** and send back the
 single file (`cat /var/log/ip-gyro-logger.log`) — see the
-[Diagnostic logger](#diagnostic-logger-v32-optional) section below.
+[Diagnostic logger](#diagnostic-logger-v33-optional) section below.
 
 ## What's new in v8
 
@@ -159,16 +186,16 @@ single file (`cat /var/log/ip-gyro-logger.log`) — see the
 
 ### 3. Passive diagnostic logger (two-mode install)
 
-`install.sh` now supports **two modes**: a plain `./install.sh` (binary install only) and `./install.sh --log` (`-l` / `--logger` are aliases), which additionally installs and enables the passive [diagnostic logger](#diagnostic-logger-v32-optional). See the install section below.
+`install.sh` now supports **two modes**: a plain `./install.sh` (binary install only) and `./install.sh --log` (`-l` / `--logger` are aliases), which additionally installs and enables the passive [diagnostic logger](#diagnostic-logger-v33-optional). See the install section below.
 
 ## Install (prebuilt binary)
 
-Download **`inputplumber-legiongo2-gyro-v10.tar.gz`** from the **Releases** page, extract it and run:
+Download **`inputplumber-legiongo2-gyro-v10.1.tar.gz`** from the **Releases** page, extract it and run:
 
 ```bash
-tar xzf inputplumber-legiongo2-gyro-v10.tar.gz
+tar xzf inputplumber-legiongo2-gyro-v10.1.tar.gz
 ./install.sh        # plain install — binary + profile + power fixes + auto gyro-reset unit, restarts inputplumber, ensures the logger is OFF
-./install.sh --log  # ONE command: same as above PLUS installs & enables the v3.2 diagnostic logger, which captures EVERYTHING into /var/log/ip-gyro-logger.log
+./install.sh --log  # ONE command: same as above PLUS installs & enables the v3.3 diagnostic logger, which captures EVERYTHING into /var/log/ip-gyro-logger.log
 ```
 
 > Run `install.sh` as your regular (non-root) user — it uses `sudo` internally and refuses
@@ -182,7 +209,7 @@ tar xzf inputplumber-legiongo2-gyro-v10.tar.gz
 3. the systemd override with comfortable gains (see below);
 4. the suspend/resume power fix — enables `inputplumber-suspend.service` (so the device can sleep without waking from the controllers) and installs a drop-in that force-re-scans udev on wake so the virtual Steam Deck controller returns to Steam (see [Suspend / Resume fixes](#suspend--resume-fixes-included-in-this-patch));
 5. the boot-time auto-reset unit [`steam-deck-uhid-gyro-reset.service`](steam-deck-uhid-gyro-reset.service) — clears Steam's virtual gamepad registry before Steam starts so the virtual Steam Deck controller re-registers **with its IMU/gyro initialized** after Bazzite updates (see [Auto-reset after updates](#4-auto-reset-after-updates-installed-by-installsh));
-6. **optionally** the passive diagnostic logger (only with `--log`; plain `./install.sh` makes sure it is fully removed — see [Diagnostic logger](#diagnostic-logger-v32-optional)).
+6. **optionally** the passive diagnostic logger (only with `--log`; plain `./install.sh` makes sure it is fully removed — see [Diagnostic logger](#diagnostic-logger-v33-optional)).
 
 Or manually:
 
@@ -216,13 +243,13 @@ sudo systemctl edit inputplumber.service
 sudo systemctl restart inputplumber
 ```
 
-## Diagnostic logger (v3.2, optional)
+## Diagnostic logger (v3.3, optional)
 
-In gaming mode the virtual Steam Deck controller could previously map only A/B (no joysticks, no gyro). To make such issues diagnosable after the fact, this repo ships a **passive diagnostic logger**: pure Python 3 standard library, no dependencies, no rebuild. **v10** ships the **v3.2** logger, which captures every source into a single log (`/var/log/ip-gyro-logger.log`) via the one command `./install.sh --log` — the per-app Steam Input activation markers described in [What's new in v9](#2-diagnostic-logger-v31), plus the physical IMU decode described in [What's new in v10](#whats-new-in-v10).
+In gaming mode the virtual Steam Deck controller could previously map only A/B (no joysticks, no gyro). To make such issues diagnosable after the fact, this repo ships a **passive diagnostic logger**: pure Python 3 standard library, no dependencies, no rebuild. **v10.1** ships the **v3.3** logger, which captures every source into a single log (`/var/log/ip-gyro-logger.log`) via the one command `./install.sh --log` — the per-app Steam Input activation markers described in [What's new in v9](#2-diagnostic-logger-v31), the physical IMU decode described in [What's new in v10](#whats-new-in-v10), and the full per-field `XFULL` decode described in [What's new in v10.1](#whats-new-in-v101).
 
 Files in [`logger/`](logger/):
 
-- `logger/ip-gyro-logger.py` — records timestamped, greppable evidence: udev device add/remove events, `/proc/bus/input/devices` snapshots, IIO gyro/accel samples, evdev key/axis events, hidraw flow into the virtual deck, Steam registry verdicts, InputPlumber's journal, STATE session markers, and a heartbeat / session (gamescope/desktop) transitions. **v3.1** added: per-app Steam Input activation from Steam's `controller_ui.txt` and a running-game tracker (AppID + loaded config). **v3.2** adds: full physical Legion XInput IMU decode (`DECODE LEGION-SRC ... left_gyro=(41–46) right_gyro=(54–59)`), complete raw 64-byte frames on a timer/motion, and IIO ↔ LEGION-SRC ↔ DECK correlation during motion.
+- `logger/ip-gyro-logger.py` — records timestamped, greppable evidence: udev device add/remove events, `/proc/bus/input/devices` snapshots, IIO gyro/accel samples, evdev key/axis events, hidraw flow into the virtual deck, Steam registry verdicts, InputPlumber's journal, STATE session markers, and a heartbeat / session (gamescope/desktop) transitions. **v3.1** added: per-app Steam Input activation from Steam's `controller_ui.txt` and a running-game tracker (AppID + loaded config). **v3.2** added: full physical Legion XInput IMU decode (`DECODE LEGION-SRC ... left_gyro=(41–46) right_gyro=(54–59)`), complete raw 64-byte frames on a timer/motion, and IIO ↔ LEGION-SRC ↔ DECK correlation during motion. **v3.3** adds: per-frame decode of **EVERY** field of the Legion XInput report on a `DECODE LEGION-SRC ... XFULL` line — enums, batteries, sticks, all 32 buttons by name, triggers, wheel, touch, low-quality gyros, both IMU timestamps and both full accel+gyro triads by name, plus the raw trailer and full frame hex — so any change in the physical frame is captured.
 - `logger/ip-gyro-logger.service` — systemd unit, runs as **root** (so `/dev/input/*`, `/dev/hidraw*`, `/sys/bus/iio`, every `/home` user's Steam registry and `journalctl -u inputplumber` are readable), `Restart=always`, logs to `/var/log/ip-gyro-logger.log`.
 
 ### Two install modes
@@ -291,7 +318,7 @@ The logger is fully passive: it only reads hidraw (the kernel duplicates each re
 open reader, so it never steals or acknowledges input) and tails InputPlumber's journal — it
 cannot interfere with InputPlumber or Steam.
 
-Steam registering **`28de-12f0`** (not `28de-12fb`) during the gaming-mode `deck-uhid` window is the expected v8/v9/v10 behaviour.
+Steam registering **`28de-12f0`** (not `28de-12fb`) during the gaming-mode `deck-uhid` window is the expected v8/v9/v10/v10.1 behaviour.
 
 ## Build from source
 
@@ -309,11 +336,11 @@ To fine-tune or reproduce the debugging, see [Agent.md](Agent.md) — it documen
 ## Repository contents
 
 - `patches/inputplumber-legion-go-2-bazzite.patch` — the complete source patch (all changes vs upstream base)
-- `inputplumber-legiongo2-gyro-v4.resume-gamefix` — prebuilt modified binary for **v10** (unchanged from v9; Release asset: `inputplumber-legiongo2-gyro-v10.tar.gz`); sha256 `c9a4bfa800a2c1bca078c41ddfcb0131351cd8f5402d8a5cdd4963ca13476e00`
+- `inputplumber-legiongo2-gyro-v4.resume-gamefix` — prebuilt modified binary for **v10.1** (unchanged since v9/v10; Release asset: `inputplumber-legiongo2-gyro-v10.1.tar.gz`); sha256 `c9a4bfa800a2c1bca078c41ddfcb0131351cd8f5402d8a5cdd4963ca13476e00`
 - `inputplumber-legiongo2-gyro` — legacy prebuilt binary (v8.1-era, sha256 `0618564a6194f89ca8039f4db56996ac43e05c05a23f2f80d03bbea2022689ca`), kept as the `install.sh` last-resort fallback (no FIX A)
 - `50-legion_go_2.yaml` — composite device profile (routes the device to the `deck` target so it is seen as a Steam Deck with gyro)
 - `install.sh` — install / update script with two modes (plain vs `--log`) for the optional diagnostic logger (binary + profile + gain override + suspend/resume power fixes + boot-time Steam gyro auto-reset unit)
-- `logger/` — passive diagnostic logger (v3.2: `ip-gyro-logger.py` + `ip-gyro-logger.service`), installed by `./install.sh --log` (see [Diagnostic logger](#diagnostic-logger-v32-optional))
+- `logger/` — passive diagnostic logger (v3.3: `ip-gyro-logger.py` + `ip-gyro-logger.service`), installed by `./install.sh --log` (see [Diagnostic logger](#diagnostic-logger-v33-optional))
 - `steam-deck-uhid-gyro-reset.service` — oneshot unit that clears Steam's virtual gamepad registry at boot (installed & enabled by install.sh) so the deck controller re-registers with IMU/gyro initialized after Bazzite updates
 - `Agent.md` — full debugging log: hypotheses, measurements, reproduction steps
 - `steam-input-ref.png` — Steam Input reference screenshot

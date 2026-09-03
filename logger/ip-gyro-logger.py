@@ -74,6 +74,20 @@ v3.2 (the physical-source IMU + burst capture — closing the LEFT side of the l
     gyro/accel values line up with the hidraw bursts for correlation; the quiet
     default stays at 1 sample/s
 
+v3.3 (capture EVERY field of the joystick path — the agreed "all" definition):
+  * the PHYSICAL Legion XInput frame (0x04 @ byte 0) is decoded into NAMED
+    fields for EVERY byte of the 64-byte frame: header/enums/batteries/state
+    (0-13), sticks (14-17), every named bit of button bytes 18-21, analog +
+    digital triggers and mouse wheel (22-25), touch (26-29), low-quality gyro +
+    IMU timestamps (30-34), both IMU accel+gyro i16 BE (35-59: left_accel
+    35/37/39, left_gyro 41/43/45, right_accel y/x/z 48/50/52, right_gyro y/x/z
+    54/56/58) and the 60-63 trailer
+  * a full-field "DECODE ... XFULL ..." line fires on ANY change (gyro motion
+    OR a button/stick/trigger/state change) — throttled to ~10 lines/s during
+    motion bursts — plus one decoded keepalive per 5 s on the same cadence as
+    the raw-hex snapshot, so at rest every field still appears as a NAMED value
+    at least every 5 s, never only as an anonymous byte in a raw snapshot
+
 Runs as root via ip-gyro-logger.service so it can read /dev/input/* and
 /sys/bus/iio. Pure Python 3 standard library — no dependencies, no rebuild.
 
@@ -879,6 +893,12 @@ def _u16(raw, off):
         return None
     return struct.unpack_from("<H", raw, off)[0]
 
+def _u16be(raw, off):
+    """Big-endian unsigned u16 (Legion XInput touch_x/y are MSB-first)."""
+    if off + 2 > len(raw):
+        return None
+    return struct.unpack_from(">H", raw, off)[0]
+
 def _u32_le(raw, off):
     if off + 4 > len(raw):
         return None
@@ -977,44 +997,149 @@ def decode_deck_report(raw):
     }
 
 # ---------------------------------------------------------------------------
-# v3.2 — full 64-byte PHYSICAL Legion XInput report decode.
+# v3.3 — full 64-byte PHYSICAL Legion XInput report decode.
 #
 # Byte-layout source of truth = InputPlumber's on-wire struct `XInputDataReport`
 # in src/drivers/lego/hid_report.rs (ReportType::XInputData = 0x04 at byte 0,
 # hid_cmd 0x74 = XINPUT_COMMAND_ID at byte 2, #[packed_struct(size_bytes =
-# "60")] carried in a 64-byte report):
-#   [0]=0x04 XInputData report id, [2]=0x74 controller/IMU command id
-# IMU bytes are big-endian signed i16 (MSB-first) at the struct offsets:
-#   left_gyro_x/y/z = 41/43/45, right_gyro_y/x/z = 54/56/58 (2 bytes each).
+# "60")] carried in a 64-byte report). The whole 64-byte frame is decoded into
+# NAMED fields (nothing dropped): header/enum/state bytes 0-13, sticks 14-17,
+# every named bit of the button bytes 18-21, analog + digital triggers and
+# wheel 22-25, touch 26-29, the low-quality gyro bytes + IMU timestamps 30-34,
+# accel/gyro i16 (MSB-first) for BOTH IMUs 35-59, and the 60-63 trailer.
+#   left_gyro_x/y/z = 41/43/45, right_gyro_y/x/z = 54/56/58  (i16 BE, gyro)
+#   left_accel_x/y/z = 35/37/39, right_accel_y/x/z = 48/50/52 (i16 BE, accel)
+#   right_accel is stored y@48-49/x@50-51/z@52-53 and right_gyro
+#   y@54-55/x@56-57/z@58-59 (Rust field order is NOT x,y,z in the bytes).
 # The report's own "left/right gyro" labels ARE the controller's gyro stream —
 # the same physical motion the virtual deck later reports as pitch/yaw/roll.
 # ---------------------------------------------------------------------------
 
 LEGO_HEADER_BYTES = (0x04, 0x74)
 
+# GamepadMode / ConnectedState value->name maps (mirror hid_report.rs enums).
+LEGO_MODE_NAMES = {0x00: "xinput", 0x01: "dinput", 0x02: "fps"}
+LEGO_STATE_NAMES = {0x02: "attached", 0x03: "detached"}
+
+def _lego_mode(v):
+    """GamepadMode byte 9 -> Display name (mirrors hid_report.rs GamepadMode)."""
+    return LEGO_MODE_NAMES.get(v, "unknown")
+
+def _lego_state(v):
+    """ConnectedState byte 12/13 -> name (mirrors hid_report.rs ConnectedState:
+    0x02 attached, 0x03 detached, anything else -> connecting)."""
+    return LEGO_STATE_NAMES.get(v, "connecting")
+
+# Named buttons by byte index -> (byte-mask, name) for the Legion source.
+# bytes 18-21 are fully mapped (Rust hid_report.rs:358-428).
+LEGO_BTN_BYTES = {
+    18: ((0x80, "legion"), (0x40, "quick_access"), (0x20, "thumb_l"),
+         (0x10, "thumb_r"), (0x08, "up"), (0x04, "down"),
+         (0x02, "left"), (0x01, "right")),
+    19: ((0x80, "a"), (0x40, "b"), (0x20, "x"), (0x10, "y"),
+         (0x08, "lb"), (0x04, "d_trigger_l"), (0x02, "rb"),
+         (0x01, "d_trigger_r")),
+    20: ((0x80, "y1"), (0x40, "y2"), (0x20, "y3"), (0x10, "m1"),
+         (0x08, "m2"), (0x04, "m3"), (0x02, "view"), (0x01, "menu")),
+    21: ((0x80, "mouse_click"), (0x40, "show_desktop"), (0x20, "alt_tab"),
+         (0x10, "u21_3"), (0x08, "u21_4"), (0x04, "u21_5"),
+         (0x02, "u21_6"), (0x01, "u21_7")),
+}
+
+# stable display/compare order for the Legion source button set
+LEGO_BTN_ORDER = (
+    "legion", "quick_access", "thumb_l", "thumb_r", "up", "down", "left",
+    "right", "a", "b", "x", "y", "lb", "rb", "d_trigger_l", "d_trigger_r",
+    "y1", "y2", "y3", "m1", "m2", "m3", "view", "menu",
+    "mouse_click", "show_desktop", "alt_tab",
+    "u21_3", "u21_4", "u21_5", "u21_6", "u21_7",
+)
+
+def _lego_buttons(raw):
+    """Pressed named buttons in a Legion XInput frame (deterministic order)."""
+    if len(raw) < 22:
+        return []
+    pressed = set()
+    for bi, table in LEGO_BTN_BYTES.items():
+        b = raw[bi]
+        for mask, name in table:
+            if name and (b & mask):
+                pressed.add(name)
+    return [n for n in LEGO_BTN_ORDER if n in pressed]
+
 def decode_lego_report(raw):
     """Decode one 64-byte physical Legion XInput report into a dict, or None
     when the frame is not an XInputData report (a 64-byte DECK frame is never
     mis-decoded). Byte0 must be 0x04 (XInputData report id); when byte2 is 0x74
-    (XINPUT_COMMAND_ID) the frame carries the IMU payload. Fields are named to
-    mirror the Rust struct with the axes spelled out explicitly:
-      left_gyro_x = 41, left_gyro_y = 43, left_gyro_z = 45
-      right_gyro_y = 54, right_gyro_x = 56, right_gyro_z = 58
-    All are big-endian signed i16."""
+    (XINPUT_COMMAND_ID) the frame carries the IMU payload (dec["has_imu"]).
+    EVERY field of the 64-byte frame is decoded into a named value so nothing
+    in the joystick path is left as an anonymous byte:
+      header/enums/state: report_id/report_size/hid_cmd, aux bytes 3/4/6/8/10/
+        11/24, mode (9), l/r con_state (12/13), batteries (5/7)
+      controls: sticks 14-17, button bytes 18-21 (named), analog triggers
+        22/23, mouse_z 25, touch_x/y 26-29 (u16 BE)
+      IMU: low-quality gyro 30-33, IMU timestamps 34/47, accel+gyro i16 BE for
+        left (35-46) and right (48-59)
+    All multi-byte IMU/touch fields are big-endian."""
     if len(raw) < 64:
         return None
     if raw[0] != LEGO_HEADER_BYTES[0]:
         return None
-    if raw[2] != LEGO_HEADER_BYTES[1]:
-        return {"has_imu": False}
     try:
+        has_imu = raw[2] == LEGO_HEADER_BYTES[1]
         return {
-            "has_imu": True,
-            "lgx": _s16be(raw, 41), "lgy": _s16be(raw, 43), "lgz": _s16be(raw, 45),
-            "rgy": _s16be(raw, 54), "rgx": _s16be(raw, 56), "rgz": _s16be(raw, 58),
+            "has_imu": has_imu,
+            "report_id": raw[0], "report_size": raw[1], "hid_cmd": raw[2],
+            "u3": raw[3], "u4": raw[4],
+            "lbat": raw[5], "u6": raw[6], "rbat": raw[7], "u8": raw[8],
+            "mode": _lego_mode(raw[9]), "u10": raw[10], "u11": raw[11],
+            "lst": _lego_state(raw[12]), "rst": _lego_state(raw[13]),
+            "lsx": raw[14], "lsy": raw[15], "rsx": raw[16], "rsy": raw[17],
+            "buttons": _lego_buttons(raw),
+            "alt_l": raw[22], "alt_r": raw[23], "u23": raw[24],
+            "mz": raw[25],
+            "tx": _u16be(raw, 26), "ty": _u16be(raw, 28),
+            "lglqx": raw[30], "lglqy": raw[31],
+            "rglqx": raw[32], "rglqy": raw[33],
+            "lts": raw[34],
+            "lax": _s16be(raw, 35), "lay": _s16be(raw, 37),
+            "laz": _s16be(raw, 39),
+            "lgx": _s16be(raw, 41), "lgy": _s16be(raw, 43),
+            "lgz": _s16be(raw, 45),
+            "rts": raw[47],
+            "ray": _s16be(raw, 48), "rax": _s16be(raw, 50),
+            "raz": _s16be(raw, 52),
+            "rgy": _s16be(raw, 54), "rgx": _s16be(raw, 56),
+            "rgz": _s16be(raw, 58),
         }
     except IndexError:
-        return {"has_imu": False}
+        return None
+
+def _lego_fmt(label, dec, raw, tag):
+    """Format one full all-fields DECODE line for a Legion XInput frame.
+    Keeps the legacy substrings left_gyro=(x=,y=,z=) and right_gyro=(y=,x=,z=)
+    so old greps for those tokens still match, and adds every other named
+    field + aux bytes + trailer, with the full raw hex at the end."""
+    btns = ",".join(dec["buttons"]) or "-"
+    return (
+        f"DECODE {label} XFULL imu={1 if dec['has_imu'] else 0} "
+        f"cmd={dec['hid_cmd']:02x} mode={dec['mode']} "
+        f"bat=({dec['lbat']},{dec['rbat']}) state=({dec['lst']},{dec['rst']}) "
+        f"sticks=({dec['lsx']},{dec['lsy']},{dec['rsx']},{dec['rsy']}) "
+        f"btn=[{btns}] "
+        f"trig=({dec['alt_l']},{dec['alt_r']}) wheel={dec['mz']} "
+        f"touch=({dec['tx']},{dec['ty']}) "
+        f"lqgyro=({dec['lglqx']},{dec['lglqy']},{dec['rglqx']},{dec['rglqy']}) "
+        f"ts=({dec['lts']},{dec['rts']}) "
+        f"accel_l=({dec['lax']},{dec['lay']},{dec['laz']}) "
+        f"left_gyro=(x={dec['lgx']},y={dec['lgy']},z={dec['lgz']}) "
+        f"accel_r=({dec['ray']},{dec['rax']},{dec['raz']}) "
+        f"right_gyro=(y={dec['rgy']},x={dec['rgx']},z={dec['rgz']}) "
+        f"aux=({dec['u3']},{dec['u4']},{dec['u6']},{dec['u8']},"
+        f"{dec['u10']},{dec['u11']},{dec['u23']}) "
+        f"tr={raw[60:64].hex(' ')} "
+        f"raw={raw.hex(' ')} [{tag}]"
+    )
 
 def _decode_deck(raw):
     """v2-compatible single-report decode hook (kept for back-compat; the real
@@ -1179,9 +1304,14 @@ def _handle_lego_reports(e, chunk, t2):
     """Per-report decode + raw capture for the PHYSICAL Legion XInput source
     (17EF:61EB, iface 2) — the input InputPlumber reads BEFORE the virtual deck.
     Real XInput frames are 64 bytes (report id 0x04 at byte 0); a read may hold
-    several back-to-back frames. Decode lives in decode_lego_report(); the whole
-    point is to prove gyro motion LEAVES the controller: bytes 41-46
-    (left_gyro_x/y/z) and 54-59 (right_gyro_y/x/z), big-endian signed i16."""
+    several back-to-back frames. v3.3 decodes EVERY field of each 64-byte frame
+    into named values (see decode_lego_report()) and emits:
+      * "LEGION-SRC ... raw=..." full raw hex every LEGO_RAW_HB (5 s);
+      * a full "DECODE ... XFULL ..." line whenever ANY field changes (motion
+        throttled to LEGO_MOTION_LOG_MIN ~10 lines/s; the first frame of a
+        fresh quiet->active edge logs immediately), plus one decoded keepalive
+        on the same 5 s cadence as the raw hex so at-rest frames still show
+        every field as a NAMED value at least every 5 s."""
     label = _hid_label(e)
     L = len(chunk)
     if L and (L == 64 or (L > 64 and L % 64 == 0)):
@@ -1202,28 +1332,34 @@ def _handle_lego_reports(e, chunk, t2):
                 log(f"FLOW GAP {label} 64-byte frame with non-XInput header "
                     f"raw={raw.hex(' ')} (protocol mismatch?)")
             continue
-        # full raw hex every LEGO_RAW_HB (revives the v3.1 last_hex sample
-        # state that was stored but never actually logged)
+        # -- full raw hex + decoded keepalive every LEGO_RAW_HB ---------------
         if t2 - e["lego_hex_log"] >= LEGO_RAW_HB:
             e["lego_hex_log"] = t2
             log(f"LEGION-SRC {label} raw={raw.hex(' ')}")
-        if not dec.get("has_imu") or dec["lgx"] is None:
-            continue  # XInputData frame without the 0x74 IMU payload
-        mag = _mag(dec["lgx"], dec["lgy"], dec["lgz"],
-                   dec["rgx"], dec["rgy"], dec["rgz"])
-        lg = "left_gyro=(x={},y={},z={})".format(
-            dec["lgx"], dec["lgy"], dec["lgz"])
-        rg = "right_gyro=(y={},x={},z={})".format(
-            dec["rgy"], dec["rgx"], dec["rgz"])
-        if mag > LEGO_MOTION_MIN:
-            # the first motion frame of a burst logs immediately, then throttled
-            if not e["lego_last_motion"]:
-                e["lego_last_motion"] = True
-                e["lego_dec_log"] = 0.0
-            if t2 - e["lego_dec_log"] >= LEGO_MOTION_LOG_MIN:
-                e["lego_dec_log"] = t2
-                log(f"DECODE {label} IMU-LEGION {lg} {rg} "
-                    f"raw={raw.hex(' ')} [IMU]")
+            log(_lego_fmt(label, dec, raw, "KEEP"))
+        # -- ANY field changed -> full decoded all-fields line -----------------
+        # (motion throttled to LEGO_MOTION_LOG_MIN; a fresh quiet->active edge
+        # logs its first frame immediately by resetting the throttle stamp)
+        if repr(dec) != e["lego_prev"]:
+            e["lego_prev"] = repr(dec)
+            if dec["has_imu"]:
+                mag = _mag(dec["lgx"], dec["lgy"], dec["lgz"],
+                           dec["rgx"], dec["rgy"], dec["rgz"])
+            else:
+                mag = 0
+            if mag > LEGO_MOTION_MIN:
+                if not e["lego_last_motion"]:
+                    e["lego_last_motion"] = True
+                    e["lego_dec_log"] = 0.0
+                if t2 - e["lego_dec_log"] >= LEGO_MOTION_LOG_MIN:
+                    e["lego_dec_log"] = t2
+                    log(_lego_fmt(label, dec, raw, "IMU"))
+            else:
+                e["lego_last_motion"] = False
+                # control/state/quiet-field change -> immediate (rare vs motion)
+                if t2 - e["lego_dec_log"] >= LEGO_MOTION_LOG_MIN:
+                    e["lego_dec_log"] = t2
+                    log(_lego_fmt(label, dec, raw, "CHG"))
         else:
             e["lego_last_motion"] = False
 
@@ -1848,6 +1984,10 @@ def main():
     log("LOGGER: v3.2 active — physical Legion-SRC IMU decode (IMU-LEGION + full "
         "raw hex), deck raw24-35 correlation, coalesced DECK bursts, fast IIO "
         "sampling during motion")
+    log("LOGGER: v3.3 active — EVERY field of the Legion XInput frame decoded "
+        "(DECODE ... XFULL: enums/batteries/sticks/buttons/triggers/touch/"
+        "lq-gyro/IMU-timestamps/both accel+gyro/trailer) — full line on any "
+        "change + decoded keepalive every 5 s with the raw-hex snapshot")
 
     last_snap = last_hb = last_iio = last_sess = last_iio_rescan = \
         last_flow = last_steam = time.monotonic()
