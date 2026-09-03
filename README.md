@@ -24,10 +24,42 @@ See the screenshot below:
 3. At the very top where it says **GENERAL** there will be **"choose gyro button(s)"**; click it and set it to **None (Gyro Always On)**.
 4. **Reason:** by default the gyro is only enabled while a specific button is held (like Push-to-Talk), so without this change the gyro appears dead.
 
+## What's new in v11
+
+**v11** is the current release — the **first InputPlumber binary change since v9** (v9/v10/v10.1 all shipped the same `c9a4bfa8` build). New prebuilt binary sha256:
+`553e4967500df1cb06e987e209edd87567c4a555538d5578a1966798372f8d00`.
+
+Two changes:
+
+### 1. Center-gyro fallback (fix b) — the center gyro no longer dies when its source dies
+
+The deck's central gyro is fed by a single live source chosen by a new **`gyro_center`
+proxy/arbiter**: whichever center IMU source is alive feeds the deck. If that active source
+goes dead, the deck **automatically falls back to the other one — in BOTH directions**
+(`IIO -> XInput` and `XInput -> IIO`):
+
+- on THIS machine (XInput alive; IIO sometimes weak) the center stays on the XInput source
+  — behaviour is 1:1 with v9 (regression-tested);
+- on a unit whose **XInput IMU is dead** (the open SamTsuki case: XInput IMU bytes are all
+  zero, while the IIO IMU `iio:device2` is alive) the center gyro now **switches to the live
+  IIO source by itself** — no flag, no config needed.
+
+Switches are single-winner with a 2 s dead-deadline and log `[gyro-center]` markers only on
+transitions (no flapping). Validated on our hardware: regression (a) 1:1 with v9 ✅,
+mechanism in gaming (b) PASS ✅, desktop sanity (c) PASS ✅.
+
+### 2. Right-handle gyro +15% (user request)
+
+The **right-handle (detached) gyro is 15% faster** — the handle output scale
+`RIGHT_GYRO_SCALE` goes `0.15 -> 0.1725` (effective `0.75 -> 0.8625` with the shipped
+`IP_GYRO_GAIN_HANDLE=5`). The **central** gyro is unchanged (`CENTER_GYRO_SCALE=1.0`,
+`IP_GYRO_GAIN_CENTER=3.0`). The recommended settings below are unchanged.
+
 ## What's new in v10.1
 
-**v10.1** is the current release — a **logger-only** upgrade to the **v3.3 diagnostic
-logger** (per-frame decode of EVERY field of the physical Legion XInput report). The
+**v10.1** was the previous release (superseded by [v11](#whats-new-in-v11)) — a
+**logger-only** upgrade to the **v3.3 diagnostic logger** (per-frame decode of EVERY
+field of the physical Legion XInput report). The
 InputPlumber binary is **unchanged** — still the same `c9a4bfa8` build as v9/v10 (prebuilt
 sha256:
 `c9a4bfa800a2c1bca078c41ddfcb0131351cd8f5402d8a5cdd4963ca13476e00`).

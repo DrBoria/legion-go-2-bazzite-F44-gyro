@@ -1183,3 +1183,174 @@ The old record (lines 598-660) claimed "deck-uhid cannot trigger Steam IMU → g
 
 ### 5) ПОБОЧНАЯ НАХОДКА — InputPlumber ЗАСТРЯЛ в GAMING (паттерн #2, воспроизведён)
 После закрытия ESO 17:35:53 НЕТ перехода из GAMING: последний STATE = 17:34:02 `NO-DECK -> GAMING`; на 17:51+ логгер всё ещё в GAMING с активным DECK-GAME (`HIDFLOW DECK-GAME 20 rd/s`, frame≈396k на 17:51:44) — застревание ~17+ мин. Отдельный известный баг (кризис #2: застревание в GAMING убивает тачпад). Лечится мягким рестартом inputplumber (вне этого todo, по согласованию).
+
+## 2026-09-03 — РЕЗУЛЬТАТ v3.3 С МАШИНЫ SamTsuki (todo 28 ЗАВЕРШЁН ПО ДАННЫМ): ЕГО right_gyro 54–59 МЁРТВ + left_gyro 41–46 МЁРТВ + центральный IIO (iio:device2) ЖИВ + deck 12f0 = 0
+
+### 0) ИСТОЧНИК И СТРУКТУРА ЛОГА
+- Файл: `/var/home/legion/Downloads/ip-gyro-logger.log` (1 913 468 Б, 13 538 строк). **ВНУТРИ ДВА СТАРТА ЛОГГЕРА**: старый v3.1 (16:15:36, строки 1–8035, без IMU-байт) и **свежий v3.3 (21:10:08, строки 8036–13538, маркеры 8113–8116)** — анализировался только v3.3-сегмент. Местное время UTC+3 (Москва); хост bazzite; Bazzite, kernel 7.2.1-ogc4.1.fc44; inputplumber PID сменился 205908→225062 ~21:10 (ребут/переустановка перед деплоем v3.3).
+- Режимы v3.3: `STATE: mode NO-DECK -> DESKTOP` 21:10:11.234; `STATE: mode DESKTOP -> GAMING` 21:11:20.858 + `HID: capturing /dev/hidraw1 (DECK-GAME vid=28DE pid=12F0)`.
+- Счёт: 211 реальных XFULL (212 с маркером v3.3); 0 `[IMU]`; 171 `[CHG]`; распределение cmd в DECODE-строках: 13×cmd=02, 11×cmd=10, 4×cmd=69, 183×cmd=74.
+
+### 1) ГЛАВНЫЙ РЕЗУЛЬТАТ — У SamTsuki XInput-кадр LEGION НЕСЁТ НОЛЬ ВО ВСЕХ IMU-ПОЛЯХ (байты 34–59)
+- Каждый подлинный кадр `cmd=74 mode=dinput state=(attached,attached)` имеет ВСЕ IMU-поля = 0: `ts=(0,0) accel_l=(0,0,0) left_gyro=(x=0,y=0,z=0) accel_r=(0,0,0) right_gyro=(y=0,x=0,z=0)`, байты 34–59 raw = 00…00. Пример: `21:12:08.121 DECODE LEGION-SRC@1.2 XFULL imu=1 cmd=74 mode=dinput bat=(99,99) state=(attached,attached) … ts=(0,0) accel_l=(0,0,0) left_gyro=(x=0,y=0,z=0) accel_r=(0,0,0) right_gyro=(y=0,x=0,z=0) … raw=04 3c 74 … 00×26 [KEEP]`.
+- **Даже в покое НЕТ гравитации accel** (у нас на покое accel_r≈(-2848…-2851, 36…59, -2940…-2957)) — у SamTsuki accel_r = (0,0,0). Это НЕ просто «занулён гиро» — весь правый/левый IMU-контур USB-контроллера у него НЕ заполняется.
+- Отсев артефактов: 3 «ненулевых» XFULL (21:10:54.627/.728, 21:10:56.701; `cmd=69 … accel_l=(-32640,-32768,0) accel_r=(-32768,0,0)`, raw-голова `04 06 69`) — это КОРОТКИЕ управляющие кадры report_size=0x06 (cmd=0x69), которые decode_lego_report мис-парсит как XFULL (совпал report_id 0x04). -32768=0x8000 sentinel. НЕ реальный IMU. После отсева: ВСЕ настоящие cmd=0x74 = нулевой IMU.
+
+### 2) ЕГО центральный IIO (iio:device2) ЖИВ — реальное вращение
+- iio:device0 = accel_3d (покой `accel=0,-6,-7`), **iio:device2 = gyro_3d**. Реальные бёрсты вращения: макс |gyro|=2039 @21:12:09.074 (`gyro=-1,2039,0`, ~20°/с при scale 0.000174532), затем 507 @21:10:29, потом 463/439/417/407/345/312/301/299. Покой — шум (~±21).
+- **Корреляция бёрста 21:12:09**: IIO gyro=-1,2039,0 (реальное вращение) В ТО ЖЕ ВРЕМЯ `HIDFLOW DECK-GAME 19 rd/s … gyr(p,y,r)=0,0,0` и `ACTIVITY … DECK-GAME=19rd/s mot=0/19`; ближайший XFULL LEGION (21:12:08.121) — IMU нули. → Его deck в бёрсте НЕСЁТ НОЛЬ при живом центральном железе.
+
+### 3) ПРИЧИНА (код, подтверждён по driver.rs)
+- Центральный гиро deck в attached-режиме = событие **MultiGyro** из `right_gyro` XInput (байты 54–59), см. [driver.rs:600](src/drivers/lego/driver.rs:600) (`Capability::Gyroscope(Source::Center)` + right_gyro изменился → `map_center_gyro_axes` + CENTER_GYRO_SCALE=1.0). Фильтр в attached ([driver.rs:186](src/drivers/lego/driver.rs:186)) держит Center и фильтрует Left/Right контроллера.
+- У SamTsuki right_gyro (54–59) = ВСЕГДА (0,0,0) → условие «right_gyro изменился» никогда не выполняется → MultiGyro не эмитится → в deck центр не пишется. А его IIO-центр (iio:device2), хоть и ЖИВ, фильтруется (ROUND 6: лего — единственный источник IMU центра; IIO отключён на композите). Итог: deck = 0.
+- **Сравнение с нашей машиной (эталон):** тот же бинарь V9 c9a4bfa8, тот же логгер, тот же тип кадра `cmd=74 mode=dinput state=(attached,attached) LEGION-SRC@1.2` — но у НАС правый IMU-контур заполнен (`accel_r≈гравитация`, живой right_gyro) → MultiGyro работает → deck несёт гиро. Различие НЕ в бинаре, а в эмиссии IMU USB-контроллера юнита SamTsuki (прошивка/EC/конфиг против железа).
+
+### 4) ВЫВОД ПО ФИКСУ (решение за пользователем — бинарь НЕ тронут)
+- Данные НЕ поддерживают «править профиль 12f0 / пересборку маппинга» — источник (XInput right_gyro) у SamTsuki физически мёртв, маппинг тут ни при чём.
+- Два направления (кандидаты, НЕ реализованы):
+  - (a) Выяснить у SamTsuki, почему его Legion не шлёт IMU в XInput (проверка: Legion Space / EC / тумблер / прошивка; на этой машине правый контур жив «из коробки»).
+  - (b) Детектируемый фолбэк центра на ЖИВОЙ IIO (iio:device2), когда XInput IMU лего обнаружен мёртвым (нет гравитации accel N секунд) — РЕВЕРС ROUND 6 (у нас IIO фильтруется всегда). ОБЯЗАТЕЛЬНО с гейтом детекции, чтобы не регрессировать нашу рабочую машину (у нас лего-IMU жив; фолбэк не должен сработать).
+- Статус: **todo 28 ЗАВЕРШЁН ПО ДАННЫМ**; следующий шаг — решение пользователя по (a)/(b). Бинарь V9 c9a4bfa8 НЕ менялся.
+
+### 5) СЕМАНТИКА СЛОТОВ IMU В attached-режиме (ответ на вопрос пользователя «у нас всегда правый действует? / левый у SamTsuki мёртв?»)
+- **Слот отчёта ≠ физический контроллер.** В attached (закреплённом) XInput-кадре базы поле `right_gyro` (54–59), по замеренной истине ROUND 5e, несёт **ЦЕНТРАЛЬНЫЙ корпусный IMU** (аппаратный квирк Lenovo: «правый» слот отчёта = встроенный центральный сенсор, НЕ гиро правого хендла). Драйвер в attached использует именно этот слот как центр (MultiGyro, [driver.rs:600](src/drivers/lego/driver.rs:600)); собственные Left/Right хендлов в attached фильтруются ([driver.rs:185](src/drivers/lego/driver.rs:185)) — то есть «мы не выбрали правый контроллер», а центральный IMU физически лежит в правом слоте отчёта.
+- `left_gyro` (41–46) в attached-отчёте = ВСЕГДА (0,0,0) **на обеих машинах** (у нас тоже) — слот не заполняется в attached. «Мёртвый левый» — НЕ отличитель и НЕ причина.
+- Отличитель SamTsuki — только **right_gyro (центр) = 0**: у нас там гравитация accel_r + живой сигнал, у него ноль. Это НЕ «правый контроллер сломан», а центральный IMU-контур USB-отчёта не заполняется.
+- **Про физические хендлы (откреплённо) attached-лог НИЧЕГО не говорит**: их гиро активны только в detached (каждый хендл = свой контроллер `0x61ed`, Left/Right не фильтруются, [driver.rs:196](src/drivers/lego/driver.rs:196)). Весь лог SamTsuki — attached (`state=(attached,attached)`), данных по detached-хендлам у нас нет.
+- Кнопки/стики/триггеры/тач SamTsuki РАБОТАЮТ (sticks/btn/bat заполнены в XFULL) — контроллер НЕ «мёртв», пуст только IMU-пейлоад attached-отчёта.
+- **ФИЗИЧЕСКИ ЭТО ОДИН ДАТЧИК, ДВА КАНАЛА** (модель, которой отвечаем пользователю): в корпусе Legion Go 2 ОДИН центральный/корпусный IMU-чип. ОС видит его ДВУМЯ независимыми путями: (1) **kernel IIO** — прямая шина датчика (iio:device0 у нас / iio:device2 у SamTsuki); (2) **USB-контроллер базы** — кладёт этот же сенсор в XInput-кадр в байты 54–59 (протокол зовёт слот «right», но физически это корпусный центр — так развёл Lenovo, доказано калибровкой ROUND 5e). У нас жив канал (2) → deck-гиро работает (покой = гравитация, вращение ~2000+, deck нёс в desktop и в игре). У SamTsuki на ТОМ ЖЕ устройстве канал (2) пуст (байты 0), а канал (1) жив и сильный (2039) — **сенсор-чип цел, не работает именно firmware-путь «сенсор → USB XInput»** (версия/настройка прошивки контроллера его юнита), а НЕ бинарь (у нас идентичный). Отсюда оба направления: (a) чинить канал (2) прошивкой/настройкой, (b) при детекте мёртвого канала (2) брать центр из живого канала (1)=IIO.
+
+### 5) СЕМАНТИКА СЛОТОВ IMU В attached-режиме (ответ на вопрос пользователя «у нас всегда правый действует? / левый у SamTsuki мёртв?»)
+- **Слот отчёта ≠ физический контроллер.** В attached (закреплённом) XInput-кадре базы поле `right_gyro` (54–59), по замеренной истине ROUND 5e, несёт **ЦЕНТРАЛЬНЫЙ корпусный IMU** (аппаратный квирк Lenovo: «правый» слот отчёта = встроенный центральный сенсор, НЕ гиро правого хендла). Драйвер в attached использует именно этот слот как центр (MultiGyro, [driver.rs:600](src/drivers/lego/driver.rs:600)); собственные Left/Right хендлов в attached фильтруются ([driver.rs:185](src/drivers/lego/driver.rs:185)) — то есть «мы не выбрали правый контроллер», а центральный IMU физически лежит в правом слоте отчёта.
+- `left_gyro` (41–46) в attached-отчёте = ВСЕГДА (0,0,0) **на обеих машинах** (у нас тоже) — слот не заполняется в attached. «Мёртвый левый» — НЕ отличитель и НЕ причина.
+- Отличитель SamTsuki — только **right_gyro (центр) = 0**: у нас там гравитация accel_r + живой сигнал, у него ноль. Это НЕ «правый контроллер сломан», а центральный IMU-контур USB-отчёта не заполняется.
+- **Про физические хендлы (откреплённо) attached-лог НИЧЕГО не говорит**: их гиро активны только в detached (каждый хендл = свой контроллер `0x61ed`, Left/Right не фильтруются, [driver.rs:196](src/drivers/lego/driver.rs:196)). Весь лог SamTsuki — attached (`state=(attached,attached)`), данных по detached-хендлам у нас нет.
+- Кнопки/стики/триггеры/тач SamTsuki РАБОТАЮТ (sticks/btn/bat заполнены в XFULL) — контроллер НЕ «мёртв», пуст только IMU-пейлоад attached-отчёта.
+
+## 2026-09-03 — ПЛАН ФИКСА (b) «ГИРО-ФОЛБЭК ЦЕНТРА» (proxy gyro_center) — ПЛАН-ДОКУМЕНТ ГОТОВ
+- **Полный план**: [`docs/plan-fix-b-gyro-proxy.md`](docs/plan-fix-b-gyro-proxy.md) (архитектура §2, API модуля §3, таблица точек вставки §4, env §5, лог-маркеры §6, протокол валидации из 4 сценариев §7 с PASS/FAIL). Здесь — конспект.
+- **Суть (b)** (см. вывод п.4 выше): при детекте мёртвого XInput-канала IMU центра (у SamTsuki байты 54–59 = 0) брать центральный гиро deck из ЖИВОГО IIO (iio:device2). На нашей машине (XInput-центр жив) фолбэк НЕ должен сработать — 1:1 с V9.
+- **Кто сейчас отвечает за центр-deck**: attached → [`lego/driver.rs`](src/drivers/lego/driver.rs:598) `MultiGyro` из XInput-слота right_gyro (`map_center_gyro_axes` + CENTER_GYRO_SCALE=1.0) → `Gamepad::Gyro` → merged-ветка [`steam_deck.rs`](src/input/target/steam_deck.rs:796) (скейл `IP_GYRO_GAIN_CENTER`). IIO-центр отрезан ROUND-6 фильтром в [`iio_imu/driver.rs`](src/drivers/iio_imu/driver.rs:131) (пришёл бы в ветку `Gyroscope(Source)` [`steam_deck.rs`](src/input/target/steam_deck.rs:881)). `steam_deck.rs` НЕ трогаем.
+- **Дизайн**: новый общий модуль-арбитр `src/drivers/gyro_center.rs` (паттерн `legion_state.rs`: только атомики, без sysfs/USB-чтений; регистрация в [`drivers/mod.rs`](src/drivers/mod.rs:7)). Правило «1 канал за раз» реализуется ЧЕРЕЗ существующий механизм фильтров `filtered_events`/`refresh_event_filter()` — правки эмиссии НЕ нужны (все IMU-блоки lego уже гейтятся `!contains(Center)`).
+- **Выбор канала** `use_iio_for_center()` = attached && (FORCE_IIO || ACTIVE==Iio). Детектор «мёртв»: активный источник даёт 0 с гравитацией N сек (XInput: raw-аксель правого слота < LSB-порог ~500; IIO: |accel| < ~3.0 м/с²), только при attached. Переключение — только если другой источник недавно был жив (анти-флап). Detached → всегда XInput (IIO держит ROUND-6).
+- **Точки вставки (план, текущие номера строк)**:
+  - Новый `src/drivers/gyro_center.rs`; `pub mod gyro_center;` в [`src/drivers/mod.rs`](src/drivers/mod.rs:7).
+  - [`iio_imu/driver.rs`](src/drivers/iio_imu/driver.rs:131): `refresh_event_filter()`/`get_default_event_filter()` — реверс ROUND-6 (убрать Center из фильтра) ТОЛЬКО когда `use_iio_for_center()`; [`poll()`](src/drivers/iio_imu/driver.rs:161) — читать аксель ВСЕГДА (health-фид детектору), эмитить только если не фильтровано.
+  - [`lego/driver.rs`](src/drivers/lego/driver.rs:151): `refresh_event_filter()` — перестроить: реагировать и на attach, и на решение proxy; [`get_default_event_filter()`](src/drivers/lego/driver.rs:178) — при attached+use_iio добавить {Accel(C),Gyro(C)} (гейтит MultiAccel/MultiGyro, кнопки целы); хук health в [`translate_xinput()`](src/drivers/lego/driver.rs:278) из сырого `right_accel_*` (байты 48–53) — работает и при фильтре, т.к. фильтр режет только эмиссию.
+  - Detached/хендлы/steam_deck/конфиг/логгер — вне скоупа.
+- **Env**: `IP_GYRO_FORCE_IIO=1` (тест механизма на нашей машине), `IP_GYRO_FALLBACK_MS=2000`, `IP_GYRO_FALLBACK_XACCEL_LSB=500`, `IP_GYRO_FALLBACK_IACCEL_MS2=3.0`.
+- **Лог-маркеры** `[gyro-center]` (info): startup/decision, `XInput→Iio` с длительностью смерти и |аксель| обоих источников, `Iio→XInput`, сброс при detached. Ловятся логгером (journal, IPJ-префикс).
+- **Валидация (§7 док-а)**: (a) РЕГРЕССИЯ наша машина, override OFF — 1:1 V9; (b) МЕХАНИЗМ наша машина в GAMING, override ON — форс-старт с мёртвого IIO → детект «0 с гравитацией» → свитч на живой XInput → deck несёт сильный гиро + маркеры перехода; (c) DESKTOP sanity — iio:device0 ~90–100 ненулевой; (d) ФУНКЦИОНАЛ на машине SamTsuki — его XInput мёртв естественно → свитч на живой iio:device2 (2039) → DECK-* gyr≠0 в игре + корреляция с IIO.
+- **Открытые вопросы**: возможная ре-калибровка осей IIO-центра (vs ROUND 6k), если в (d) оси разойдутся; подбор порогов/гистерезиса.
+- **Скоуп**: только план (.md). Реализация/сборка/деплой/железные тесты — вне этого todo.
+
+## 2026-09-03 — РЕАЛИЗАЦИЯ ФИКСА (b) «ГИРО-ФОЛБЭК ЦЕНТРА» (proxy gyro_center) — КОД НАПИСАН + СОБРАН (БЕЗ ДЕПЛОЯ)
+- **Сделано по плану** [`docs/plan-fix-b-gyro-proxy.md`](docs/plan-fix-b-gyro-proxy.md). Переключение центрального deck-гиро «1 канал за раз» — через существующий механизм `filtered_events`/`refresh_event_filter()`; блоки эмиссии НЕ менялись (IMU-блоки lego уже гейтятся `!contains(Center)`).
+- **Новый модуль-арбитр** [`src/drivers/gyro_center.rs`](src/drivers/gyro_center.rs:1) (паттерн `legion_state.rs`: только атомики, без sysfs/USB-чтений, без USB-протокола); зарегистрирован `pub mod gyro_center;` в [`src/drivers/mod.rs`](src/drivers/mod.rs:5).
+  - Состояние: `ACTIVE` (0=XInput — дефолт V9; 1=IIO), `FORCE_CONSUMED` (override одноразовый, анти-флап), `XINPUT_LAST_ALIVE_MS`/`IIO_LAST_ALIVE_MS` (0=никогда не жив), `XINPUT_SEEN_AT_MS` (boot-guard), текущие магнитуды (для логов).
+  - Health-фиды: [`report_xinput_accel()`](src/drivers/gyro_center.rs) из КАЖДОГО XInput-кадра lego (байты 48–53); [`report_iio_accel()`](src/drivers/gyro_center.rs) из accel-полла iio (accel_3d). «Есть гравитация» = источник жив.
+  - `use_iio_for_center()` = attached && (FORCE_IIO || ACTIVE==IIO). [`evaluate()`](src/drivers/gyro_center.rs) — арбитраж; ВСЕ переходы — через CAS `try_switch` (evaluate зовётся из ДВУХ потоков полла: accel_3d + gyro_3d → только победитель CAS логирует).
+  - Анти-регрессия/анти-флап: boot-guard `XINPUT_SEEN_AT_MS` (XInput не объявляется мёртвым до первого отчёта); АСИММЕТРИЯ (XInput-активный — консервативен: нужен SEEN + FALLBACK_MS без гравитации; IIO-активный — «никогда не был жив» = мёртв → возможен фолбэк под FORCE); `FORCE_CONSUMED` (override срабатывает один раз и не ре-армится после естественного фолбэка); переход требует, чтобы ДРУГОЙ источник был жив < FALLBACK_MS. Detached → всегда XInput (IIO держит ROUND-6).
+- **Реверс ROUND 6** в [`iio_imu/driver.rs`](src/drivers/iio_imu/driver.rs:122): `refresh_event_filter()`/`get_default_event_filter()` строят фильтр через приватный `desired_center_filter()` = `{}` когда `use_iio_for_center()`, иначе `{Accel(C),Gyro(C)}` (=V9). [`poll()`](src/drivers/iio_imu/driver.rs:177): `evaluate()` в начале; аксель читается ВСЕГДА (фид `report_iio_accel`, эмитится только если не фильтрован); гиро — только если не фильтрован (health-ценности нет).
+- **Правки lego** [`lego/driver.rs`](src/drivers/lego/driver.rs:147): `refresh_event_filter()` публикует attach (лог «controllers docked/detached» сохранён) и ВОЗВРАЩАЕТ новый фильтр при ЛЮБОМ изменении (attach ИЛИ решение proxy; спама нет — Some только при отличии от текущего); [`get_default_event_filter()`](src/drivers/lego/driver.rs:195) при attached + `use_iio_for_center()` добавляет `{Accel(C),Gyro(C)}` (гейтит MultiAccel/MultiGyro → единственный центр = IIO); два info-лога из get_default УБРАНЫ (вызывается каждую итерацию), лог перехода — в refresh при Some. Health-хук в [`translate_xinput()`](src/drivers/lego/driver.rs:311): `report_xinput_accel(state.right_accel_x/y/z)` — безусловно на каждом кадре (фильтр режет только эмиссию).
+- **steam_deck.rs / detached-хендлы / ось-маппинг / скейлы (map_center_gyro_axes, CENTER_GYRO_SCALE, RIGHT_GYRO_SCALE) — НЕ тронуты** (границы скоупа плана).
+- **Гарантия регрессии (сценарий a)**: override OFF + XInput-центр жив (наша машина, |аксель| ~2852 LSB при пороге 500) → ACTIVE=XInput → iio_imu фильтрует центр, lego держит центр = 1:1 с V9. Единственное отличие от V9 при override OFF — accel_3d читается всегда (health-фид детектору), набор эмитируемых событий не меняется.
+- **Сборка**: `bash /home/legion/ip-build/build.sh` (podman rust:1.92, release) — OK, `Finished release in 2m 49s`, ошибок НЕТ; НОВЫХ warning НЕТ (остались только 4 прежних, вне моих файлов: `controllers_attached` в iio_imu, `DEFAULT_EVENT_FILTER`, `udev_device`, `LenovoLegionGo2`).
+- **Артефакты**: git HEAD `7b3d3e5be66588830deeed9bcb75208d85234295` (правки НЕ закоммичены: изменены iio_imu/driver.rs, lego/driver.rs, mod.rs; добавлен gyro_center.rs); бинарь `target/release/inputplumber` sha256 `973fa703d0c481b1baef826e12435323e9771967d47b90b6d960c57bc438962e` (10 932 872 байта).
+- **Выбранные пороги (по данным логов)**: `IP_GYRO_FALLBACK_MS=2000` (детект «0 с гравитацией» ~2 c), `IP_GYRO_FALLBACK_XACCEL_LSB=500` (наш жив ~2852, мёртв 0 — большой запас), `IP_GYRO_FALLBACK_IACCEL_MS2=3.0` (жив ~9.8 м/с², мёртв ~0). «Гистерезис» = требование «другой источник жив < FALLBACK_MS» при каждом переходе.
+- **Отклонение от плана (по дизайну, задокументировано)**: при FORCE на нашей машине IIO «никогда не был жив» считается мёртвым СРАЗУ → фолбэк IIO→XInput сработает быстро (~десятки мс после первого живого XInput-кадра), а не через «~2 c» из плана §7(b); маркер `[gyro-center] … IIO->XInput` покажет фактическое время.
+- **Открытые вопросы (для 3-режимной валидации §7)**: (1) отслеживает ли accel_3d живость IIO-гиро в GAMING — если accel_3d показывает гравитацию и при мёртвом gyro_3d, health-сигнал «IIO жив» не спадёт и сценарий (b) может не дать фолбэк (проверить по логам); (2) ре-калибровка осей IIO-центра (vs ROUND 6k), если в (d) оси разойдутся; (3) тонкая настройка порогов/гистерезиса по реальным данным.
+- **НЕ деплоено / НЕ перезапущен сервис / НЕ валидировано на железе** — следующий шаг: валидация по §7 (a) регрессия OFF, (b) механизм FORCE в GAMING, (d) функционал SamTsuki.
+
+## 2026-09-03 ~23:3x — GAMING-ТЕСТ (б) ПОД FORCE-СБОРКОЙ 973fa703: ВЕРДИКТ = ТЕСТ НЕВАЛИДЕН + НАЙДЕН БАГ СТАДИИ ФОРСА (root cause подтверждён кодом)
+### 1) ЧТО СРАБОТАЛО (механизм детекта ✅, journal PID 1336, рестарт 23:30:08 CEST)
+- Маркер `[gyro-center] override IP_GYRO_FORCE_IIO=1: center starts on IIO (attached)` — 23:30:09.
+- Маркер фолбэка `[gyro-center] IIO center IMU dead: no accel-gravity for 2000 ms (iio_accel_mag=0.88 m/s2); XInput accel_mag=4137 LSB alive -> switch center gyro source IIO->XInput` — 23:30:21.
+- Далее до 23:50 НИ ОДНОГО маркера → `ACTIVE` сел на XInput и не флапал. Детектор «IIO мёртв (0.88<3.0), XInput жив (4137≥500)» + анти-флап работают.
+
+### 2) ЧТО НЕ ПОДТВЕРДИЛОСЬ (функциональный фолбэк ❌, /var/log/ip-gyro-logger.log)
+- Окно вращения 23:31:43–49 (force-IIO): raw right_gyro (XInput-центр) достигал ±4900 (x=-4114/4902/3720, y=3410) — в ~5× СИЛЬНЕЕ эталона (17:35 ±940), а deck gyr (DECK-GAME HIDFLOW, ~1/с) пик всего ±20 при duty 15–25% (23:31:45 gyr=-20,1,1 mot=101/688).
+- Эталон GAMING 17:35:29–45 (V9/c9a4bfa8, right_gyro ~±940): deck gyr достигал ±500–1400 (17:35:41 y=1403, 17:35:44 z=1237, 17:35:39 x=981) при mot=376/376..418/418 (100% duty).
+- ВЫВОД: right_gyro в 5× сильнее, а deck gyr в ~70× СЛАБЕЕ эталона → deck в тесте (б) НЕ пошёл по XInput-пути — остался на слабом IIO-центре.
+
+### 3) ROOT CAUSE (код, подтверждён): `force_iio()` НЕ гейтится `FORCE_CONSUMED`
+- [`use_iio_for_center()`](src/drivers/gyro_center.rs:169) было `attached && (force_iio() || active_is_iio())`, а [`force_iio()`](src/drivers/gyro_center.rs:81) = OnceLock env read → TRUE ВЕСЬ процесс, пока жив `IP_GYRO_FORCE_IIO=1`. `FORCE_CONSUMED` ставится только в [`try_switch()`](src/drivers/gyro_center.rs:193) (т.е. при реальном переходе), но use_iio_for_center/active_source_str его НЕ читали.
+- Следствие: маркер фолбэка сменил только атомик `ACTIVE` (IIO→XInput в 23:30:21), а фильтры (iio_imu `desired_center_filter`, lego `get_default_event_filter`) НИКОГДА не переключились: IIO-центр (rad/s ×3.0 → мелкие deck-байты) эмитился ВЕСЬ тест, MultiGyro (XInput right_gyro ×3.0, сильный) остался отфильтрован. Форс отравил выбор источника — отсюда deck ±20.
+- Вывод: ТЕСТ (б) КАК ЗАСТЕЙДЖЕН НЕВАЛИДЕН для проверки фолбэка; он подтвердил только детект. + Найден баг стадии форса.
+
+### 4) ФИКС ПРИМЕНЁН + ПЕРЕСОБРАН (2026-09-03 ~23:50)
+- [`use_iio_for_center()`](src/drivers/gyro_center.rs:169) и [`active_source_str()`](src/drivers/gyro_center.rs:178): `force_iio()` заменено на `(force_iio() && !FORCE_CONSUMED.load(Ordering::Relaxed))` → после ПЕРВОГО реального перехода (форс-применение ИЛИ фолбэк) источником правит только `ACTIVE`. До первого `evaluate()` форс по-прежнему даёт старт на IIO (семантика «start on IIO once» сохранена).
+- Сборка: `bash /home/legion/ip-build/build.sh` — OK (2m44s), новых warning НЕТ. Новый бинарь sha256 `ab34f83cba67aa5ac4b6aa639080a2c25b2b2b5f7916588eaaf2bbdc81a7e823` (10 932 696 байт), артефакт workspace-root `inputplumber-legiongo2-gyro-v4.resume-gamefix`.
+- Регрессия (override OFF): force_iio()=false → обе функции = `active_is_iio()` → 1:1 с 973fa703/V9 — поведение НЕ меняется. SamTsuki-сценарий (без форса) тоже идентичен прежнему.
+- Ожидаемое поведение ПОД ФИКСОМ в инвертированном GAMING-тесте: старт IIO → фолбэк 23:3x (IIO accel мёртв 0.88<3.0) → фильтры РЕАЛЬНО переключаются на XInput → deck центр = right_gyro ×3.0 (сильный, ±1000), MultiGyro снова эмитится.
+- Деплой: НЕ выполнен (sudo требует пароль, недоступен не-интерактивно). Команда для пользователя: `sudo cp /home/legion/ip-build/InputPlumber/inputplumber-legiongo2-gyro-v4.resume-gamefix /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v4.resume-gamefix` (сначала `sudo cp … .bak-forcebug-973fa703` для отката). override.conf оставить с `IP_GYRO_FORCE_IIO=1` → следующий ребут в GAMING = ВАЛИДНЫЙ повтор теста (б). После валидации убрать строку форса.
+- Дальше по плану §7/§8: повтор (б) под фиксом; затем (d) SamTsuki. ВАЖНО для SamTsuki: его живой источник — IIO (rad/s); deck понесёт IIO-центр ×3.0 без доменной нормализации — слабая амплитуда (та же тема unit-mismatch), оценить/добавить нормализующий скейл IIO-пути при функциональном тесте.
+
+## 2026-09-04 ~00:0x — ПОВТОР GAMING-ТЕСТА (б) ПОД ФИКСОМ ab34f83c: ВЕРДИКТ = PASS ✅ (фолбэк РЕАЛЬНО переключил deck на XInput)
+### 0) Контекст
+- Ребут в GAMING после деплоя фикса. Сервис inputplumber: ActiveEnter 23:56:09 CEST, MainPID 1329, `/opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v4.resume-gamefix` sha256 = `ab34f83c…` (фикс). Ранее 23:55:34–36 PID 1336 (старая сборка) снимал устройства.
+
+### 1) МАРКЕРЫ [gyro-center] (journal, PID 1329) — 23:56:10, ВСЕ 4 строки
+- `[gyro-center] override IP_GYRO_FORCE_IIO=1: center starts on IIO (attached)` — форс-старт.
+- `[gyro-center] IIO center IMU dead: no accel-gravity for 2000 ms (iio_accel_mag=0.93 m/s2); XInput accel_mag=4077 LSB alive -> switch center gyro source IIO->XInput` — фолбэк.
+- `[gyro-center] iio_imu: event filter changed -> filter Accel(C)/Gyro(C) (center source = XInput)` — IIO-центр ОТФИЛЬТРОВАН (это и был фикс).
+- `[gyro-center] lego: event filter -> keep center accel/gyro (XInput is the center gyro source)` — XInput-центр ОСТАВЛЕН (MultiGyro снова эмитится).
+- После 23:56:11 НОЛЬ строк `[gyro-center]` (journalctl с 23:56:11, count=0) → флапа НЕТ, стабильно.
+
+### 2) ФУНКЦИОНАЛ — deck несёт СИЛЬНЫЙ гиро по XInput-пути (/var/log/ip-gyro-logger.log)
+- Окно вращения 23:58:45–23:59:00: raw right_gyro (XInput-центр) жив ~±800 (x до −802, y 325/478, z до 630).
+- DECK-GAME HIDFLOW (~1/с, duty ВЫСОКАЯ mot=245..320/320):
+  - 23:58:45 `gyr=174,211,169 mot=275/320`; 23:58:46 `gyr=-210,-5,129 mot=317/320`; 23:58:47 `gyr=14,-12,-45`.
+  - 23:58:52 HIDFLOW `gyr=-487,788,-289 mot=234/245`; MOTION mag=1933 `gyr=(-762,1005,166)`.
+  - 23:58:53 MOTION mag=1557 `gyr=(255,-1051,251)`; 23:58:54 MOTION mag=1609 `gyr=(-377,-790,442)`; 23:58:56 `gyr=(-68,212,-30)`.
+- После 23:59:00 — покой: 20 rd/s, `gyr ±5`, MOTION только одиночные шумовые пики mag~255–260 (duty 1/35) — консоль лежит.
+
+### 3) ВЕРДИКТ: PASS ✅
+- Контраст с невалидным тестом (973fa703): там right_gyro ±4900 → deck gyr ±20 @ duty 15–25% (фильтры НЕ переключились, эмитился слабый IIO-центр rad/s ×3.0). Здесь right_gyro ±800 → deck gyr до ±500..1000 (MOTION mag 1933) @ duty ~100%. Разница объясняется ТОЛЬКО двумя маркерами смены фильтров в 23:56:10, которых в 973fa703 не было.
+- Итог по §7(b) (инвертировано на нашей машине): форс-старт IIO → детект «IIO мёртв (0.93<3.0), XInput жив (4077≥500)» → фолбэк IIO→XInput → фильтры РЕАЛЬНО переключились → deck пошёл по XInput-пути (right_gyro ×3.0). Без флапа, стабильно до 00:0x.
+- Механизм арбитра (b) подтверждён в направлении IIO→XInput. Направление XInput→IIO (нужное SamTsuki) на нашей машине в GAMING невоспроизводимо естественно (XInput жив, IIO мёртв) — валидируется на его железе (d).
+
+### 4) ДЕЙСТВИЯ
+- `override.conf`: строка `Environment=IP_GYRO_FORCE_IIO=1` УБРАНА (2026-09-04 ~00:0x, sed -i). Сервис НЕ перезапускался — текущая GAMING-сессия не тронута; эффект со следующего старта сервиса: наша машина → естественный XInput-старт = регрессия (а). Для SamTsuki форс не нужен (его XInput мёртв естественно → сработает ветка XInput→IIO).
+- Дальше: (d) функциональная валидация SamTsuki — отправить фикс-сборку ab34f83c + протокол логгера; его живой источник iio:device2; проверить амплитуду IIO-центра (rad/s ×3.0, unit-mismatch) и оси vs ROUND 6k.
+
+## 2026-09-04 ~00:1x — DESKTOP-ТЕСТ (в) ПОД ФИКСОМ ab34f83c: ВЕРДИКТ = PASS ✅ (deck несёт гиро, 0 флапа/переходов)
+### 0) Контекст
+- Пользователь был УЖЕ в DESKTOP (не GAMING). После деплоя фикса ab34f83c + очистки override.conf выполнен `systemctl daemon-reload` + рестарт → ЧИСТЫЙ процесс.
+- Сервис: ActiveEnter **00:11:18 CEST**, MainPID **15135**. Цепочка рестартов: 1329 (старт 23:56:09, ЕЩЁ с форсом IP_GYRO_FORCE_IIO=1 в /proc env) → 14663 (рестарт ~00:11:01, ВСЁ ЕЩЁ с форсом — systemd отдал закешированный drop-in, warning "run systemctl daemon-reload") → 15135 (после daemon-reload, ЧИСТЫЙ). env PID 15135: только `IP_GYRO_GAIN_CENTER=3.0`, `IP_GYRO_GAIN_HANDLE=5`, БЕЗ форса. sha256 бинаря = `ab34f83c…` (фикс) подтверждён.
+- ЛОВУШКА тэга: deck в desktop = `DECK-DESK@1.2` (vid 28de, pid **1205**); `DECK-GAME` (12f0) — только GAMING. Ранние grep'ы по DECK-GAME в окне давали пусто.
+- НА ЭТОМ десктопном буте IIO accel слабый (~0.98 м/с²: raw 0,0,-10 × scale 0.0980665 < порога 3.0) → арбитр законно держит XInput-путь. Тест прошёл по XInput-ветке (как (а)/(б)), а НЕ по план-ветке «IIO-канал видим ~90-100».
+
+### 1) Функционал — deck (DECK-DESK@1.2) несёт СИЛЬНЫЙ гиро при вращениях (/var/log/ip-gyro-logger.log, фильтр `$1=="2026-09-04" && $2>="00:11:24"`)
+- Покой/байас: true-rest mag 54–87 (00:11:57.107 mag=75; 00:12:01.649 mag=54; 00:12:49.983 mag=60); состояния mag ~762–789 с константой ~760 на одной оси (gyr=(0,-762,0), (-6,771,-3), …) — ПРЕ-СУЩЕСТВУЮЩИЙ idle-офсет (есть и в V9 desktop-данных 17:xx 2026-09-03), = right_gyro idle ~253 × GAIN_CENTER 3.0, фиксом НЕ вносится.
+- Вращение-1 (~00:11:57–00:12:01): deck mag до 6795 (00:12:00.641 gyr=(-2742,2778,-1275)), 3006, 2322 — коррелирует с right_gyro пиками окна.
+- Вращение-2 «подергал нормально» (~00:12:50–00:12:59, плотная серия mag>4000 ~9 с): deck mag до **15423** (00:12:55.096 gyr=(-12714,-1155,-1554)), 13506 (00:12:54.591 gyr=(12810,225,-471)), 11766 (00:12:54.087 gyr=(-1533,2595,-7638)), 10491 (00:12:58.651), 9327/8973/8730. right_gyro (XInput-источник) в том же окне: пики z ±4132/±4206, x ±3147 → корреляция прямая.
+- После 00:13:00 — покой: снова mag ~51–60 и ~762-байас-состояния (прослежено до 00:16:43) → гиро спал, хвоста/дубля нет.
+
+### 2) Флап/переходы — 0
+- journalctl с 00:11:24 (PID 15135): `[gyro-center]` count = **0** → ни одного перехода/свитча за весь тест. Стабильно, без флапа, без удвоения.
+
+### 3) ВЕРДИКТ: PASS ✅ (desktop sanity по XInput-ветке)
+- Чистый процесс БЕЗ тестового флага (регрессионный конфиг): deck в рабочем столе нёс РЕАЛЬНЫЙ сильный гиро при физическом вращении (mag до 15423, gyr до ±12800) 1:1 из правого гиро-источника (right_gyro ±4200); в покое спадает к ~50. 0 переходов → фикс НЕ вносит ни флапа, ни дубля в desktop.
+- НЮАНС: на этом буте IIO-аксель слабый (~1.0 < 3.0) → арбитр остался на XInput; ветка §7(c) как задумано («IIO-канал видим/ненулевой ~90-100») на нашей машине/буте НЕ воспроизведена (поведение = V9/регрессионный XInput-путь). Функциональный фолбэк на IIO (XInput→IIO, нужный SamTsuki) валидируется на его железе (d).
+
+### 4) ДЕЙСТВИЯ
+- Из локальной валидации осталось ТОЛЬКО (d) — функциональный тест на машине SamTsuki: отправить фикс-сборку ab34f83c + протокол логгера; его XInput мёртв естественно → ветка XInput→IIO на его живой iio:device2; оценить амплитуду IIO-центра (rad/s ×3.0, unit-mismatch) и оси.
+
+## 2026-09-04 ~00:3x — V11: ПРАВЫЙ ГИРО +15% (центр не тронут) + ПОДГОТОВКА РЕЛИЗА (запрос пользователя «ускорь на 15% гироскоп в правом джойстике, центральный скорость как надо, ребилдни, установи и создавай 11ю версию, коммить, релизь и заливай патч»)
+### 1) ВЕКИКЛ-РЕШЕНИЕ: код, НЕ env
+- Запрос «ребилдни» + «для всех» → выбран код: [`src/drivers/lego/driver.rs`](src/drivers/lego/driver.rs:37) `const RIGHT_GYRO_SCALE: f64 = 0.15` → **0.1725** (ровно +15%, хендл-only; центр [`CENTER_GYRO_SCALE=1.0`](src/drivers/lego/driver.rs:56) НЕ тронут). Эффектив: 0.1725 × `IP_GYRO_GAIN_HANDLE`(5) = 0.8625 (было 0.75). override.conf НЕ менялся (GAIN_CENTER=3.0, GAIN_HANDLE=5, без форса). Env-вариант (GAIN_HANDLE 5→5.75) отклонён — не соответствовал «ребилдни» и не зашил бы +15% всем.
+- Комментарий над константой дополнен пометкой `[v11, USER REQUEST 2026-09-04]`.
+
+### 2) СБОРКА + ДЕПЛОЙ (выполнено МНОЙ, по протоколу)
+- `bash /home/legion/ip-build/build.sh` (podman rust:1.92) OK за ~1m55s → `target/release/inputplumber`; вручную скопирован в workspace-корень как `inputplumber-legiongo2-gyro-v4.resume-gamefix`.
+- **НОВЫЙ sha256 = `553e4967500df1cb06e987e209edd87567c4a555538d5578a1966798372f8d00`** (10 932 696 б, размер не изменился — это константа).
+- Пользователь: «через install.sh без логов, чтобы убрать логи пожалуйста устанавливай» → сначала синхронизирован бинарь релизного репо (`/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/inputplumber-legiongo2-gyro-v4.resume-gamefix`) на 553e4967 (там лежал СТАРЫЙ 973fa703 = форс-баг билд!), затем `./install.sh` (БЕЗ --log) из релизного репо.
+- Результат: /opt/...resume-gamefix = 553e4967 (подтверждён sha256sum); сервис active, MainPID **21970** (старт 00:32:33 CEST); override.conf чистый (без форса); **логгер остановлен/удалён** (нормальный режим install.sh), `/var/log/ip-gyro-logger.log` удалён. WAIT: install.sh перезаписал override.conf теми же GAIN_CENTER=3.0/GAIN_HANDLE=5.
+- WARNING от install.sh про sha-мисматч (expected c9a4bfa8) — ожидаемо; EXPECTED_SHA256 в install.sh обновится на 553e4967 в v11-коммите.
+- Верификация +15%: чистый детерминированный множитель 1.15 (0.1725/0.15) в коде; лог-замер невозможен (логгер снят по просьбе пользователя) — субъективная проверка за пользователем.
+
+### 3) V11-РЕЛИЗ
+- Workspace source-коммит (снапшот ветки v810-pre-revert-backup): фикс (b) (gyro_center.rs + реверс ROUND 6 в iio_imu + health-хук lego + mod.rs + docs/plan-fix-b-gyro-proxy.md) + RIGHT_GYRO_SCALE 0.1725 + Agent.md.
+- Релизный репо DrBoria/legion-go-2-bazzite-F44-gyro: install.sh EXPECTED_SHA256 → 553e4967; README «What's new in v11» (первый бинарный релиз с V9: фикс (b) двусторонний фолбэк + хендл +15%); SHA256SUMS; тарболл inputplumber-legiongo2-gyro-v11.tar.gz; commit + tag v11 + gh release + upload.
+- (d) SamTsuki остаётся открытым — v11 (553e4967) включает готовый механизм XInput→IIO; его тест-протокол прежний.

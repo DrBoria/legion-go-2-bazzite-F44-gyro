@@ -61,11 +61,14 @@ BASE_DIR="$(
 INSTALL_DIR="/opt/inputplumber-legiongo2-runtime"
 INSTALLED_BINARY="$INSTALL_DIR/inputplumber-legiongo2-gyro-v4.resume-gamefix"
 
-# Expected sha256 of the CURRENT fix binary — V9 = v8.1-era baseline + FIX A
-# restored (deck-uhid virtual Steam Controller KEPT ALIVE across system sleep;
-# FIX C overlay-reload dedup retained; destructive self-heal NOT present).
+# Expected sha256 of the CURRENT fix binary — v11 = FIRST binary change since V9:
+#  * fix (b) center-gyro fallback — gyro_center proxy/arbiter, BIDIRECTIONAL:
+#    if the active center source goes dead the deck's center gyro automatically
+#    falls back to the live source (IIO <-> XInput); on a unit whose XInput IMU
+#    is dead (SamTsuki case) the live IIO center takes over by itself;
+#  * right-handle gyro +15% (RIGHT_GYRO_SCALE 0.15 -> 0.1725); center unchanged.
 # Verified after install — a mismatch only warns, never aborts.
-EXPECTED_SHA256="c9a4bfa800a2c1bca078c41ddfcb0131351cd8f5402d8a5cdd4963ca13476e00"
+EXPECTED_SHA256="553e4967500df1cb06e987e209edd87567c4a555538d5578a1966798372f8d00"
 
 # Resolve which source binary to install, in priority order:
 #   1) the fix binary shipped next to install.sh (once added to the repo/tarball)
