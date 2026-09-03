@@ -57,6 +57,23 @@ v3.1 (Steam Input activation evidence — direction D, the Steam->game hop):
   Together with the existing DECK-GAME stream + ACTIVITY correlation this closes
   the blind spot between "Steam read the reports" and "the game received input".
 
+v3.2 (the physical-source IMU + burst capture — closing the LEFT side of the loop):
+  * the PHYSICAL Legion XInput stream (17EF:61EB hidraw, iface 2) is DECODED per
+    report like the deck -> "DECODE LEGION-SRC ... IMU-LEGION" lines with the
+    big-endian i16 gyro bytes (left_gyro_x/y/z @ 41/43/45, right_gyro_y/x/z @
+    54/56/58) that prove gyro motion leaves the controller, not just its header
+  * full 64-byte raw hex of the Legion source is captured -> "LEGION-SRC raw=..."
+    lines (periodically every 5 s, on the IMU frames, and on protocol anomaly),
+    reviving the previously dead "last_hex" sample state
+  * every DECK DECODE/MOTION line now also carries raw24-35 (accel+gyro bytes)
+    so the deck's own gyro report is correlated byte-for-byte with the source
+  * DECK-GAME reads are coalesced: the deck emits ~240-250 frame/s vs ~20 reads/s,
+    so as soon as a frame shows IMU motion the rest of the burst is drained and
+    processed together instead of being lost between reads
+  * IIO sampling enters a fast mode (0.1 s) while a gyro blip is present, so raw
+    gyro/accel values line up with the hidraw bursts for correlation; the quiet
+    default stays at 1 sample/s
+
 Runs as root via ip-gyro-logger.service so it can read /dev/input/* and
 /sys/bus/iio. Pure Python 3 standard library — no dependencies, no rebuild.
 
@@ -140,6 +157,11 @@ SNAP_INTERVAL = 3.0         # re-read /proc/bus/input/devices
 HB_INTERVAL = 15.0          # compact heartbeat when the device set did not change
 IIO_INTERVAL = 1.0          # sample gyro/accel
 IIO_IDLE_HB = 5.0           # one idle heartbeat per device when magnitude == 0
+# v3.2 — fast IIO sampling while the IMU is actually moving (burst capture).
+# A first gyro blip arms a fast window; each new blip re-arms it. The quiet
+# default behaviour stays at 1 sample/s.
+IIO_FAST_INTERVAL = 0.1     # fast cadence while motion is present (10 Hz)
+IIO_FAST_HOLD = 2.0         # stay fast this long after the last motion blip
 SESS_INTERVAL = 5.0         # loginctl session scan
 IIO_RESCAN_INTERVAL = 60.0  # rediscover iio devices (IMU can come/go)
 EV_THROTTLE = 0.1           # ~10 EV_ABS lines/sec/device
@@ -213,6 +235,13 @@ FLOW_GAP_HB = 20.0          # re-assert a long-lived FLOW GAP only this often
 FLOW_EV_WINDOW = 2.0        # an EV event this recent counts as "user active"
 HID_MOTION_LOG_MIN = 0.5    # at most ~2 MOTION lines/sec/deck while moving
 
+# v3.2 — physical Legion-SRC (XInput) decode + raw capture + deck coalescing
+LEGO_PID = 0x61EB           # physical Legion Go 2 XInput source (17EF:61EB)
+LEGO_MOTION_MIN = 60        # combined gyro magnitude that counts as real motion
+LEGO_RAW_HB = 5.0           # periodic full raw-hex cadence for LEGION-SRC
+LEGO_MOTION_LOG_MIN = 0.1   # <= ~10 IMU DECODE lines/sec/source while moving
+DECK_DRAIN_MAX = 16         # max frames coalesced from one deck burst drain
+
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
@@ -233,6 +262,8 @@ EV_OPEN_ERR = {}
 IIO_LAST_ACTIVE = {}
 IIO_LAST_IDLE = {}
 IIO_DEVICES = []
+# v3.2 — deadline until which the fast (0.1 s) IIO sampling window stays armed
+IIO_FAST_UNTIL = 0.0        # monotonic; extended by every gyro blip
 
 # v2 — hidraw / Steam / InputPlumber journal state
 HID_DEVICES = {}            # hidraw node -> {fd,path,label,vid,pid,iface,...}
@@ -503,7 +534,12 @@ def _mag(*vals):
 
 def sample_iio(now):
     """Read every iio gyro/accel device once, log throttled: live when the
-    magnitude is non-zero (max ~1 line/device/sec), idle heartbeat every 5s."""
+    magnitude is non-zero (max ~1 line/device/sec), idle heartbeat every 5s.
+    v3.2 — a gyro blip arms the global fast window (IIO_FAST_UNTIL, refreshed on
+    each new blip): while armed the main loop samples at IIO_FAST_INTERVAL and
+    live lines are logged at that cadence, so raw gyro/accel values line up with
+    the hidraw bursts for correlation. The quiet default stays at 1 sample/s."""
+    global IIO_FAST_UNTIL
     for entry, dpath, name, gyro, accel, scale in IIO_DEVICES:
         try:
             gx, gy, gz = _read_axes([os.path.join(dpath, f) for f in gyro])
@@ -518,7 +554,12 @@ def sample_iio(now):
         if scale:
             line += f" scale={scale}"
         if _mag(gx, gy, gz, ax, ay, az) > 0:
-            if now - IIO_LAST_ACTIVE.get(entry, 0.0) >= IIO_INTERVAL:
+            # v3.2: real rotation = gyro magnitude (accel always shows gravity),
+            # which arms/refreshes the fast sampling window for burst correlation
+            if _mag(gx, gy, gz) > 0:
+                IIO_FAST_UNTIL = now + IIO_FAST_HOLD
+            iv = IIO_FAST_INTERVAL if now < IIO_FAST_UNTIL else IIO_INTERVAL
+            if now - IIO_LAST_ACTIVE.get(entry, 0.0) >= iv:
                 log(line)
                 IIO_LAST_ACTIVE[entry] = now
         else:
@@ -809,6 +850,10 @@ def scan_hidraw():
             "btn_prev": "", "last_frame": None,
             "gap_active": False, "gap_at": 0.0,
             "bad_len_logged": False, "bad_hdr_logged": False, "jump_log": 0.0,
+            # v3.2 — Legion-SRC decode/raw state + coalesced-deck-burst flag
+            "lego_prev": "", "lego_dec_log": 0.0, "lego_hex_log": 0.0,
+            "lego_last_motion": False, "lego_bad_logged": False,
+            "motion_seen": False,
         }
         log(f"HID: capturing {path} ({_hid_label(HID_DEVICES[node])} "
             f"vid={info['vid']:04X} pid={info['pid']:04X})")
@@ -822,6 +867,12 @@ def _s16(raw, off):
     if off + 2 > len(raw):
         return None
     return struct.unpack_from("<h", raw, off)[0]
+
+def _s16be(raw, off):
+    """Big-endian signed i16 (the Legion XInput IMU bytes are MSB-first)."""
+    if off + 2 > len(raw):
+        return None
+    return struct.unpack_from(">h", raw, off)[0]
 
 def _u16(raw, off):
     if off + 2 > len(raw):
@@ -925,6 +976,46 @@ def decode_deck_report(raw):
         "gx": _s16(raw, 30), "gy": _s16(raw, 32), "gz": _s16(raw, 34),
     }
 
+# ---------------------------------------------------------------------------
+# v3.2 — full 64-byte PHYSICAL Legion XInput report decode.
+#
+# Byte-layout source of truth = InputPlumber's on-wire struct `XInputDataReport`
+# in src/drivers/lego/hid_report.rs (ReportType::XInputData = 0x04 at byte 0,
+# hid_cmd 0x74 = XINPUT_COMMAND_ID at byte 2, #[packed_struct(size_bytes =
+# "60")] carried in a 64-byte report):
+#   [0]=0x04 XInputData report id, [2]=0x74 controller/IMU command id
+# IMU bytes are big-endian signed i16 (MSB-first) at the struct offsets:
+#   left_gyro_x/y/z = 41/43/45, right_gyro_y/x/z = 54/56/58 (2 bytes each).
+# The report's own "left/right gyro" labels ARE the controller's gyro stream —
+# the same physical motion the virtual deck later reports as pitch/yaw/roll.
+# ---------------------------------------------------------------------------
+
+LEGO_HEADER_BYTES = (0x04, 0x74)
+
+def decode_lego_report(raw):
+    """Decode one 64-byte physical Legion XInput report into a dict, or None
+    when the frame is not an XInputData report (a 64-byte DECK frame is never
+    mis-decoded). Byte0 must be 0x04 (XInputData report id); when byte2 is 0x74
+    (XINPUT_COMMAND_ID) the frame carries the IMU payload. Fields are named to
+    mirror the Rust struct with the axes spelled out explicitly:
+      left_gyro_x = 41, left_gyro_y = 43, left_gyro_z = 45
+      right_gyro_y = 54, right_gyro_x = 56, right_gyro_z = 58
+    All are big-endian signed i16."""
+    if len(raw) < 64:
+        return None
+    if raw[0] != LEGO_HEADER_BYTES[0]:
+        return None
+    if raw[2] != LEGO_HEADER_BYTES[1]:
+        return {"has_imu": False}
+    try:
+        return {
+            "has_imu": True,
+            "lgx": _s16be(raw, 41), "lgy": _s16be(raw, 43), "lgz": _s16be(raw, 45),
+            "rgy": _s16be(raw, 54), "rgx": _s16be(raw, 56), "rgz": _s16be(raw, 58),
+        }
+    except IndexError:
+        return {"has_imu": False}
+
 def _decode_deck(raw):
     """v2-compatible single-report decode hook (kept for back-compat; the real
     64-byte decode lives in decode_deck_report())."""
@@ -984,6 +1075,32 @@ def handle_hidraw(now):
         # -- v3: decode / inspect every virtual-deck report -------------------
         if e["pid"] in DECK_PIDS:
             _handle_deck_reports(e, chunk, t2)
+            # v3.2 — coalesce a motion burst: the deck emits ~240 frame/s but we
+            # only read ~20/s, so as soon as the first frame shows IMU motion,
+            # drain the rest of the burst NOW (bounded, non-blocking) instead of
+            # losing it until the next select tick. Read/liveness counters are
+            # still incremented per read, so HIDFLOW/ACTIVITY semantics survive.
+            if e["motion_seen"]:
+                e["motion_seen"] = False
+                for _ in range(DECK_DRAIN_MAX - 1):
+                    try:
+                        dchunk = os.read(e["fd"], 4096)
+                    except BlockingIOError:
+                        break
+                    except OSError as ex:
+                        log(f"HID: read error on /dev/{node} during drain: "
+                            f"{ex}, dropping")
+                        _drop_hid(node)
+                        break
+                    if not dchunk:
+                        break
+                    e["count"] += 1
+                    e["nbytes"] += len(dchunk)
+                    e["last_len"] = len(dchunk)
+                    _handle_deck_reports(e, dchunk, t2)
+        # -- v3.2: decode / inspect the PHYSICAL Legion XInput source ---------
+        elif e["pid"] == LEGO_PID:
+            _handle_lego_reports(e, chunk, t2)
         e["last_data"] = t2
 
 def _handle_deck_reports(e, chunk, t2):
@@ -1019,17 +1136,21 @@ def _handle_deck_reports(e, chunk, t2):
             log(f"DECODE {label} frame={dec['frame']} btn=[{sig or '-'}] "
                 f"ls=({dec['lsx']},{dec['lsy']}) rs=({dec['rsx']},{dec['rsy']}) "
                 f"lt={dec['lt']} rt={dec['rt']} "
-                f"gyr=({dec['gx']},{dec['gy']},{dec['gz']})")
+                f"gyr=({dec['gx']},{dec['gy']},{dec['gz']}) "
+                f"raw24-35={raw[24:36].hex(' ')}")
         # -- gyro/accel motion present -> a MOTION line proving IMU reaches deck
         mag = _mag(dec["gx"], dec["gy"], dec["gz"])
         if mag > DECK_MOTION_MIN:
             e["mot_count"] += 1
             e["mot_last"] = t2
+            # v3.2: flag the burst so handle_hidraw drains the remaining frames
+            e["motion_seen"] = True
             if t2 - e["mot_log"] >= HID_MOTION_LOG_MIN:
                 e["mot_log"] = t2
                 log(f"MOTION {label} frame={dec['frame']} mag={mag} "
                     f"gyr=({dec['gx']},{dec['gy']},{dec['gz']}) "
-                    f"acc=({dec['ax']},{dec['ay']},{dec['az']})")
+                    f"acc=({dec['ax']},{dec['ay']},{dec['az']}) "
+                    f"raw24-35={raw[24:36].hex(' ')}")
         # -- frame-counter continuity (bytes 4-7, u32 LE) --------------------
         # Both deck targets increment the counter once per poll() and emit one
         # report per poll, so consecutive reads normally show delta 0 or 1.
@@ -1049,6 +1170,62 @@ def _handle_deck_reports(e, chunk, t2):
                     e["jump_log"] = t2
                     log(f"FRAMEJUMP {label} frame {prev} -> {fr} "
                         f"(skipped {fr - prev - 1} report(s) between reads)")
+
+# ---------------------------------------------------------------------------
+# v3.2 — physical Legion XInput source decode + full raw capture
+# ---------------------------------------------------------------------------
+
+def _handle_lego_reports(e, chunk, t2):
+    """Per-report decode + raw capture for the PHYSICAL Legion XInput source
+    (17EF:61EB, iface 2) — the input InputPlumber reads BEFORE the virtual deck.
+    Real XInput frames are 64 bytes (report id 0x04 at byte 0); a read may hold
+    several back-to-back frames. Decode lives in decode_lego_report(); the whole
+    point is to prove gyro motion LEAVES the controller: bytes 41-46
+    (left_gyro_x/y/z) and 54-59 (right_gyro_y/x/z), big-endian signed i16."""
+    label = _hid_label(e)
+    L = len(chunk)
+    if L and (L == 64 or (L > 64 and L % 64 == 0)):
+        reports = [chunk[i:i + 64] for i in range(0, L, 64)]
+    else:
+        # expected 64 bytes; any other length on the Legion source is an anomaly
+        if L and 64 in e["frames_seen"] and not e["lego_bad_logged"]:
+            e["lego_bad_logged"] = True
+            log(f"FLOW GAP {label} anomalous frame len={L} "
+                f"(legion XInput reports are 64 bytes) head={chunk[:12].hex(' ')}")
+        reports = [] if L == 0 else [chunk]
+    for raw in reports:
+        dec = decode_lego_report(raw)
+        if dec is None:
+            # 64-byte frame that is not an XInputData report -> protocol mismatch
+            if len(raw) == 64 and not e["lego_bad_logged"]:
+                e["lego_bad_logged"] = True
+                log(f"FLOW GAP {label} 64-byte frame with non-XInput header "
+                    f"raw={raw.hex(' ')} (protocol mismatch?)")
+            continue
+        # full raw hex every LEGO_RAW_HB (revives the v3.1 last_hex sample
+        # state that was stored but never actually logged)
+        if t2 - e["lego_hex_log"] >= LEGO_RAW_HB:
+            e["lego_hex_log"] = t2
+            log(f"LEGION-SRC {label} raw={raw.hex(' ')}")
+        if not dec.get("has_imu") or dec["lgx"] is None:
+            continue  # XInputData frame without the 0x74 IMU payload
+        mag = _mag(dec["lgx"], dec["lgy"], dec["lgz"],
+                   dec["rgx"], dec["rgy"], dec["rgz"])
+        lg = "left_gyro=(x={},y={},z={})".format(
+            dec["lgx"], dec["lgy"], dec["lgz"])
+        rg = "right_gyro=(y={},x={},z={})".format(
+            dec["rgy"], dec["rgx"], dec["rgz"])
+        if mag > LEGO_MOTION_MIN:
+            # the first motion frame of a burst logs immediately, then throttled
+            if not e["lego_last_motion"]:
+                e["lego_last_motion"] = True
+                e["lego_dec_log"] = 0.0
+            if t2 - e["lego_dec_log"] >= LEGO_MOTION_LOG_MIN:
+                e["lego_dec_log"] = t2
+                log(f"DECODE {label} IMU-LEGION {lg} {rg} "
+                    f"raw={raw.hex(' ')} [IMU]")
+        else:
+            e["lego_last_motion"] = False
 
 def emit_hid_summary(now):
     """Once per second, per watched hidraw:
@@ -1668,6 +1845,9 @@ def main():
     log("LOGGER: v3.1 Steam Input activation tracking — controller_ui focus "
         "(STEAM UI / STEAM UI FOCUS) + running-game AppID (STEAM PROC) — "
         "direction D (Steam -> game)")
+    log("LOGGER: v3.2 active — physical Legion-SRC IMU decode (IMU-LEGION + full "
+        "raw hex), deck raw24-35 correlation, coalesced DECK bursts, fast IIO "
+        "sampling during motion")
 
     last_snap = last_hb = last_iio = last_sess = last_iio_rescan = \
         last_flow = last_steam = time.monotonic()
@@ -1700,7 +1880,10 @@ def main():
                     log(f"LOGGER: heartbeat error: {e}")
 
             # -- periodic: iio gyro/accel sampling ---------------------------
-            if now - last_iio >= IIO_INTERVAL:
+            # v3.2: adaptive cadence — fast (0.1 s) while a motion blip keeps
+            # IIO_FAST_UNTIL armed, quiet 1/s otherwise (default preserved).
+            iio_iv = IIO_FAST_INTERVAL if now < IIO_FAST_UNTIL else IIO_INTERVAL
+            if now - last_iio >= iio_iv:
                 last_iio = now
                 try:
                     sample_iio(now)

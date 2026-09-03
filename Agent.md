@@ -976,3 +976,169 @@ The old record (lines 598-660) claimed "deck-uhid cannot trigger Steam IMU → g
 - ОГОВОРКА (честно, записано обязательно): явной строки FIX A «Keeping deck-uhid target device alive across system suspend» в окне 12:12:18 НЕТ (единственное вхождение за всё время — 23:51:15.411 PID 1332, тест v8.9 на том же c9a4bfa8). В 12:12:18 лог обрывается сразу после «Target device stopping/stopped: mouse0» и БЕЗ финального «Target devices before suspend:» — suspend-фриз обрезал цикл handle_suspend ДО ветки deck-uhid. Прямое логирование ветки в этом прогоне не получено, НО функциональный исход (deck «already running» после wake, DEVCHG не DEVREM, нет hid_read failure, Steam перезагрузил конфиг ESO) доказывает: deck НЕ был разрушен при сне; плюс v8.9 (тот же c9a4bfa8) уже логировал явную строку FIX A в 23:51:15.
 - КРИТЕРИЙ УСПЕХА (из протокола): ВЫПОЛНЕН — та же ESO-сессия приняла ввод после wake; отдельного факта «ESO убита системой на сне» (exit code -1) в этом тесте НЕ было.
 - ВЕРДИКТ: V9 = РЕЛИЗНАЯ СБОРКА. `c9a4bfa8` (FIX A keep-alive deck-uhid при сне + FIX C dedup; БЕЗ деструктивного self-heal) — сон В ИГРЕ исправлен. РЕЛИЗ V9 выполняется (README v9, SHA256SUMS, тег v9).
+
+## 2026-09-03 — ФОРЕНЗИКА ЛОГА ТЕСТЕРА SamTsuki (V9, resume-gamefix) + ГИПОТЕЗА-ТРЕК H-??: «гиро не пишется в deck-uhid» (V10-кандидат)
+
+Контекст (результаты задачи Debug, перенесены без потерь): расследование лога тестера SamTsuki (чужой машины) по жалобе «гиро не работает (слайдеры на 0)» при живых кнопках/стиках/триггерах. Лог — 9-минутная сессия 16:15:36→16:24:31: [ip-gyro-logger(1).log](/home/legion/Downloads/ip-gyro-logger%281%29.log:1). ТОЛЬКО ДОКУМЕНТАЦИЯ — код НЕ правился, сборка/install.sh НЕ запускались; раздел фиксирует находки/диагноз/гипотезы/план фикса для согласования; код-фикс = отдельная задача после согласования гипотез.
+
+### (а) ВЕРСИЯ ТЕСТЕРА
+- V9 (resume-gamefix) подтверждена: бинарь `inputplumber-legiongo2-gyro-v4.resume-gamefix` [стр.5](/home/legion/Downloads/ip-gyro-logger%281%29.log:5); логгер **v3.1** [стр.78-79](/home/legion/Downloads/ip-gyro-logger%281%29.log:78); Bazzite 44 (`7.2.1-ogc4.1.fc44`). Suspend-фикс (V9) работает.
+
+### (б) ХРОНОЛОГИЯ СЕССИИ (тайминги локальные)
+- 16:15:34 SystemWake — InputPlumber штатно восстановил таргеты deck/keyboard/mouse/touchpad [стр.58-69](/home/legion/Downloads/ip-gyro-logger%281%29.log:58).
+- 16:15:39 NO-DECK→DESKTOP [стр.248](/home/legion/Downloads/ip-gyro-logger%281%29.log:248); deck-uhid `28de:1205` (serial `23618df`); Steam подключил как Controller 15 и загрузил `controller_neptune.vdf` для ZZZ 4162040 [стр.431](/home/legion/Downloads/ip-gyro-logger%281%29.log:431).
+- 16:16:36–16:18:11 и 16:19:01–16:20:37 — Zenless Zone Zero (AppID 4162040) запускалась дважды; Proton-процессы завершились 16:20:37 [стр.2516](/home/legion/Downloads/ip-gyro-logger%281%29.log:2516).
+- 16:18:46-52 и 16:20:39-59 — два эпизода I/O errors физического Legion-контроллера с успешным переподключением [стр.1666](/home/legion/Downloads/ip-gyro-logger%281%29.log:1666).
+- 16:20:42 рестарт пользовательской сессии 26→28 [стр.2754](/home/legion/Downloads/ip-gyro-logger%281%29.log:2754).
+- 16:20:47 OGU грузит профиль deck-uhid; deck создаётся с циклом «Unable to create UdevDevice … node check #01/#02: hidraw not found yet; will retry».
+- 16:20:50 DESKTOP→GAMING; создан DECK-GAME `28de:12f0` [стр.2905](/home/legion/Downloads/ip-gyro-logger%281%29.log:2905).
+- 16:21:24 OGU переключается на профиль hori-steam (HORIPAD); gamepad остановлен → GAMING→NO-DECK [стр.3627](/home/legion/Downloads/ip-gyro-logger%281%29.log:3627).
+- 16:21:35 аккорд QuickAccess2+Button East «Found activation chord! / intercept Always» (открытие OGU-overlay).
+- 16:21:41 HORI-uhid `0003:0F0D:01AB` удалён [стр.3757](/home/legion/Downloads/ip-gyro-logger%281%29.log:3757); OGU снова грузит deck-uhid; DECK-GAME пересоздан.
+- 16:21:44 NO-DECK→GAMING [стр.3881](/home/legion/Downloads/ip-gyro-logger%281%29.log:3881).
+- 16:21:47 registry «FULL gaming deck 12f0 (gyro-capable)» [стр.3907](/home/legion/Downloads/ip-gyro-logger%281%29.log:3907).
+- 16:23:06–16:24:15 стабильный геймплей-ввод (кнопки/стики/триггеры реальные) — ГИРО ВСЕГДА НУЛИ.
+- 16:24:31.479 лог резко обрывается на середине штатного потока (HIDFLOW 20 rd/s), БЕЗ маркера suspend; deck-uhid жив. Обрыв = остановка логгера/устройства (не suspend).
+
+### (в) ТОЧНАЯ ПРИЧИНА «НЕ РАБОТАЕТ» — гиро НИКОГДА не попадает в выходной HID-поток deck-uhid (`28de:12f0`)
+- Все 70/70 декодированных репортов DECODE DECK-GAME [стр.3321](/home/legion/Downloads/ip-gyro-logger%281%29.log:3321) содержат `gyr=(0,0,0)`, включая живой геймплей 16:23:59–16:24:15 (стики/триггеры реальные: `rs=(128,-128)`, `rt=32767` [стр.4957](/home/legion/Downloads/ip-gyro-logger%281%29.log:4957)).
+- Заголовок потока HIDFLOW DECK-GAME … `gyr(p,y,r)=0,0,0` [стр.5062](/home/legion/Downloads/ip-gyro-logger%281%29.log:5062).
+- Физический IMU ЖИВ: IIO `iio:device2 gyro_3d` [стр.360](/home/legion/Downloads/ip-gyro-logger%281%29.log:360) даёт реальные угловые скорости (напр. `gyro=451,12,-9` в 16:15:52; ненулевых значений — десятки).
+- ВЫВОД: датчик читается ядром, НО InputPlumber НЕ пишет гиро в репорт виртуального Deck → Steam видит нули → «слайдеры гиро на 0»; гиро мёртв и в Steam-UI, и в игре. Кнопки/джойстики работают — жалоба «не работает управление» = именно гиро.
+
+### (г) СОПУТСТВУЮЩИЙ ФАКТОР (идентичность устройства)
+- Steam связывает deck-uhid с `controller_neptune.vdf` [стр.431](/home/legion/Downloads/ip-gyro-logger%281%29.log:431) и `configset_controller_steamos_handheld.vdf` [стр.3354](/home/legion/Downloads/ip-gyro-logger%281%29.log:3354) — в GAMING Steam трактует устройство как SteamOS Handheld (neptune/Steam Deck), а НЕ как «Steam Deck Controller» (в desktop `28de:1205` — «Steam Controller»). Объясняет мигание названия между режимами у тестера.
+
+### (д) СОВПАДЕНИЕ С ИЗВЕСТНЫМИ ПАТТЕРНАМИ
+- Паттерн №3 (suspend убивает deck) — НЕ воспроизводится; фикс V9 работает (resume штатный, deck прожил всю сессию).
+- Паттерн №1 (overlay/переключение убивает deck, `hid_read failure`) — есть КАК СЛЕДСТВИЕ: 3 события «Controller device closed after hid_read failure» (16:20:58 [стр.3291](/home/legion/Downloads/ip-gyro-logger%281%29.log:3291), 16:21:24 [стр.3638](/home/legion/Downloads/ip-gyro-logger%281%29.log:3638), 16:21:41 [стр.3816](/home/legion/Downloads/ip-gyro-logger%281%29.log:3816)) вызваны флапом профилей OGU deck-uhid↔hori-steam при переходах режимов; deck каждый раз пересоздаётся — не фатально.
+- Паттерн №2 (застревание в GAMING) — НЕ воспроизводится (все выходы из GAMING чистые).
+- НОВЫЙ ПЕРВИЧНЫЙ ПАТТЕРН: гиро не пишется в HID-репорт deck-uhid при живом IIO-датчике и живых кнопках.
+
+### ВЫВОД-ДИАГНОЗ
+Гиро теряется на пути «IIO-датчик → CompositeDevice → HID-репорт deck-uhid `28de:12f0`»: физический IMU жив (IIO читается ядром), кнопки/стики/триггеры доходят до Steam, но gyr-поля выходного репорта Deck = 0 в 70/70 декодированных кадров, включая стабильный живой геймплей. Steam получает корректный кнопочный ввод и нулевой гиро → «слайдеры на 0». Потеря — на стороне InputPlumber (источник/маппинг/профиль deck-uhid), НЕ Steam и НЕ ядро. Suspend-фикс V9 на этот симптом не влияет (эпизоды resume чистые).
+
+### ГИПОТЕЗЫ-ПРИЧИНЫ (как думаем чинить; по приоритету)
+- **H-A (приоритет 1):** в профиле/коде deck-uhid target НЕ проброшен capability gyro/motion от источника (Legion/IIO) → CompositeDevice не имеет гиро-источника для `12f0`. Проверить маппинг capability в yaml-профиле [50-legion_go_2.yaml](rootfs/usr/share/inputplumber/devices/50-legion_go_2.yaml) (секция sources→target deck-uhid) и код записи репорта [steam_deck_uhid.rs](src/input/target/steam_deck_uhid.rs).
+- **H-B (приоритет 2):** источник гиро есть, но маппинг значений (raw IIO → gyr-поля репорта `12f0`) неверный/выключен (scale/axis mapping) — пишет нули. Зона: [iio_imu/driver.rs](src/drivers/iio_imu/driver.rs), [lego/driver.rs](src/drivers/lego/driver.rs), репорт-код deck-uhid.
+- **H-C (приоритет 3):** гиро-данные приходят только в desktop-режиме (`28de:1205`), а в GAMING-профиле (`12f0`) гиро-канал отсутствует/отключён — проблема именно в gaming/neptune-профиле, а не в источнике.
+- **H-D (приоритет 4, идентичность):** `12f0` должен регистрироваться как полноценный Steam Deck Controller со своим configset, а не подменяться конфигом steamos_handheld (neptune) — влияет на то, из какого источника Steam ждёт гиро, и на «мигание» названия.
+
+### ПЛАН ФИКСА (после согласования гипотез) + ПЛАН ВЕРИФИКАЦИИ
+- Локализовать точку потери по приоритету H-A→H-B→H-C→H-D: сперва capability-маппинг профиля/источника для `12f0`, затем scale/axis-маппинг значений, затем различие desktop/GAMING-профилей, затем идентичность (configset).
+- **Верификация-инструментация (логгер v3.2):** добавить в [logger/ip-gyro-logger.py](logger/ip-gyro-logger.py) строку с СЫРЫМИ gyro-байтами выходного репорта deck И значением гиро НА ВХОДЕ CompositeDevice (зафиксировать, где именно теряются данные — до CompositeDevice или на записи репорта).
+- **Короткий тестовый лог:** вращение устройства в GAMING (гиро-жесты) БЕЗ переключения режимов/overlay — чистый замер пути гиро в одном профиле.
+- Критерий: в v3.2-логе gyr-байты репорта deck ≠ 0 при реальном вращении И Steam-UI/игра реагируют на гиро.
+
+### РЕЗУЛЬТАТ ТЕСТА V10 (обновлён после теста вращения v3.2 — DESKTOP, см. раздел ниже «РЕЗУЛЬТАТ ФИЗИЧЕСКОГО ТЕСТА ВРАЩЕНИЯ v3.2»)
+- [x] v3.2: сырые gyro-байты репорта deck + все источники (LEGION-SRC right/left_gyro, IIO, DECK) зафиксированы при живом движении.
+- [ ] Тест ВРАЩЕНИЯ В GAMING (как у SamTsuki, deck `28de:12f0`) — НЕ ПРОВЕДЁН: в текущей сессии DECK-GAME отсутствовал (grep DECK-GAME=0, игры не запускались); desktop-путь (`28de:1205`) доказанно РАБОТАЕТ.
+- [~] Гипотезы переоценены: H-C (gaming/neptune-профиль `12f0` теряет гиро-канал) — приоритет 1; H-B (scale/axis) — маловероятна (desktop-маппинг жив); «IIO владелец центра / разворот архитектуры» — ДАННЫМИ НЕ ПОДТВЕРЖДЕНА, НЕ делать без GAMING-теста.
+- [ ] Код-фикс согласован и реализован → отдельная задача (в этом разделе НЕ выполнялась).
+
+## 2026-09-03 — АУДИТ ЛОГГЕРА v3.1: логирует НЕ все источники (LEGION-SRC IMU-байты 41–46/54–59 отсутствуют) + АРХИТЕКТУРА ЗАХВАТА + план v3.2
+
+Контекст (результаты задачи Debug, перенесены без потерь): аудит диагностического логгера **v3.1** — канонический релизный [ip-gyro-logger.py](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:1), 1775 строк — по жалобе: «логгер пишет НЕ все источники данных». ТОЛЬКО ДОКУМЕНТАЦИЯ: код/логгер/бинарь/install.sh/build/README/tarball/SHA256SUMS НЕ менялись, git-коммиты НЕ делались; раздел фиксирует признание дыр, архитектуру захвата, ключевой вывод и план v3.2 для согласования. Правки бинаря НЕ нужны (см. п.3).
+
+### 1) ПРИЗНАНИЕ/ФАКТ — жалоба ОБОСНОВАНА: логгер v3.1 НЕ пишет полные сырые кадры всех источников
+- **LEGION-SRC (физический XInput легиона, hidraw):** в [ip-gyro-logger.py](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:975) логируется только 12-байтный head ОДИН раз на длину; полный 64-Б кадр НЕ пишется; IMU-байты `left_gyro_*` (41–46) и `right_gyro_*` (54–59) НЕ декодируются и НЕ пишутся — декод есть только для deck-PID ([стр. 984–986](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:984)); переменная `last_hex` (24 Б каждые 5 с, запись [стр. 983](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:983)) — «мёртвая»: нигде в файле не логируется (инициализация [стр. 804](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:804)).
+- **DECK (1205/12f0/12fb):** полный сырой кадр не пишется (только head); поток ~240–250 кадр/с против чтения логгера ~20/с → FRAMEJUMP skipped 11–19.
+- **IIO:** опрос 1/с (IIO_INTERVAL=1.0, [стр. 141](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:141)), без корреляции по времени с LEGION/DECK.
+- **Собственное raw-логирование бинаря закомментировано** ([driver.rs:224–226](src/drivers/lego/driver.rs:224)) — в бинаре нет fallback-источника полных кадров (но и не нужен, см. п.3).
+
+### 2) АРХИТЕКТУРА ЗАХВАТА (откуда логгер читает каждый источник)
+- **LEGION-SRC:** напрямую `/dev/hidrawN` — discover_hidraws() ([стр. 740](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:740)), open O_RDONLY|O_NONBLOCK в scan_hidraw() ([стр. 794](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:794)), select+os.read(fd,4096) в handle_hidraw() ([стр. 952](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:952)).
+- **IIO:** sysfs `/sys/bus/iio/devices` — discover_iio() ([стр. 425](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:425)) / sample_iio() ([стр. 504](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:504)).
+- **DECK:** тоже напрямую `/dev/hidrawN` (DECK_PIDS [стр. 202](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:202)); по-кадровый декод _handle_deck_reports() ([стр. 989](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:989)) / decode_deck_report() ([стр. 904](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:904)): аксель 24–29, гиро pitch/yaw/roll 30–35, триггеры 44–47, стики 48–55, i16 LE.
+- **Бинарь InputPlumber:** journalctl -u inputplumber -f (ipj_tail_loop() [стр. 1268](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:1268)), фильтр CTL_RE ([стр. 168](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:168)) — ТОЛЬКО контекст (IPJ), бинарь НЕ источник сырых данных.
+- **Steam UI (направление D):** tail-diff controller_ui.txt ([стр. 1495](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:1495)), virtualgamepadinfo.txt ([стр. 1346](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:1346)), controller.txt ([стр. 1421](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:1421)).
+- **Запущенная игра:** /proc/<pid>/environ → SteamAppId (_steam_procs() [стр. 1556](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:1556)).
+- **КНОПКИ/тачпады:** /dev/input/event* (scan_evdev() [стр. 625](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:625)).
+- ВЫВОД: логгер — ПОЛНОСТЬЮ ПАССИВНЫЙ самостоятельный считыватель, НЕ ретранслирует строки бинаря.
+
+### 3) КЛЮЧЕВОЙ ВЫВОД (правки бинаря НЕ нужны)
+Полные 64-Б кадры LEGION-SRC УЖЕ доступны логгеру в потоке, который он читает. Доказательства из лога SamTsuki: FRAME len=64 head=04 3c 74 01… ([стр. 81](/home/legion/Downloads/ip-gyro-logger%281%29.log:81)) и HIDFLOW LEGION-SRC@1.2 20 rd/s 1280 B/s len=64. Соответствие структуре бинаря: raw[0]=0x04 = XINPUT_DATA ([mod.rs:36](src/drivers/lego/mod.rs:36)), raw[2]=0x74 = XINPUT_COMMAND_ID ([mod.rs:43](src/drivers/lego/mod.rs:43)); PID 0x61eb/VID 0x17ef — интерфейс lego ([mod.rs:14,29](src/drivers/lego/mod.rs:14)), лейбл LEGION-SRC@1.2 = интерфейс 2 ([mod.rs:30](src/drivers/lego/mod.rs:30)); IMU-байты из XInputDataReport ([hid_report.rs:302](src/drivers/lego/hid_report.rs:302)): left_gyro 41–46 ([hid_report.rs:461](src/drivers/lego/hid_report.rs:461)), right_gyro 54–59 ([hid_report.rs:475](src/drivers/lego/hid_report.rs:475)), msb i16 — смещения валидны прямо против сырого 64-Б кадра. Требование «в логере все источники данных» нарушено решением Python-логгера, а не ограничением потока.
+
+### 4) ПЛАН v3.2 (только Python-логгер, БЕЗ правок бинаря)
+- Добавить `decode_lego_report(raw)` по образцу decode_deck_report(): проверка raw[0]==0x04 и raw[2]==0x74; распаковка msb i16 `left_gyro_x/y/z`=raw[41:43]/[43:45]/[45:47], `right_gyro_y/x/z`=raw[54:56]/[56:58]/[58:60]; смещение подтвердить эмпирически на живом движении.
+- Включить LEGION-SRC в декод-ветку handle_hidraw (аналог [стр. 984–986](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:984)): строки LEGION-SRC с left_gyro/right_gyro и флагом движения.
+- Писать полный сырой hex кадра при движении IMU/аномалии/периодически («оживить» `last_hex`).
+- DECK: дублировать сырой hex (минимум гиро 30–35) в DECODE-строках.
+- Поднять частоту/коалесценцию чтения DECK-GAME (поток ~250 кадр/с против ~20/с), мгновенный дамп при изменении IMU.
+- IIO: при движении/blip повышать частоту опроса и логировать с таймстампом для корреляции LEGION-SRC ↔ IIO ↔ DECK.
+
+### ПРИМЕЧАНИЕ (какой файл правится для v3.2)
+В [logger/ip-gyro-logger.py](logger/ip-gyro-logger.py) (workspace) лежит устаревшая v3 (без Steam UI-блоков v3.1); канонический логгер для деплоя — релизный [ip-gyro-logger.py](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/logger/ip-gyro-logger.py:1) (v3.1, 1775 строк). v3.2 правится в релизном (каноническом) файле.
+
+### РЕЗУЛЬТАТ ТЕСТА v3.2 (ЗАПОЛНЯЕТСЯ ПОСЛЕ ПРОВЕРКИ)
+**ДЕПЛОЙ v3.2 — ВЫПОЛНЕН (2026-09-03 17:06 CEST / 15:06 UTC)** — безопасный ПАССИВНЫЙ деплой: код логгера и бинарь НЕ правились (задача деплоя, не код-задача).
+- Логгер: [/opt/ip-gyro-logger/ip-gyro-logger.py](/opt/ip-gyro-logger/ip-gyro-logger.py:1), sha256 = `71f1a0fffecd799b4f41695afbd1532700cdf8b763da5165f5fe76ccf6ddd7ba` (v3.2) — подтверждено `sha256sum` после [install.sh --log](/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/install.sh:1).
+- Сервис `ip-gyro-logger`: `active (running)` с 17:06:23 CEST, Main PID 43730 (python3); `systemctl is-enabled` = `enabled`. Лог [/var/log/ip-gyro-logger.log](/var/log/ip-gyro-logger.log:1) пересоздан (перезапуск после install).
+- Стартовый маркер: `2026-09-03 17:06:23.408 LOGGER: v3.2 active — physical Legion-SRC IMU decode (IMU-LEGION + full raw hex), deck raw24-35 correlation, coalesced DECK bursts, fast IIO sampling during motion`.
+- Покой-проверка (устройство в покое, окно 17:06:23→17:07:27, ~60–90 с) — реально увиденные маркеры v3.2:
+  - `LEGION-SRC LEGION-SRC@1.2 raw=<64Б hex>` — каждые ~5 с (полный сырой кадр физического XInput), напр. 17:06:28.515, 17:06:33.541, 17:06:38.567, 17:06:43.598, 17:06:48.622, 17:06:53.646, 17:06:58.675, 17:07:03.699, 17:07:08.729, 17:07:13.757, 17:07:18.783, 17:07:23.812.
+  - `IIO iio:device0 (gyro_3d) gyro=0,0,1..2` / `iio:device2 (accel_3d) accel=0,-7,-6` — непрерывно ~10 Гц (каждые ~0.1 с) с таймстампом, значения idle. ✅ (замечание: темп ~10 Гц, а не ~1/с из ожиданий ТЗ — быстрее, не ошибка).
+  - `DECK` (режим DESKTOP активен): `17:06:26.451 HID: capturing /dev/hidraw16/17/7 (DECK-DESK@1.1/1.2/1.0 vid=28DE pid=1205)`; `HIDFLOW DECK-DESK@1.2 20 rd/s 1280 B/s len=64 gyr(p,y,r)=…`; `MOTION DECK-DESK@1.2 … raw24-35=…`; `ACTIVITY EV=0 | src=20rd/s | DECK-DESK@1.2=20rd/s mot=0/20`. Строк DECK-GAME нет — устройство в desktop-режиме, игры не запущены (ожидаемо).
+  - `DECODE LEGION-SRC@1.2 IMU-LEGION left_gyro=(0,0,0) right_gyro=(y≈0-2,x≈±3,z≈-257…254) raw=…` — присутствует периодически, в т.ч. в покое (17:06:30.788, 17:06:35.707, 17:06:53.517, 17:07:10.042, 17:07:14.211, 17:07:18.500), значения ~0 (idle). ✅ (в ТЗ допускалось отсутствие в покое — здесь присутствует; отклик на ДВИЖЕНИЕ = отдельный физический тест).
+  - Честное замечание: в покое изредка одиночные однокадровые blips `MOTION DECK-DESK` `mag≈765-774` (`mot=1/35`; напр. 17:06:29.526, 17:06:30.031, 17:07:26.486) — похоже на фоновую вибрацию, не устойчивое движение; после каждого снова idle.
+- `inputplumber` после рестарта: `active (running)` с 17:06:19 CEST, Main PID **42536** (до деплоя был 14601 — штатный рестарт install.sh); бинарь [/opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v4.resume-gamefix](/opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v4.resume-gamefix:1) sha = `c9a4bfa800a2c1bca078c41ddfcb0131351cd8f5402d8a5cdd4963ca13476e00` (V9, не изменён). `/opt` — symlink на `/var/opt` (штатно). Логгер пассивный, гиро/джойстики не трогал.
+- Незакрытые пункты (требуют отдельного физического теста ВРАЩЕНИЯ): подтверждение смещения left/right_gyro на живом движении; DECK-GAME ~250 кадр/с в игре; ускоренный опрос IIO при движении; триггеры сырого hex «при движении IMU/аномалии».
+- [ ] v3.2: decode_lego_report(raw) добавлен; LEGION-SRC декодирует left_gyro 41–46 / right_gyro 54–59 (msb i16) с флагом движения; смещение подтверждено на живом движении. (декод активен — поля left/right_gyro парсятся, в покое ~0; подтверждение СМЕЩЕНИЯ на живом движении — к тесту вращения)
+- [x] Полный сырой 64-Б hex кадра LEGION-SRC пишется при движении IMU/аномалии/периодически (`last_hex` «оживлён»). — подтверждён ПЕРИОДИЧЕСКИЙ полный raw каждые ~5 с в покое; триггеры «при движении/аномалии» — к тесту вращения.
+- [ ] DECK: сырой hex (минимум гиро 30–35) продублирован в DECODE-строках; частота/коалесценция чтения DECK-GAME поднята (~250 кадр/с против ~20/с) + мгновенный дамп при изменении IMU.
+- [ ] IIO: при движении/blip опрос чаще + таймстамп для корреляции LEGION-SRC ↔ IIO ↔ DECK.
+- [x] В логе присутствуют полные сырые кадры ВСЕХ источников (жалоба «не все источники» закрыта). — в покое видны: LEGION-SRC полный 64-Б raw (периодически), DECK-DESK полные кадры/raw24-35 (MOTION/HID), IIO-сэмплы.
+- [ ] Код-фикс v3.2 реализован в РЕЛИЗНОМ (каноническом) логгере → отдельная задача (в этом разделе НЕ выполнялась).
+
+## 2026-09-03 — РЕЗУЛЬТАТ ФИЗИЧЕСКОГО ТЕСТА ВРАЩЕНИЯ v3.2 (17:10:30–17:10:46 CEST, /var/log/ip-gyro-logger.log, ~15 с по разным осям, DESKTOP-режим, бинарь V9 c9a4bfa8)
+
+Пользователь физически повращал Legion Go 2 ~15 с по разным осям; v3.2 параллельно писал ВСЕ источники (LEGION-SRC XInput, IIO, DECK-uhid). Анализ сырых IMU-байт LEGION-SRC XInput (запрос: байты 41–46/54–59):
+
+> УТОЧНЕНИЕ (17:26 CEST, повторная верификация всех примеров ниже дословно из лога): плотный поток декодов IMU-LEGION шёл 17:10:12–17:10:46 (~10/с, 322 строки в окне 17:10:1x–4x), а не только 17:10:30–46 (шапка). Пик вращения — 17:10:38.4–17:10:41.2, максимум |right_gyro| mag=3973 на 17:10:39.894 → (y=-1639,x=-1502,z=832) — в ту же миллисекунду DECK-DESK MOTION mag=6906 gyr=(-111,-3396,-3399). Все таймстампы/значения в разделе ниже подтверждены grep/поиском по логу verbatim.
+
+### 1) Что показал физический XInput-кадр LEGION-SRC (байты, подтверждены ручным разбором raw 64-Б против [hid_report.rs:302](src/drivers/lego/hid_report.rs:302))
+- **left_gyro (байты 41–46) = ВСЕГДА (0,0,0)**, даже в пике вращения 17:10:31–17:10:46. Мёртвый путь — левый гиро на этом устройстве не заполняется вовсе. НЕ источник.
+- **right_gyro (байты 54–59) = РЕАЛЬНЫЙ ЖИВОЙ сигнал**, трекает вращение до ~±2000 отсчётов (декод v3.2, msb i16 y/x/z = 54-55/56-57/58-59):
+  - 17:10:34.151 → (y=165,x=1964,z=-17); 17:10:35.015 → (y=-1808,x=-127,z=-225); 17:10:38.416 → (y=-441,x=-906,z=-1692); 17:10:39.766 → (y=-893,x=-1934,z=-11); 17:10:40.450 → (y=1873,x=660,z=554); 17:10:41.155 → (y=-2007,x=-1213,z=113).
+  - Покой (17:11:33–17:11:46): (y≈±2,x≈±3,z≈-256…254) — малый базис. ✅ Смещение 41–46/54–59 ПОДТВЕРЖДЕНО НА ЖИВОМ ДВИЖЕНИИ (ранее пункт был открыт).
+
+### 2) Корреляция IIO ↔ LEGION-SRC ↔ DECK в том же окне вращения
+- **IIO центр (iio:device0 gyro_3d, scale 0.000174532)**: отзывается СЛАБО — пик всего ~±165 отсчётов (17:10:36.867 gyro=165,85,-17; 17:10:41.675 gyro=126,-3,-18) против ~±2000 у right_gyro.
+- **DECK-DESK@1.2 (deck-uhid, DESKTOP) гиро-репорта (байты 30–35) = НЕ НОЛЬ при вращении**: 17:10:42.341 HIDFLOW gyr(p,y,r)=**801,291,573** mot=131/131; MOTION-события mag до ~9888 (17:10:38.366 gyr=(3816,1020,-5052)); в покое (17:14:27+) gyr(p,y,r)≈(-3..6,3..12,-9..9)≈0.
+- Вывод: цепочка «физический XInput right_gyro (54–59) → lego MultiGyro ([driver.rs:598](src/drivers/lego/driver.rs:598)) → deck-uhid (байты 30–35)» на ЭТОЙ машине в **DESKTOP-режиме ЖИВА и несёт реальный гиро**.
+
+### 3) Переоценка гипотез и направления фикса (ВАЖНО)
+- Гипотеза Debug «right_gyro несёт нули → нужен разворот архитектуры (IIO — единственный владелец центра, отключить lego MultiGyro)» ДАННЫМИ **НЕ ПОДТВЕРЖДЕНА**: на этом железе right_gyro несёт реальный сигнал, deck в desktop гиро получает. Разворот архитектуры НЕ делать без данных GAMING-режима.
+- Усилена **H-C**: desktop (`28de:1205`) гиро РАБОТАЕТ; неработающий кейс SamTsuki — **GAMING (`28de:12f0`)**. В этой сессии DECK-GAME отсутствует (grep DECK-GAME=0, игры не запускались, в логе только DECK-DESK) → путь `12f0` на нашей машине ещё НЕ проверен.
+- Решающий эксперимент: **повторить это же вращение ~15 с В ИГРЕ** (как у SamTsuki), чтобы активен был DECK-GAME (`12f0`). Если `12f0` gyr=0 при живом right_gyro → баг локализован в gaming/neptune-профиле `12f0` (H-C/H-D), фикс в профиле/маппинге 12f0, а НЕ в источнике/архитектуре IIO.
+- Обновлённый приоритет: **H-C — приоритет 1**; H-A — приоритет 2 (только для 12f0-target); H-B — маловероятна (desktop-маппинг значений жив); H-D — приоритет 3.
+
+## 2026-09-03 — РЕЗУЛЬТАТ ИГРОВОГО ТЕСТА v3.2 (GAMING / 12f0) — ВРАЩЕНИЕ УЖЕ БЫЛО СДЕЛАНО 17:35:30–44 (ESO) → ГИРО 12f0 РАБОТАЕТ (H-C ОПРОВЕРГНУТА на ЭТОЙ машине) [todo 25]
+
+### 0) ПРИЗНАНИЕ ОШИБКИ АТРИБУЦИИ (пользователь был прав: «зачем опять? данных достаточно»)
+Игровой тест вращения (протокол из раздела 17:10 DESKTOP) пользователь УЖЕ выполнил в реальной сессии ESO сразу после перезагрузки/запуска: **17:35:30.065–17:35:44.715** (DECK-GAME `12f0` активен с 17:34:02). Мой ранний запрос «повращай ещё раз в игре» был ЛИШНИМ — я неверно атрибутировал окно 17:37:49–50 как «тест», хотя игра к тому моменту уже закрылась (см. п.3). Новые данные не нужны; все примеры ниже — verbatim из [/var/log/ip-gyro-logger.log](/var/log/ip-gyro-logger.log:1).
+
+### 1) Хронология сессии (GAMING)
+- 17:33:52 — перезагрузка, новый inputplumber (PID 1339, бинарь V9 c9a4bfa8): `STATE: baseline mode=NO-DECK`.
+- 17:33:56 — `NO-DECK -> DESKTOP`; 17:33:59 — `DESKTOP -> NO-DECK`.
+- **17:34:02.041-042** — `HID: capturing /dev/hidraw7 (DECK-GAME vid=28DE pid=12F0)` + `STATE: mode NO-DECK -> GAMING`. ESO (AppID 306130) запущена ~17:34.
+- **17:35:30.065–17:35:44.715** — вращение пользователя В ИГРЕ (~14.7 с): **26 событий `MOTION DECK-GAME` mag≥400**.
+- **17:35:53.375** — `STEAM PROC: AppID 306130 process ended (pid=6222 name=eso64.exe)` … `running Steam games: (none)`. Игра закрыта.
+
+### 2) ГЛАВНЫЙ РЕЗУЛЬТАТ — 12f0 (DECK-GAME) НЁС ПОЛНЫЙ РЕАЛЬНЫЙ ГИРО во время вращения, НЕ ноль
+- Пик: **17:35:33.115 `MOTION DECK-GAME frame=35066 mag=2852 gyr=(1704,325,-823) acc=(58,-1507,-1183)`**. Серия (выборка): 17:35:30.065 mag=1122; 17:35:34.121 mag=1947; 17:35:35.130 mag=1903; 17:35:37.651 mag=2412; 17:35:40.170 mag=1964; 17:35:41.188 mag=2341; 17:35:43.707 mag=1810; 17:35:44.715 mag=1434.
+- LEGION right_gyro (байты 54–59) ЖИВ в том же окне, трекает 1:1: 17:35:30.058 `right_gyro=(y=7,x=858,z=257)`; 17:35:33.306 `(y=-167,x=2051,z=-14)`; 17:35:34.377 `(y=-2079,x=106,z=-234)`; 17:35:41.220 `(y=1564,x=-1,z=-23)`. left_gyro (41–46) мёртв как всегда `(0,0,0)`.
+- Вывод: цепочка «**физический XInput right_gyro (54–59) → lego MultiGyro → deck-uhid 12f0 (байты 30–35)**» в GAMING-режиме на ЭТОЙ машине ЖИВА. Гипотеза «12f0 gyr=0 при живом right_gyro» — **НЕ подтверждена**.
+- IIO центр (iio:device0 gyro_3d) в этой GAMING-сессии почти не откликался (бо́льшую часть `gyro=0,0,1`; редкие малые значения, напр. 17:49:08.262 `gyro=0,-19,-11`) — согласуется с архитектурой ROUND 6 (лего — ЕДИНСТВЕННЫЙ источник IMU центра; IIO фильтруется). Гиро deck идёт из lego, не из IIO.
+
+### 3) КОРРЕКЦИЯ прежнего «дымящегося ствола» (окно 17:37:49–50)
+- Раньше (сводка) помечала 17:37:49–50 как «12f0≈0 при живом right_gyro mag 2177» и «тест». Это НЕВЕРНО по двум пунктам: (а) игра закрылась в 17:35:53; InputPlumber **ЗАСТРЯЛ в GAMING** (после 17:34:02 нет ни одного STATE-перехода выхода); (б) реальный пик в окне — 17:37:49.805 `right_gyro=(y=-289,x=1088,z=-70)` mag≈1128 (НЕ 2177) — кратковременный толчок ~1.2 с (демпфированное колебание), не вращение; deck не нёс sustained.
+- Дек-путь живость подтверждена позже: MOTION DECK-GAME присутствуют и на 17:51:33–17:51:44 (mag~257, фоновые), т.е. канал 12f0 жив и пишет.
+
+### 4) ВЫВОД ПО ГИПОТЕЗАМ (ВАЖНО)
+- **H-C (gaming/neptune-профиль 12f0 теряет гиро-канал) — ОПРОВЕРГНУТА на этой машине**: тот же бинарь V9 (c9a4bfa8) и тот же 12f0-профиль, что у SamTsuki, а 12f0 гиро РАБОТАЕТ. Симптом SamTsuki (12f0 gyr=(0,0,0) 70/70 при живом IIO) НЕ воспроизводится на идентичной сборке.
+- → Различие **machine/unit-specific**. Ведущая гипотеза для SamTsuki: у НЕГО источник right_gyro (54–59) мёртв/иной (аналог мёртвого left_gyro на этой машине — на его юните может быть мёртв правый), ЛИБО конфиг/прошивка-различие. Правки кода V9/профиля 12f0 данные НЕ поддерживают (гиро работает).
+- ЕДИНСТВЕННЫЙ недостающий факт: **лог v3.2 с машины SamTsuki** (тот же деплой логгера), чтобы увидеть ЕГО `DECODE LEGION-SRC right_gyro=(54–59)` на живом движении. До этого — НЕ менять код.
+
+### 5) ПОБОЧНАЯ НАХОДКА — InputPlumber ЗАСТРЯЛ в GAMING (паттерн #2, воспроизведён)
+После закрытия ESO 17:35:53 НЕТ перехода из GAMING: последний STATE = 17:34:02 `NO-DECK -> GAMING`; на 17:51+ логгер всё ещё в GAMING с активным DECK-GAME (`HIDFLOW DECK-GAME 20 rd/s`, frame≈396k на 17:51:44) — застревание ~17+ мин. Отдельный известный баг (кризис #2: застревание в GAMING убивает тачпад). Лечится мягким рестартом inputplumber (вне этого todo, по согласованию).
