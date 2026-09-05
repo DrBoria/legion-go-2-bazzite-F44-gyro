@@ -1354,3 +1354,94 @@ The old record (lines 598-660) claimed "deck-uhid cannot trigger Steam IMU → g
 - Workspace source-коммит (снапшот ветки v810-pre-revert-backup): фикс (b) (gyro_center.rs + реверс ROUND 6 в iio_imu + health-хук lego + mod.rs + docs/plan-fix-b-gyro-proxy.md) + RIGHT_GYRO_SCALE 0.1725 + Agent.md.
 - Релизный репо DrBoria/legion-go-2-bazzite-F44-gyro: install.sh EXPECTED_SHA256 → 553e4967; README «What's new in v11» (первый бинарный релиз с V9: фикс (b) двусторонний фолбэк + хендл +15%); SHA256SUMS; тарболл inputplumber-legiongo2-gyro-v11.tar.gz; commit + tag v11 + gh release + upload.
 - (d) SamTsuki остаётся открытым — v11 (553e4967) включает готовый механизм XInput→IIO; его тест-протокол прежний.
+
+## 2026-09-04 ~01:1x CEST — V12: ФИКС «ПОСЛЕ ОТКЛЮЧЕНИЯ КОНТРОЛЛЕРА НЕ ПЕРЕПОДКЛЮЧАЕТСЯ К ИГРЕ» (hotplug reconnect fix; запрос пользователя «после отключения контроллера он не переподключается к игре, вроде в менюшку стима работает, но в игре нет — инсталл с логами, записываем, потом исправишь» → «записал, проверяй, исправляй»)
+### 1) ROOT CAUSE (жёсткое доказательство из /var/log/ip-gyro-logger.log, re-dock 00:52:07.3–00:52:16.9)
+- НЕ Steam и НЕ перерегистрация deck: `28de:12f0` (deck-uhid) НИКОГДА не отваливался — узел жил, state только чистился (GENRESET DECK-GAME 3×: 8→1, 27→1, 7→1). Steam Input-пад (input37/event3, «Microsoft X-Box 360 pad 0») был стабилен. Виновата СТОРОНА InputPlumber.
+- Ядро добавило новые 61EB.0014-узлы БЫСТРО (00:52:08.08–08.11, ~0.8 с после дока в 00:52:07.323). Мёртвое окно ~8.4 с — целиком InputPlumber-side.
+- Механизм (код): [`src/input/manager.rs`](src/input/manager.rs) `watch_devnodes()` обрабатывал каждый inotify `WatchEvent::Create` ПОСЛЕДОВАТЕЛЬНО и на каждый ждал `udev::Device::from_subsystem_sysname().is_initialized()` петлёй до 80×50 мс (~4 с), затем `continue 'outer` (бросал устройство). В шторме дока udev-БД отставала по переиспользуемым именам event5/js1 → ДВА ПОСЛЕДОВАТЕЛЬНЫХ 4-сек give-up цикла (event5 сдан в 00:52:12.040, js1 — в 00:52:16.157) head-of-line блокировали очередь Create для ЗДОРОВЫХ источников (event7/8/18, hidraw) → все добавлены разом только в 00:52:16.421, All sources [iio2,iio1,event7,event8,event18,hidraw3] к 00:52:16.881 → deck возобновил поток ~00:52:16.78–17.9 (пользователь уже нажал Guide в 00:52:17.897 и вышел). event5/js1 дропнуты НАВСЕГДА (безвредно: docked-список их не содержит).
+### 2) ФИКС (применён в коде)
+- [`src/input/manager.rs`](src/input/manager.rs:1537): Create-ветка теперь **НЕ ждёт inline** — на каждое устройство `tokio::spawn`, который параллельно ждёт `Self::wait_for_udev_initialization` (новый хелпер, до 80×50 мс, макс. бюджет тот же) и шлёт `ManagerCommand::DeviceAdded`. Лейбл `'outer` удалён. Медленный/застрявший сосед больше НЕ может заблокировать здоровые источники того же бёрста. Delete-ветка не тронута.
+- Итог-ожидание: окно док→«All sources» схлопнется с ~8.4 с до ~1–2 с; give-up-варнинги event5/js1 перестанут задерживать event7/8/18/hidraw.
+### 3) СБОРКА + ДЕПЛОЙ (выполнено МНОЙ, по протоколу)
+- `bash /home/legion/ip-build/build.sh` OK за ~2m34s (только 3 прежних lib-warning + 1 bin-warning; новых из manager.rs нет) → вручную скопирован в workspace-корень как `inputplumber-legiongo2-gyro-v4.resume-gamefix`.
+- **НОВЫЙ sha256 = `035c87c98df2158fe1a7e5e915b7eb64c563500299594d93f013c1143acaf20b`** (10 944 536 б).
+- Бинарь синхронизирован в релизный репо; install.sh `EXPECTED_SHA256` 553e4967 → **035c87c9** (комментарий v11→v12). `./install.sh --log` из релизного репо: Source/Installed sha OK (035c87c9), сервис active, MainPID **20234**, логгер включён (root, /var/log/ip-gyro-logger.log + journalctl -u ip-gyro-logger), override.conf GAIN_CENTER=3.0/GAIN_HANDLE=5.
+### 4) ВЕРИФИКАЦИЯ / ПОВТОРНЫЙ ТЕСТ (за пользователем; логгер ЖИВОЙ)
+- Повторить mid-game detach → re-dock с логгером. Критерий PASS: окно «docked → All sources [iio2,iio1,event7,event8,event18,hidraw3]» ~1–2 с (было 8.4 с); в игре ввод возобновляется без Guide/выхода. Якоря в логе: больше НЕ должно быть 4-сек сдвига между добавлением 61EB.0014-узлов и обработкой event7/8/18/hidraw.
+- После подтверждения — v12-коммит/тег/релиз (README «What's new in v12», SHA256SUMS, тарболл). (d) SamTsuki остаётся открытым.
+
+## 2026-09-04 ~17:27–17:29 CEST — V13 FIX APPLIED: `persist: true` на LEGO-композите (config-only, БЕЗ пересборки) — deck-uhid больше НЕ уничтожается на detach/dock
+### (0) ROOT CAUSE (код): CompositeDevice САМОСТОПИТСЯ при `devices_removed && source_devices_used.is_empty()` (composite_device/mod.rs run() 593–606), если config `options.persist` НЕ true. На detach (XInput↔DInput mode-switch) источники композита опустошаются → break 'main → teardown `self.targets.stop()` УНИЧТОЖАЕТ deck-uhid (GENRESET на detach И dock) → Steam сносит/пере-present виртуальный Xbox-пад → живая ESO/SDL держит мёртвый stale-binding. Upstream-флаг persist создан ровно для этого: композит НЕ self-close после удаления всех источников, держит deck представленным, чистит только состояние таргета.
+### (1) ФИКС (config-only): релизный 50-legion_go_2.yaml → options: `persist: true`. Развёрнуто install.sh --log → /etc/inputplumber/devices.d/50-legion_go_2.yaml + restart inputplumber. Конфиг-селекшн: manager берёт ПЕРВЫЙ matching-конфиг; при равном имени файла /etc/inputplumber/devices.d идёт раньше /usr/share → активен deck-вариант из /etc (подтверждено логом DECK-GAME).
+### (2) ПОДТВЕРЖДЕНИЕ ПОСЛЕ РЕСТАРТА (PID 1497→28796): 17:28:25 «Found a matching hidraw device ... in config /etc/inputplumber/devices.d/50-legion_go_2.yaml, creating CompositeDevice»; CompositeDevice0 стартовал, источники пере-добавлены; логгер 17:29:02 LEGION-SRC@1.2+IIO живы; Steam пере-present пада. sha бинаря 035c87c9 (тот же v12, бинарь НЕ тронут).
+### (3) ТЕСТ ЗА ЮЗЕРОМ: mid-game detach → пауза → re-dock. КРИТЕРИЙ PASS: НЕТ `GENRESET DECK-GAME frame N -> 1` на переходах; ввод в игре жив после re-dock. Если GENRESET остался — persist не прочитан композитом.
+### (4) СТАТУС: fix деплоен 17:28 CEST; функциональная проверка за пользователем. SamTsuki (d) отложен.
+
+## V19 — WAKE-В-ЖИВОЙ-ИГРЕ ПОЧИНЕН: ORCHESTRATOR HEALTH ВЫКЛЮЧЕН (env-гейт IP_ORCHESTRATOR=0 → legacy FIX-A wake path) (2026-09-05 ~16:1x–16:39 CEST) — BUILD + DEPLOYED ✅
+
+### (0) Контекст записи (синхронизация Agent.md)
+- Workspace Agent.md до этого момента заканчивался V18 (BOOT FORENSICS). Релизный репо Agent.md был синхронизирован только до V13 (17:30 2026-09-04); V14–V18 живут только в workspace-файле. Здесь секция V19 дописана в ОБА файла.
+
+### (1) ПРОБЛЕМА / ЗАПРОС
+- Просыпание В ЖИВОЙ ИГРЕ сломалось ПОСЛЕ внедрения механизма «orchestrator health» (деплой V13-orch, бинарь `34a4e3b2`, logger v3.4). Доказанный механизм по логам (окно 16:18:50–16:19:40 CEST): на wake HealthChecker увидел транзиентное resume-состояние (composite ещё `suspended=true`, физический XInput `61eb` ещё не пере-энумерован) как failure и запланировал «controlled reconnect/recreate», который ТЕЙРДАУНИЛ deck-uhid (`28de:12f0`), корректно переживший suspend через keep-alive FIX A.
+- Рабочий эталон wake-пути: бинарь `fe95e162` (V12 + frame-counter, legacy path, БЕЗ оркестратора) — FIX A keep-alive БЕЗ teardown.
+- Ограничения: починить wake-в-живой-игре, НЕ сломав detach; минимум изменений; НЕ трогать persist-gate / FIX A / frame counter / deck-uhid / OGUI gate / config; без рефакторинга; стоп, если фикс > ~нескольких строк.
+
+### (2) ШАГ 1 (read-only) — ГДЕ ГЕЙТ + ПОЧЕМУ HEALTH БЫЛ АКТИВЕН
+- Код с маркерами `[orch]`/health/reconnect/recreate: [`src/input/manager.rs`](src/input/manager.rs) (гейт 316–335), [`src/orchestrator/mod.rs`](src/orchestrator/mod.rs) (`mode_from_env()` 59–65; спавн HealthChecker 445–452; `on_health_failed` 259–278; `do_controlled_recreate` 348–398), [`src/orchestrator/health.rs`](src/orchestrator/health.rs) («health check FAILED» 112; `composite_forwarding_ok` 135; `deck_published` 145–169).
+- ГЕЙТ: `OrchestratorMode::mode_from_env()` ([`mod.rs:59`](src/orchestrator/mod.rs:59)) читает env `IP_ORCHESTRATOR`: `"1"`/`"active"` → Active, `"shadow"` → Shadow, ВСЁ остальное (unset / `"0"`) → Off. Оркестратор спавнится ТОЛЬКО если mode ≠ Off ([`manager.rs:317`](src/input/manager.rs:317)). HealthChecker спавнится и его failure-actions исполняются ТОЛЬКО в Active. Код НЕ default-on (по умолчанию Off).
+- ОТВЕТ «почему health был активен, хотя считалось, что override.conf без IP_ORCHESTRATOR»: вариант **(а)** — env-гейт, включённый САМИМ install.sh при деплое V13-orch. install.sh пишет в `/etc/systemd/system/inputplumber.service.d/override.conf` строку `Environment=IP_ORCHESTRATOR=$ORCHESTRATOR` (стр. 189), а переменная `ORCHESTRATOR="1"` (стр. ~138) была выставлена в V13-orch. Живая система подтверждена: override.conf содержит `IP_ORCHESTRATOR=1`, `systemctl show` то же. Старые записи «no IP_ORCHESTRATOR (V12/legacy)» относятся к эпохе `fe95e162` — ДО V13-orch, когда строки ORCHESTRATOR в install.sh ещё не существовало.
+
+### (3) ШАГ 2 — МИНИМАЛЬНЫЙ ФИКС (health off через чистый гейт → legacy path)
+- Приоритетный путь задачи: выключить orchestrator health ЧИСТЫМ гейтом (env `IP_ORCHESTRATOR`) → legacy wake-путь (FIX A keep-alive), где health/reconnect/recreate невозможны в принципе. Защищённые компоненты (persist-gate, FIX A `targets.rs:704–710`, frame counter, deck-uhid, OGUI gate, config) НЕ тронуты.
+- Код — только одно лог-выражение в ветке `else` (mode==Off) гейта, [`src/input/manager.rs:325`](src/input/manager.rs:325):
+```rust
+} else {
+    // V19: orchestrator health/reconnect is DISABLED for this
+    // deployment (IP_ORCHESTRATOR not active). Proven wake path =
+    // FIX A keep-alive WITHOUT teardown (as fe95e162). With the
+    // orchestrator off, no HealthChecker runs and therefore no
+    // health-driven controlled reconnect/recreate can tear down a
+    // deck-uhid (28de:12f0) that survived system suspend.
+    log::info!(
+        "[orch] health DISABLED legacy wake path: orchestrator off (IP_ORCHESTRATOR not active); no health check/reconnect/recreate; wake = FIX A keep-alive only (V19)"
+    );
+}
+```
+- install.sh (релизный репо `/home/legion/Desktop/legion-go-2-bazzite-F44-gyro/install.sh`): `ORCHESTRATOR="1"` → `ORCHESTRATOR="0"`; `EXPECTED_SHA256` → `93081b83…` (комментарии v13-orch → v19). Строка 189 `Environment=IP_ORCHESTRATOR=$ORCHESTRATOR` теперь пишет `0`.
+
+### (4) СБОРКА + ДЕПЛОЙ (выполнено МНОЙ, по протоколу)
+- `bash /home/legion/ip-build/build.sh` (podman rust:1.92) — чисто ~2m42s, только прежние warnings. Новый бинарь 11 109 880 б.
+- Скопирован в workspace-корень и релизный репо как `inputplumber-legiongo2-gyro-v4.resume-gamefix`.
+- **НОВЫЙ sha256 = `93081b837970135ff137931e879c8c8a09e41a094e3f0768f14c63da5db095f3`**.
+- `./install.sh --log` из релизного репо: Source/Installed sha OK (`93081b83`), сервис active, MainPID **30951** (старт 16:38:48 CEST), override.conf `IP_ORCHESTRATOR=0`, логгер включён (живой).
+
+### (5) ВЕРИФИКАЦИЯ (БЕЗ игр/sleep/detach/reboot)
+- Ровно 1 демон: PID 30951 (`pgrep -x inputplumber-le` — comm усечён до 15 символов из-за длинного имени бинаря). Старый PID 22049 (`34a4e3b2`) завершён.
+- sha 3× совпадают = `93081b83`: диск `/opt/inputplumber-legiongo2-runtime/…`, `/proc/30951/exe` (через sudo — процесс root), install.sh `EXPECTED_SHA256`.
+- journalctl (новый PID 30951, с 16:38:48): оба стартовых маркера — `[detach-log] armed (v0.77.4)` И `[orch] health DISABLED legacy wake path: … wake = FIX A keep-alive only (V19)`. С момента старта — 0 строк health/orchestrator от нового PID.
+- История-доказательство механизма: старый PID 22049 до 16:38:40 каждые 15 с печатал `[orch] health check FAILED` — ровно тот деструктивный health-цикл, который теперь выключен.
+- Логгер жив: активен, стримит живые данные (16:39:15).
+
+### (6) СТАТУС
+- health ВЫКЛЮЧЕН на уровне гейта → на wake НЕ может выполнить controlled reconnect/recreate/teardown deck-uhid (`28de:12f0`). Функциональный тест wake-в-живой-игре — за пользователем (критерий PASS: suspend→resume в живой игре, ввод жив; в journal НЕТ `[orch]` health/recreate от PID 30951).
+- SamTsuki (d) и прочие открытые пункты — вне рамок этой задачи.
+
+## V19 (2026-09-05) — ROOT CAUSE: install.sh wrote IP_ORCHESTRATOR=1 (since V13-orch) → [orch] health-check at wake DESTROYS a surviving deck-uhid → FIX: IP_ORCHESTRATOR=0 (legacy wake path), sha 93081b83, deployed PID 30951
+
+### Механизм (окно 16:19:08–16:19:10) — почему «suspend в живой игре» снова ломался под [orch]
+- deck-uhid КОРРЕКТНО переживает suspend (FIX A + счётчик кадров работают — подтверждено логом)
+- но [orch] health-check при wake (16:19:08) видит переходный suspended=true + ещё не пере-енумерованный источник как ФЕЙЛ
+- → 1s controlled reconnect срабатывает РАНЬШЕ 15s source-wait → controlled recreate УНИЧТОЖАЕТ переживший suspend deck-uhid (16:19:10) → abort → композит мёртв
+- Legacy wake path (эра fe95e162, только FIX A, БЕЗ [orch]) = РАБОЧИЙ
+
+### Корень
+- install.sh c V13-orch пишет IP_ORCHESTRATOR=1 (гейт mode_from_env, src/orchestrator/mod.rs:59) → включался здоровье-чек, ломающий wake
+
+### Фикс (собран 93081b83, задеплоен PID 30951)
+- установлен IP_ORCHESTRATOR=0 → legacy wake path восстановлен
+- добавлен стартовый маркер [orch] health DISABLED
+- persist / FIX A / счётчик кадров / OGUI gate / config — НЕ ТРОНУТЫ
+- оба стартовых маркера в journal на месте
+

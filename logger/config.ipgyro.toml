@@ -1,0 +1,81 @@
+# /etc/ip-gyro-logger/config.toml — single generic logger config (todo 52a/52b).
+#
+# INSTALLED BY install.sh --log FROM THIS TEMPLATE. If the file already exists
+# the installer does NOT overwrite user values — it only adds missing keys
+# (template mode). The logger reads it with python3 stdlib `tomllib` (no
+# third-party deps); if the file is missing/broken the logger falls back to the
+# compile-time defaults in ipgyro/conf.py and logs one
+# "LOGGER: config not found/invalid, using defaults" line. It NEVER crashes.
+#
+# SCOPE: ONLY generic tunables (cadences, sizes, thresholds, unit names and the
+# [labels] role->display table). NEVER put VID/PID / product names here — device
+# identity is discovered at runtime by ipgyro/discover.py (capability roles),
+# NOT configured. `[labels]` defaults equal the pre-52b marker strings so the
+# P1-P10 forensics contract stays byte-comparable on this machine.
+
+[log]
+# Where the logger writes (the systemd unit may pass --log which overrides this).
+path = "/var/log/ip-gyro-logger.log"
+# Internal size rotation threshold (bytes). Above this the file is renamed to
+# <path>.1 and a fresh one opened ([ROTATE] marker).
+max_bytes = 314572800
+
+[cadence]
+# Seconds between the main-loop periodic passes.
+snap = 3.0            # re-read /proc/bus/input/devices + evdev re-scan
+hb = 15.0             # compact heartbeat when the device set did not change
+iio = 1.0             # quiet IIO sample cadence (1 Hz)
+iio_idle = 5.0        # one idle heartbeat per iio device when magnitude == 0
+iio_fast = 0.1        # fast IIO cadence while a gyro blip is armed (10 Hz)
+iio_fast_hold = 2.0   # stay fast this long after the last motion blip
+iio_rescan = 60.0     # rediscover iio devices (IMU can come/go)
+sess = 5.0            # loginctl session scan cadence
+ev_throttle = 0.1     # ~10 EV_ABS lines/sec/device
+flow = 1.0            # per-device hidraw liveness summary (once/sec)
+hid_raw = 5.0         # full-report hex sample cadence per hidraw
+steam_scan = 5.0      # Steam registry / controller-log diff cadence
+steam_state = 30.0    # periodic [STEAM-STATE] cadence
+ipj_backlog = 150     # journalctl -u inputplumber -n backlog at startup (lines)
+ipj_max_s = 25        # InputPlumber journal flood gate (lines/sec)
+ipj_watchdog = 90.0   # no journal line this long -> watchdog re-check (G4)
+ipj_live = 15.0       # periodic [IPJ-LIVE] heartbeat while healthy
+gyro_src = 5.0        # periodic [GYRO-SRC] verdict cadence
+dev_inv = 60.0        # periodic [DEV-INV] re-assert cadence
+pm_follow = 60.0      # [PM-LIVE] heartbeat cadence
+
+[full_mode]
+# (e) full-capture window: held this long after the last transition.
+post = 10.0
+wake = 30.0           # extra hold after a sleep wake
+game = 3600.0         # effectively the whole game session
+
+[thresholds]
+# Motion is "real" when the per-report gyro/accel magnitude exceeds the LARGER of
+#   motion_floor                     (absolute fallback, used until a per-device
+#                                     rest-noise floor is measured)  and
+#   motion_ratio * <rest-noise floor> (per-device, measured while idle)
+# Both physical-source and deck gyro use the same rule (no per-product tuning).
+motion_ratio = 2.0
+motion_floor = 50
+# Flow liveness windows (seconds).
+flow_stop = 2.0       # silence after data -> FLOW STOP
+flow_never = 10.0     # attached but never delivered -> FLOW STOP
+flow_gap = 2.0        # deck silent this long while source alive -> FLOW GAP
+flow_gap_hb = 20.0    # re-assert a long-lived FLOW GAP only this often
+deck_drain = 16       # max frames coalesced from one deck burst drain
+frame_min = 0.0       # full-mode per-frame throttle floor (0 = none)
+
+[journal]
+# systemd unit names the logger mirrors/follows.
+inputplumber_unit = "inputplumber"
+suspend_unit = "systemd-suspend"
+
+[labels]
+# Role -> display label (defaults == pre-52b strings so markers stay comparable).
+role_physical = "LEGION-SRC"
+role_deck_game = "DECK-GAME"
+role_deck_stale = "DECK-12FB"
+role_deck_desk = "DECK-DESK"
+# iio device name hints used to identify the attached CENTER body IMU (the
+# center / right_gyro slot source). Generic (no product), capability-based.
+cen_imu_name_hints = ["gyro", "imu", "gyro_3d"]

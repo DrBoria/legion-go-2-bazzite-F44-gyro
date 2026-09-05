@@ -137,13 +137,37 @@ options:
   # this is false, InputPlumber will not try to manage the device unless an
   # external service enables management of the device. Defaults to 'false'
   auto_manage: true
+  # If true, the CompositeDevice does NOT self-stop when the last source device
+  # is removed (e.g. the Legion controller XInput<->DInput mode switch on
+  # detach/dock). Instead it stays alive and keeps its 'deck' (SteamDeck) target
+  # presented to Steam, only clearing target state while no source is present.
+  #
+  # WHY THIS IS REQUIRED: without persist the composite stops when the mode
+  # switch empties its sources, which destroys and re-creates the deck-uhid
+  # (28de:12f0) on EVERY detach AND dock. Steam then tears down and re-presents
+  # its virtual pad, and a live ESO (SDL) never re-binds it -> controller dead
+  # in-game after re-attach. Persist keeps the deck identity STABLE across the
+  # gap, so Steam never drops its slot and a running game never loses the pad.
+  #
+  # Single-path (V21): the deck-uhid (28de:12f0) is NEVER recreated once Steam
+  # has bound it; it is destroyed only at full teardown (persist=false, never in
+  # this config). Detach/dock self-heal lives in the always-on composite layer
+  # ([reconcile] marker): when the composite loses its last gamepad hidraw
+  # source it rediscovers live hidraw devices and re-adds matching ones WITHOUT
+  # touching the deck target. Suspend keeps the deck alive (FIX A). The legacy
+  # orchestrator policy keys (on_suspend/on_resume/reconnect) were removed with
+  # the dual-path code and no longer exist in the parser.
+  persist: true
+  policy:
+    on_sources_empty:
+      action: keep_alive
 
 # The target input device(s) to emulate by default.
 # NOTE: 'deck' (SteamDeck) instead of 'xbox-elite' is what makes Steam see the
 # Legion Go 2 as a Steam Deck — the only identity that carries a gyroscope.
 # Without this the default Bazzite profile routes to 'xbox-elite' (no gyro).
 target_devices:
-  - deck
+  - deck-uhid
   - keyboard
   - mouse
   - touchpad

@@ -1,0 +1,10 @@
+/var/log/ip-gyro-logger.log {
+    daily
+    rotate 14
+    size 200M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

@@ -247,8 +247,8 @@ Or manually:
 
 ```bash
 sudo mkdir -p /opt/inputplumber-legiongo2-runtime
-sudo cp inputplumber-legiongo2-gyro-v4.resume-gamefix /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v4.resume-gamefix
-sudo chmod +x /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2-gyro-v4.resume-gamefix
+sudo cp inputplumber-legiongo2 /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2
+sudo chmod +x /opt/inputplumber-legiongo2-runtime/inputplumber-legiongo2
 
 sudo mkdir -p /etc/inputplumber/devices.d
 sudo cp 50-legion_go_2.yaml /etc/inputplumber/devices.d/50-legion_go_2.yaml   # Steam Deck target routing
@@ -368,11 +368,11 @@ To fine-tune or reproduce the debugging, see [Agent.md](Agent.md) — it documen
 ## Repository contents
 
 - `patches/inputplumber-legion-go-2-bazzite.patch` — the complete source patch (all changes vs upstream base)
-- `inputplumber-legiongo2-gyro-v4.resume-gamefix` — prebuilt modified binary for **v10.1** (unchanged since v9/v10; Release asset: `inputplumber-legiongo2-gyro-v10.1.tar.gz`); sha256 `c9a4bfa800a2c1bca078c41ddfcb0131351cd8f5402d8a5cdd4963ca13476e00`
+- `inputplumber-legiongo2` — prebuilt current fix binary (**V21**, single-path); sha256 `7599c9c7786265f9b1ca1bad0e3e566377dba4b296070549cfe83825d611ee81` (canonical clean name; the stale `-v4.resume-gamefix` fork-label was dropped)
 - `inputplumber-legiongo2-gyro` — legacy prebuilt binary (v8.1-era, sha256 `0618564a6194f89ca8039f4db56996ac43e05c05a23f2f80d03bbea2022689ca`), kept as the `install.sh` last-resort fallback (no FIX A)
 - `50-legion_go_2.yaml` — composite device profile (routes the device to the `deck` target so it is seen as a Steam Deck with gyro)
 - `install.sh` — install / update script with two modes (plain vs `--log`) for the optional diagnostic logger (binary + profile + gain override + suspend/resume power fixes + boot-time Steam gyro auto-reset unit)
-- `logger/` — passive diagnostic logger (v3.3: `ip-gyro-logger.py` + `ip-gyro-logger.service`), installed by `./install.sh --log` (see [Diagnostic logger](#diagnostic-logger-v33-optional))
+- `logger/` — passive diagnostic logger (**v3.6**: thin launcher `ip-gyro-logger.py` + `ipgyro/` package), installed by `./install.sh --log` (see [Diagnostic logger](#diagnostic-logger-v33-optional))
 - `steam-deck-uhid-gyro-reset.service` — oneshot unit that clears Steam's virtual gamepad registry at boot (installed & enabled by install.sh) so the deck controller re-registers with IMU/gyro initialized after Bazzite updates
 - `Agent.md` — full debugging log: hypotheses, measurements, reproduction steps
 - `steam-input-ref.png` — Steam Input reference screenshot

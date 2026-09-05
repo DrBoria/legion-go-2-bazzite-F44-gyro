@@ -59,16 +59,39 @@ BASE_DIR="$(
 
 # Runtime install paths.
 INSTALL_DIR="/opt/inputplumber-legiongo2-runtime"
-INSTALLED_BINARY="$INSTALL_DIR/inputplumber-legiongo2-gyro-v4.resume-gamefix"
+# Canonical clean name (todo 51f): the stale "-v4" / ".resume-gamefix" fork-label
+# suffixes were removed — they carried no meaning and confused.
+INSTALLED_BINARY="$INSTALL_DIR/inputplumber-legiongo2"
 
-# Expected sha256 of the CURRENT fix binary — v11 = FIRST binary change since V9:
-#  * fix (b) center-gyro fallback — gyro_center proxy/arbiter, BIDIRECTIONAL:
-#    if the active center source goes dead the deck's center gyro automatically
-#    falls back to the live source (IIO <-> XInput); on a unit whose XInput IMU
-#    is dead (SamTsuki case) the live IIO center takes over by itself;
-#  * right-handle gyro +15% (RIGHT_GYRO_SCALE 0.15 -> 0.1725); center unchanged.
-# Verified after install — a mismatch only warns, never aborts.
-EXPECTED_SHA256="553e4967500df1cb06e987e209edd87567c4a555538d5578a1966798372f8d00"
+# Expected sha256 of the CURRENT fix binary — V21 (single-path).
+#
+# V21 = the single-path build: the legacy dual-path architecture (orchestrator /
+# HealthChecker / event-bus, selected by IP_ORCHESTRATOR) has been REMOVED from
+# the source. There is exactly ONE lifecycle path now: the always-on
+# manager/composite layer.
+#
+# Behaviour preserved from V20 (6b578eb2), which self-healed a physical detach
+# on the desktop in <=2s without touching the deck-uhid:
+#   1. manager on_source_device_removed: EVERY branch unconditionally cleans
+#      source_devices / source_devices_used / composite_device_sources before
+#      returning (no stale bookkeeping).
+#   2. manager on_source_device_added: a reused-id re-add asks the mapped
+#      composite for authoritative membership (HasSourceDevice) and, if the
+#      source is no longer live there, treats the mapping as stale, cleans it
+#      up and re-attaches the replacement instead of skipping "already in use".
+#   3. composite self-heal: when a composite loses its LAST non-blocked
+#      gamepad-hidraw source (if02 XInput 61eb), and it persists (keep-alive)
+#      and is NOT suspended, it schedules a bounded, debounced reconciliation
+#      that rediscovers live hidraw devices and re-adds missing matching ones —
+#      the deck-uhid (28de:12f0) is NEVER recreated (the persist-gate is now
+#      unconditional; destroy happens only at full teardown).
+# persist:true keep-alive (detach), FIX A handle_suspend deck-uhid keep-alive,
+# monotonic frame counter and the OGUI gate are UNCHANGED. No IP_ORCHESTRATOR
+# env is set any more (the gate no longer exists); startup logs the single
+# [single-path] marker.
+# Instrumentation: [reconcile] / [mgr-rm] / [mgr-add] / [single-path] markers in
+# journalctl. Verified after install — a mismatch only warns, never aborts.
+EXPECTED_SHA256="7599c9c7786265f9b1ca1bad0e3e566377dba4b296070549cfe83825d611ee81"
 
 # Resolve which source binary to install, in priority order:
 #   1) the fix binary shipped next to install.sh (once added to the repo/tarball)
@@ -76,8 +99,8 @@ EXPECTED_SHA256="553e4967500df1cb06e987e209edd87567c4a555538d5578a1966798372f8d0
 #   3) the legacy repo binary (kept as a last-resort fallback; sha is verified)
 SOURCE_BINARY=""
 for cand in \
-    "$BASE_DIR/inputplumber-legiongo2-gyro-v4.resume-gamefix" \
-    "/home/legion/ip-build/InputPlumber/inputplumber-legiongo2-gyro-v4.resume-gamefix" \
+    "$BASE_DIR/inputplumber-legiongo2" \
+    "/home/legion/ip-build/InputPlumber/inputplumber-legiongo2" \
     "$BASE_DIR/inputplumber-legiongo2-gyro"
 do
     if [[ -x "$cand" ]]; then
@@ -87,19 +110,28 @@ do
 done
 
 # Resolve which logger source directory to install from, in priority order:
-#   1) the logger/ dir shipped next to install.sh (once added to the repo/tarball)
-#   2) the logger/ dir in the InputPlumber workspace (used while testing)
-# Only a dir containing BOTH files qualifies; otherwise the logger is skipped.
-SOURCE_LOGGER_DIR=""
-for cand in \
-    "$BASE_DIR/logger" \
-    "/home/legion/ip-build/InputPlumber/logger"
-do
-    if [[ -f "$cand/ip-gyro-logger.py" ]] && [[ -f "$cand/ip-gyro-logger.service" ]]; then
-        SOURCE_LOGGER_DIR="$cand"
-        break
-    fi
-done
+#   1) LOGGER_SRC_DIR if the caller exported it (configurable, e.g.
+#      LOGGER_SRC_DIR=/path/to/logger ./install.sh --log)
+#   2) the logger/ dir shipped next to install.sh (repo default)
+#   3) the logger/ dir in the InputPlumber workspace (used while testing)
+# The logger is now the v3.7 PACKAGE: the thin launcher `ip-gyro-logger.py` PLUS
+# the `ipgyro/` package directory (deployed recursively). A dir qualifies only if
+# it contains the launcher, the unit AND the ipgyro package; otherwise the logger
+# is skipped (installing just a launcher without ipgyro/ would be broken).
+SOURCE_LOGGER_DIR="${LOGGER_SRC_DIR:-}"
+if [[ -z "$SOURCE_LOGGER_DIR" ]]; then
+    for cand in \
+        "$BASE_DIR/logger" \
+        "/home/legion/ip-build/InputPlumber/logger"
+    do
+        if [[ -f "$cand/ip-gyro-logger.py" ]] && \
+           [[ -f "$cand/ip-gyro-logger.service" ]] && \
+           [[ -d "$cand/ipgyro" ]]; then
+            SOURCE_LOGGER_DIR="$cand"
+            break
+        fi
+    done
+fi
 
 OVERRIDE_DIR="/etc/systemd/system/inputplumber.service.d"
 OVERRIDE_FILE="$OVERRIDE_DIR/override.conf"
@@ -134,7 +166,7 @@ source_sha="$(sha256sum "$SOURCE_BINARY" | awk '{print $1}')"
 if [[ "$source_sha" == "$EXPECTED_SHA256" ]]; then
     echo "Source binary sha256 OK ($source_sha)"
 else
-    echo "WARNING: source binary sha256 mismatch — this is NOT the current resume-gamefix build:"
+    echo "WARNING: source binary sha256 mismatch — this is NOT the current V21 (single-path) build:"
     echo "  expected: $EXPECTED_SHA256"
     echo "  actual:   $source_sha"
 fi
@@ -235,21 +267,141 @@ fi
 LOGGER_DIR="/opt/ip-gyro-logger"
 LOGGER_UNIT="/etc/systemd/system/ip-gyro-logger.service"
 LOGGER_LOG="/var/log/ip-gyro-logger.log"
+# A1 — SINGLE CONFIG (todo 52a/52b): one python-free TOML config read by the
+# logger via tomllib (stdlib). Installed by install.sh --log in TEMPLATE MODE:
+#   * absent  -> fresh copy of the bundle template logger/config.ipgyro.toml
+#   * present -> NEVER overwrite user values; only APPEND keys/sections the
+#                existing file does not yet define (new tunables surface, the
+#                user's overrides are byte-preserved). Invalid/unreadable user
+#                config is left untouched (the logger deep-merges built-in
+#                defaults, so nothing breaks — new keys just aren't in the file).
+LOGGER_CFG_DIR="/etc/ip-gyro-logger"
+LOGGER_CFG_FILE="$LOGGER_CFG_DIR/config.toml"
+LOGGER_CFG_TEMPLATE="$SOURCE_LOGGER_DIR/config.ipgyro.toml"
+
+install_logger_config() {
+    if [[ ! -f "$LOGGER_CFG_TEMPLATE" ]]; then
+        echo "WARNING: $LOGGER_CFG_TEMPLATE not found next to logger sources."
+        echo "         /etc/ip-gyro-logger/config.toml NOT installed (logger uses built-in defaults)."
+        return 0
+    fi
+    sudo mkdir -p "$LOGGER_CFG_DIR"
+    if [[ ! -f "$LOGGER_CFG_FILE" ]]; then
+        sudo install -m644 "$LOGGER_CFG_TEMPLATE" "$LOGGER_CFG_FILE"
+        echo "  config: $LOGGER_CFG_FILE (installed fresh from template)"
+        return 0
+    fi
+    # Existing config: template-merge ONLY missing keys (never overwrite user
+    # values). python3 is already a hard logger requirement; tomllib gives an
+    # exact TOML read of both files. If python3 is missing the user config is
+    # left untouched — the logger deep-merges built-in defaults, so nothing
+    # breaks, the new keys just are not surfaced in the file.
+    if command -v python3 >/dev/null 2>&1; then
+        local merged
+        merged="$(python3 - "$LOGGER_CFG_TEMPLATE" "$LOGGER_CFG_FILE" 2>/dev/null <<'PY'
+import sys, tomllib
+
+
+def fmt(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, str):
+        return '"' + v.replace('"', '\\"') + '"'
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, list):
+        return "[" + ", ".join(fmt(x) for x in v) + "]"
+    return "null"
+
+
+tpl_path, cfg_path = sys.argv[1], sys.argv[2]
+try:
+    with open(tpl_path, "rb") as f:
+        tpl = tomllib.load(f)
+except Exception:
+    raise SystemExit(0)  # template unreadable -> leave user config untouched
+try:
+    with open(cfg_path, "rb") as f:
+        cfg = tomllib.load(f)
+except Exception:
+    raise SystemExit(0)  # invalid/unreadable user config -> do not touch it
+out = []
+for sec, vals in tpl.items():
+    if sec not in cfg:
+        out.append("")
+        out.append("[" + sec + "]")
+        for k, v in vals.items():
+            out.append("".join([k, " = ", fmt(v)]))
+        continue
+    for k, v in vals.items():
+        if k not in cfg[sec]:
+            out.append("")
+            out.append("# added by ip-gyro-logger install (new template key, todo 52b)")
+            out.append("".join([sec, ".", k, " = ", fmt(v)]))
+if not out:
+    raise SystemExit(0)
+print("\n".join(out))
+PY
+        )" || true
+        if [[ -n "$merged" ]]; then
+            # Missing keys are appended as dotted keys at the END, so the user's
+            # file body is byte-untouched; dotted keys are valid TOML and
+            # tomllib reads the same effective values as if they sat in-section.
+            printf '%s\n' "$merged" | sudo tee -a "$LOGGER_CFG_FILE" >/dev/null
+            echo "  config: $LOGGER_CFG_FILE exists — appended only missing template keys (user values untouched)"
+        else
+            echo "  config: $LOGGER_CFG_FILE exists and is up to date (nothing to add)"
+        fi
+    else
+        echo "  config: $LOGGER_CFG_FILE exists — left as-is (no python3 for template merge; logger uses defaults for new keys)"
+    fi
+}
 
 install_logger() {
     echo
-    echo "Installing passive diagnostic logger..."
-    if [[ -z "$SOURCE_LOGGER_DIR" ]]; then
-        echo "WARNING: logger sources not found in either location:"
-        echo "           $BASE_DIR/logger"
+    echo "Installing passive diagnostic logger (v3.7: thin launcher + ipgyro package + config)..."
+    if [[ -z "$SOURCE_LOGGER_DIR" ]] || \
+       [[ ! -f "$SOURCE_LOGGER_DIR/ip-gyro-logger.py" ]] || \
+       [[ ! -d "$SOURCE_LOGGER_DIR/ipgyro" ]]; then
+        echo "WARNING: logger v3.7 sources not found:"
+        echo "           LOGGER_SRC_DIR=${SOURCE_LOGGER_DIR:-<unset>}"
+        echo "           $BASE_DIR/logger   (repo default)"
         echo "           /home/legion/ip-build/InputPlumber/logger"
-        echo "         (ip-gyro-logger.py AND ip-gyro-logger.service are both required.)"
+        echo "         (the thin launcher ip-gyro-logger.py AND the ipgyro/"
+        echo "          package directory are both required.)"
         echo "         The diagnostic logger was NOT installed."
         return 0
     fi
+    # Non-writing import check (PYTHONDONTWRITEBYTECODE => no .pyc pollution):
+    # make sure the v3.7 package actually imports before it goes live.
+    if command -v python3 >/dev/null 2>&1; then
+        if PYTHONDONTWRITEBYTECODE=1 python3 -c \
+            "import sys; sys.path.insert(0, '$SOURCE_LOGGER_DIR'); import ipgyro.app" 2>/dev/null; then
+            echo "  logger v3.7 package imports OK ($SOURCE_LOGGER_DIR)"
+        else
+            echo "WARNING: ipgyro.app did not import from $SOURCE_LOGGER_DIR."
+            echo "         The diagnostic logger was NOT installed."
+            return 0
+        fi
+    fi
     sudo mkdir -p "$LOGGER_DIR"
+    # Thin launcher first (keeps the exact filename the unit/ExecStart expects).
     sudo install -m755 "$SOURCE_LOGGER_DIR/ip-gyro-logger.py" "$LOGGER_DIR/ip-gyro-logger.py"
+    # Then the WHOLE ipgyro/ package, recursively. A stale/older deployment is
+    # replaced in full (never merged): the pre-v3.6 MONOLITH had no ipgyro/, and
+    # a leftover ipgyro/ would otherwise keep running stale code.
+    sudo rm -rf "$LOGGER_DIR/ipgyro"
+    sudo mkdir -p "$LOGGER_DIR/ipgyro"
+    sudo cp -r "$SOURCE_LOGGER_DIR/ipgyro/." "$LOGGER_DIR/ipgyro/"
+    sudo chown -R root:root "$LOGGER_DIR/ipgyro"
+    # Do not ship __pycache__ bytecode (regenerated by Python at first run;
+    # avoids stale pyc compiled by a different interpreter).
+    sudo find "$LOGGER_DIR/ipgyro" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
     sudo install -m644 "$SOURCE_LOGGER_DIR/ip-gyro-logger.service" "$LOGGER_UNIT"
+    # A1 — install /etc/ip-gyro-logger/config.toml from the bundle template
+    # (fresh copy or append-only-missing-keys) BEFORE the unit is (re)started,
+    # so the logger reads the config on its first run after the upgrade.
+    install_logger_config
     sudo systemctl daemon-reload
     # ALWAYS replace a previously-running logger (its old code stays loaded in
     # memory otherwise): 'enable --now' only starts a stopped unit and does NOT
@@ -259,7 +411,9 @@ install_logger() {
     sudo systemctl enable ip-gyro-logger.service
     sudo systemctl restart ip-gyro-logger.service
     echo
-    echo "Diagnostic logger enabled (runs as root via ip-gyro-logger.service)."
+    echo "Diagnostic logger v3.7 enabled (runs as root via ip-gyro-logger.service)."
+    echo "  Install dir: $LOGGER_DIR (launcher + ipgyro/ package)"
+    echo "  Config:      $LOGGER_CFG_FILE"
     echo "  Log file:  $LOGGER_LOG"
     echo "  Journal:   journalctl -u ip-gyro-logger"
 }
@@ -275,11 +429,62 @@ remove_logger() {
     echo "  The diagnostic logger is not installed (unit, files and log removed)."
 }
 
+# ---------------------------------------------------------------------------
+# Journald retention + logrotate for the diagnostic log (observability).
+# Installed ALWAYS (plain AND --log): journald storage is bounded and the
+# growing /var/log/ip-gyro-logger.log is rotated, so diagnostic evidence
+# survives (design doc MIGRATION.md §8).
+# ---------------------------------------------------------------------------
+JOURNALD_DROPIN_DIR="/etc/systemd/journald.conf.d"
+JOURNALD_DROPIN_FILE="$JOURNALD_DROPIN_DIR/99-ip-gyro-retention.conf"
+SOURCE_JOURNALD_DROPIN="$BASE_DIR/journald-99-ip-gyro-retention.conf"
+LOGROTATE_FILE="/etc/logrotate.d/ip-gyro-logger"
+SOURCE_LOGROTATE="$BASE_DIR/logrotate-ip-gyro-logger"
+
+install_log_retention() {
+    echo
+    echo "Installing journald retention + logrotate (observability)..."
+    if [[ -f "$SOURCE_JOURNALD_DROPIN" ]]; then
+        sudo mkdir -p "$JOURNALD_DROPIN_DIR"
+        sudo install -m644 "$SOURCE_JOURNALD_DROPIN" "$JOURNALD_DROPIN_FILE"
+        echo "  journald retention: $JOURNALD_DROPIN_FILE"
+    else
+        echo "WARNING: $SOURCE_JOURNALD_DROPIN not found next to install.sh."
+        echo "         Journald retention was NOT installed."
+    fi
+    if [[ -f "$SOURCE_LOGROTATE" ]]; then
+        sudo install -m644 "$SOURCE_LOGROTATE" "$LOGROTATE_FILE"
+        echo "  logrotate:          $LOGROTATE_FILE"
+    else
+        echo "WARNING: $SOURCE_LOGROTATE not found next to install.sh."
+        echo "         Logrotate for the logger log was NOT installed."
+    fi
+    # Best-effort apply of the new limits; never abort the install.
+    sudo systemctl restart systemd-journald 2>/dev/null || true
+    sudo journalctl --vacuum-size=512M 2>/dev/null || true
+}
+
+# Counterpart for a future/remove flow: reverts the two files above. This
+# install.sh has no uninstall mode, so it is defined for symmetry only and is
+# deliberately NOT called here — retention stays installed in every mode.
+remove_log_retention() {
+    echo
+    echo "Removing journald retention + logrotate..."
+    sudo rm -f "$JOURNALD_DROPIN_FILE"
+    sudo rm -f "$LOGROTATE_FILE"
+    sudo systemctl restart systemd-journald 2>/dev/null || true
+    echo "  Journald retention and logrotate removed."
+}
+
 if [[ "$LOG_MODE" -eq 1 ]]; then
     install_logger
 else
     remove_logger
 fi
+
+# Observability is installed in BOTH modes (plain install and --log): retention
+# must survive regardless of whether the diagnostic logger is enabled.
+install_log_retention
 
 echo
 echo "Service status: $(systemctl is-active inputplumber)"
