@@ -88,9 +88,15 @@ def _capture_pre_sleep_baseline():
     honestly say "gyro reached the pad before sleep, and does/does not after
     wake while buttons keep flowing". Reads the current per-second pad counters
     (they are only reset by the next pad_verdict_scan, so they reflect the last
-    second of real delivery)."""
+    second of real delivery).
+    v3.13 (todo 52t): also captures the pre-sleep STEAM focus (the active
+    controller-config AppID + kind), so after wake the flow logic can PROVE
+    [STEAM-FOCUS-DROP-AFTER-WAKE] when a game was Steam-focused before the
+    freeze but the config focus is desktop after wake (Wake#2's routing loss)."""
     S.PRE_SLEEP_BTN = (S.PAD_KEY_COUNT > 0 or S.PAD_STICK_COUNT > 0)
     S.PRE_SLEEP_GYRO = S.PAD_GYRO_AXIS_COUNT > 0
+    S.PRE_SLEEP_FOCUS_APPID = S.STEAM_FOCUS_APPID
+    S.PRE_SLEEP_FOCUS_KIND = S.STEAM_FOCUS_KIND
 
 
 def _pm_emit(line):

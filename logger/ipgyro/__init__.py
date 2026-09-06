@@ -107,6 +107,26 @@ user ground-truth corrections fixed the v3.11 lies at their SOURCE:
     (ipgyro.evreader: stable identity, churn-following reopen, independent
     bounded non-blocking reader); the physical XInput hop stays raw-hidraw.
     python-evdev is optional (falls back to the raw devices.py capture).
+
+v3.13 (todo 52t) — PER-HOP FLOW PROOF. The user rejects the v3.12 «не
+доказуемо» cell for the wake-loss (gyro stops in-game after wake) and demands
+the logger PROVE WHERE in the chain the gyro (and any data type) is lost, hop
+by hop, with evidence on every line. New ipgyro.flow models the H0-H3 chain
+per data type: H0 physical source (center-body IMU in the XInput right_gyro
+slot / right-handle 17ef:61ed) -> H1 deck->Steam (deck mot/s + act/s) -> H2
+Steam ROUTING (active controller config/focus = the running game AppID vs
+desktop 413080 — the routing hop) -> H3 Steam pad 28de:11ff -> the game reader
+(gyro-axis ABS_RX/ABS_RY / pad_key / pad_abs). New markers: [GYRO-FLOW]/
+[BTNS-FLOW]/[STX-FLOW] (per-hop verdicts naming the FIRST lost hop with quoted
+evidence), the compact [FLOW ...] snapshot line, [STEAM-FOCUS-LOST-GAME] (a
+running game is detectable but Steam's config focus is not that game — a
+PROVEN routing loss, never vague), and [STEAM-FOCUS-DROP-AFTER-WAKE] (game was
+Steam-focused before sleep, config focus is desktop after wake — the loss is
+attributed to wake + routing, never to detach). [PAD-DEAD] now ACCUMULATES the
+required consecutive quiet seconds and is suppressed when H2 routing is
+desktop. SNAPSHOT adds pad_gyro/s, the real game process (game_reader=eso64.exe)
+vs the pad-fd holder (pad_holder=winedevice.exe), and the flow= chain. New
+markers only ADD; every existing marker token stays byte-compatible.
 """
 
-__version__ = "v3.12"
+__version__ = "v3.13"

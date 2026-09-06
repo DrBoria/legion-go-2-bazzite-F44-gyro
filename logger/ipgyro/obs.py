@@ -24,6 +24,7 @@ Shared mutable state is ALWAYS accessed as S.<name> (see ipgyro.state).
 """
 
 import os
+import re
 import time
 
 import threading
@@ -35,6 +36,7 @@ from .conf import (DECK_MODE_WORDS, FULL_MODE_GAME, FULL_MODE_POST,
                    FULL_MODE_WAKE, LOOP_STALL_HB, LOOP_STALL_LOG_S,
                    MODE_TAG_WORDS, PAD_DELIVERY_HB, PAD_STALL_S,
                    REGRAB_MISSING_S, SESS_INTERVAL, WAKE_GYRO_COMPARE_S)
+from .flow import flow_refresh, flow_scan
 from .hidraw import _hid_label
 from .logcore import log, run_cmd
 
@@ -230,12 +232,23 @@ def snapshot_state(reason):
         sleep_s = "awake"
         if S.SLEEP_LAST_DUR is not None:
             sleep_s += f"+{S.SLEEP_LAST_DUR:.0f}s"
-    # -- real game reader (FIX: <pid>:<name>) ---------------------------------
-    if S.PAD_GAME_READER_PID is not None:
-        gr = f"{S.PAD_GAME_READER_PID}:{S.PAD_GAME_READER_NAME or '?'}"
-    else:
-        gr = "none"
+    # -- real game process (FIX) + pad fd holder (v3.13 split) ----------------
+    # v3.13 (todo 52t #6): game_reader= now reports the REAL running game
+    # process (e.g. eso64.exe — resolved from S.STEAM_PROC_SET minus Proton/wine
+    # helpers); pad_holder= is the process ACTUALLY holding the pad fd (e.g.
+    # winedevice.exe) — the proof-of-delivery reader behind [PAD→GAME].
+    _mpid, _mname = _main_game_proc()
+    gr = f"{_mpid}:{_mname}" if _mpid is not None else "none"
+    _hpid, _hname = _pad_holder()
+    holder = f"{_hpid}:{_hname}" if _hpid is not None else "none"
     gyro_carrier = S.GYRO_SRC_CARRIER or "unknown"
+    # refresh the per-hop flow compact line (never raises) so a grep of this
+    # snapshot alone shows the whole H0-H3 chain health (v3.13 #4).
+    try:
+        flow_refresh(time.monotonic())
+    except Exception:
+        pass
+    flow_s = S.FLOW_COMPACT or "-"
     log(f"[SNAPSHOT] reason={reason} mode={mode} "
         f"controller=[{','.join(controller) or '-'}] "
         f"virtual=[{','.join(virtual) or '-'}] "
@@ -247,8 +260,9 @@ def snapshot_state(reason):
         f"deck_keepalive={'yes' if S.DECK_KEEPALIVE else 'no'} "
         f"pad_node={pad_node} "
         f"deck_rd/s={S.DECK_RD_COUNT} pad_key/s={S.PAD_KEY_COUNT} "
-        f"pad_abs/s={S.PAD_ABS_COUNT} "
-        f"game_reader={gr} gyro_map={S.PAD_GYRO_MAP or 'unknown'} "
+        f"pad_abs/s={S.PAD_ABS_COUNT} pad_gyro/s={S.PAD_GYRO_AXIS_COUNT} "
+        f"game_reader={gr} pad_holder={holder} "
+        f"gyro_map={S.PAD_GYRO_MAP or 'unknown'} flow={flow_s} "
         f"sleep={sleep_s}")
 
 
@@ -311,6 +325,70 @@ def _proc_comm(pid):
             return f.read().strip() or ""
     except Exception:
         return ""
+
+
+# v3.13 (todo 52t #6) — the REAL running game process (e.g. eso64.exe) vs the
+# process holding the pad fd (e.g. winedevice.exe). _game_reader_pid() resolves
+# the pad-fd READER (for Proton games that is a wine child that inherited the
+# pad fd); the actual game binary sits in S.STEAM_PROC_SET under the same
+# SteamAppId. These helpers separate the two for the SNAPSHOT game_reader= /
+# pad_holder= fields.
+_HELPER_TOKENS = frozenset((
+    "wine", "wineserver", "winedevice", "wineboot", "wineconsole", "winecfg",
+    "explorer", "steamwebhelper", "reaper", "proton", "services", "plugplay",
+    "rundll32", "start", "conhost", "crashpad", "steamclient", "steam",
+    "bash", "sh", "python", "gamemode", "steamdeck", "vrserver",
+))
+
+
+def _looks_helper(comm):
+    """True when a process comm is a Steam/Proton/wine/helper rather than the
+    actual game binary (eso64.exe is NOT a helper; winedevice.exe IS)."""
+    name = (comm or "").lower().replace(" ", "")
+    if not name:
+        return True
+    if name in ("steam",):
+        return True
+    return any(tok in name for tok in _HELPER_TOKENS)
+
+
+def _main_game_proc():
+    """(v3.13) Return (pid, comm) of the REAL running game process from
+    S.STEAM_PROC_SET (pid -> (appid, name, cmd)), filtered to the appid of the
+    resolved game reader when available and excluding Proton/wine/Steam helper
+    processes — e.g. (54802, 'eso64.exe'). Purely /proc-derived (never a
+    hardcoded game name). Returns (None, '') when no game process is
+    detectable."""
+    want = S.PAD_GAME_READER_APPID
+    best = (None, "")
+    for pid in sorted(S.STEAM_PROC_SET):
+        appid, name, _cmd = S.STEAM_PROC_SET[pid]
+        if want and appid != want:
+            continue
+        if _looks_helper(name):
+            continue
+        if best[0] is None or len(name or "") > len(best[1] or ""):
+            best = (pid, name or "?")
+    if best[0] is None:      # fallback: no reader-appid filter
+        for pid in sorted(S.STEAM_PROC_SET):
+            _appid, name, _cmd = S.STEAM_PROC_SET[pid]
+            if _looks_helper(name):
+                continue
+            if best[0] is None or len(name or "") > len(best[1] or ""):
+                best = (pid, name or "?")
+    return best
+
+
+def _pad_holder():
+    """(v3.13) Return (pid, comm) of the actual process holding the pad fd
+    (/proc/<pid>/fd -> the pad node), e.g. (54485, 'winedevice.exe') — the
+    proof-of-delivery reader behind [PAD→GAME]. The REAL game process is
+    _main_game_proc(); for Proton games the fd holder is a wine child."""
+    readers = sorted(S.PAD_READER_PIDS)
+    if not readers:
+        return None, ""
+    pid = readers[0]
+    return pid, _proc_comm(pid) or "?"
 
 
 def _game_reader_pid():
@@ -558,18 +636,34 @@ def pad_verdict_scan(now):
                         f"(different virtual node); NOT provable through the "
                         f"pad host-side")
     else:
-        # -- [PAD-DEAD]: pad + game reader + deck delivering, zero pad EV -----
+        # -- [PAD-DEAD] (v3.13 fix #5): STRONG pad-dead only. The v3.12 branch
+        # fired on the FIRST quiet 1 s scan although the text promised
+        # PAD_STALL_S=5 consecutive seconds. Now the stall ACCUMULATES the
+        # required consecutive quiet seconds (S.PAD_STALL_SECS) before firing,
+        # and [PAD-DEAD] is NOT emitted when H2 routing is desktop (that is a
+        # routing state handled by [STEAM-FOCUS-LOST-GAME], not a pad-dead
+        # state). Only a STRONG [PAD-DEAD] (game config active + game reader
+        # present + deck delivering + PAD_STALL_REQ consecutive seconds of 0
+        # pad events) fires.
+        routing_desktop = (S.STEAM_FOCUS_KIND in ("769", "413080", "OTHER")
+                           or S.STEAM_FOCUS_KIND is None)
         if (game_reader is not None and pad_node and deck_rd > 0
-                and pad_ev == 0):
-            if not S.PAD_DEAD_LOGGED or now - S.PAD_DEAD_LAST >= PAD_DELIVERY_HB:
-                S.PAD_DEAD_LOGGED = True
-                S.PAD_DEAD_LAST = now
-                log(f"[PAD-DEAD] pad {pad_node} present + game "
-                    f"{game_reader}:{S.PAD_GAME_READER_NAME or '?'} holds it + "
-                    f"deck delivering {deck_rd} rd/s but ZERO pad EV events for "
-                    f"{PAD_STALL_S:.0f}s — game dropped the device and never "
-                    f"re-acquired (Valve steam-for-linux#13029)")
+                and pad_ev == 0 and not routing_desktop):
+            S.PAD_STALL_SECS += 1
+            if S.PAD_STALL_SECS >= PAD_STALL_S:
+                if not S.PAD_DEAD_LOGGED or \
+                        now - S.PAD_DEAD_LAST >= PAD_DELIVERY_HB:
+                    S.PAD_DEAD_LOGGED = True
+                    S.PAD_DEAD_LAST = now
+                    log(f"[PAD-DEAD] pad {pad_node} present + game "
+                        f"{game_reader}:{S.PAD_GAME_READER_NAME or '?'} holds "
+                        f"it + deck delivering {deck_rd} rd/s but ZERO pad EV "
+                        f"events for {S.PAD_STALL_SECS:.0f} consecutive s "
+                        f"(game config active, focus={S.STEAM_FOCUS_KIND}) — "
+                        f"game dropped the device and never re-acquired "
+                        f"(Valve steam-for-linux#13029)")
         else:
+            S.PAD_STALL_SECS = 0
             S.PAD_DEAD_LOGGED = False
 
     # -- (FIX-C) once-per-wake gyro-vs-button compare -------------------------
@@ -580,6 +674,15 @@ def pad_verdict_scan(now):
             _wake_gyro_compare(now)
         except Exception:
             pass
+
+    # -- (v3.13) per-hop flow proof: [GYRO-FLOW]/[BTNS-FLOW]/[STX-FLOW]/
+    #    [FLOW]/[STEAM-FOCUS-LOST-GAME]/[STEAM-FOCUS-DROP-AFTER-WAKE].
+    #    Runs on the same 1 s cadence (after the wake-compare so the pre-sleep
+    #    focus baseline is already captured). Never raises.
+    try:
+        flow_scan(now)
+    except Exception as e:
+        log(f"LOGGER: flow scan error: {e}")
 
     # -- reset the per-second pad counters (consumed by the next snapshot) ----
     S.PAD_EV_COUNT = 0

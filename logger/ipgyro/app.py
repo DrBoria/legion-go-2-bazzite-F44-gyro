@@ -295,6 +295,19 @@ def main():
         "[GYRO-REGAINED]/[GYRO-STALL-AFTER-WAKE] at the wake boundary, never "
         "detach); REAL game pid (game_reader=<pid>:<name> via SteamAppId + "
         "wine/proton tree); python-evdev backbone for the pad hop (evreader.py)")
+    log("LOGGER: v3.13 todo-52t PER-HOP FLOW PROOF active — proves WHERE the "
+        "gyro (and any data type) is lost, hop by hop, never «не доказуемо» "
+        "when a game runs: H0 physical source -> H1 deck->Steam -> H2 Steam "
+        "ROUTING config (game AppID vs desktop 413080) -> H3 Steam pad "
+        "28de:11ff -> game reader. [GYRO-FLOW]/[BTNS-FLOW]/[STX-FLOW] name the "
+        "FIRST lost hop with quoted evidence; compact [FLOW ...] per-snapshot "
+        "chain; [STEAM-FOCUS-LOST-GAME] (game running but Steam config focus "
+        "!= game appid — PROVEN routing loss); [STEAM-FOCUS-DROP-AFTER-WAKE] "
+        "(game Steam-focused before sleep, desktop after wake — loss at wake + "
+        "routing, never detach). [PAD-DEAD] now accumulates consecutive quiet "
+        "seconds + is suppressed when routing=desktop. SNAPSHOT adds pad_gyro/s, "
+        "real game process (game_reader=eso64.exe) vs pad-fd holder "
+        "(pad_holder=winedevice.exe), and the flow= chain")
 
     # (v3.8 F2) close the startup blind window ONCE, before the cadence loop:
     # replay the physical-source churn the udev thread recorded during init and

@@ -281,10 +281,39 @@ PRE_SLEEP_BTN = None        # None|bool: pad buttons flowing just before sleep
 PRE_SLEEP_GYRO = None       # None|bool: pad gyro axes flowing just before sleep
 GYRO_IS_LIVE = None         # per-source verdict: the physical gyro live now
 GYRO_SRC_CARRIER = None     # which physical gyro carries it (center/right-handle)
+# v3.13 — pre-sleep STEAM FOCUS (captured at [SLEEP-ENTER]): whether the GAME
+# was the Steam-Input active config before the freeze, so the post-wake flow
+# logic can PROVE [STEAM-FOCUS-DROP-AFTER-WAKE] (focus:<game>->:desktop) — the
+# loss is attributed to wake + routing, never to detach, never vague.
+PRE_SLEEP_FOCUS_APPID = None    # pre-sleep Steam focused AppID (e.g. '306130')
+PRE_SLEEP_FOCUS_KIND = None     # pre-sleep focus kind ('GAME'|'769'|'413080'...)
 # python-evdev reader liveness (evreader.py owns the pad node when active).
 EVREADER_ON = False         # True while the evdev pad reader thread is active
 EVREADER_ERR = ""           # last python-evdev reader error ('' = clean)
 EVREADER_STARTED = False    # True once start_evreader() ran (even if evdev off)
+
+# ---------------------------------------------------------------------------
+# v3.13 (todo 52t) — PER-HOP FLOW PROOF shared state (ipgyro.flow).
+# ---------------------------------------------------------------------------
+# [PAD-DEAD] honest accumulation: the pad-stall latch counts CONSECUTIVE quiet
+# seconds (pad present + game reader + deck delivering + zero pad EV) and fires
+# [PAD-DEAD] only after PAD_STALL_REQ consecutive seconds — never on the first
+# quiet 1 s scan, and never while H2 routing is desktop (that is a routing
+# state handled by [STEAM-FOCUS-LOST-GAME], not a pad-dead state).
+PAD_STALL_SECS = 0          # consecutive quiet seconds accumulated for [PAD-DEAD]
+# Flow-scan anti-spam / change-detection latches (ipgyro.flow).
+FLOW_STATE = {}             # dtype -> last per-hop verdict key (change detect)
+FLOW_COMPACT = ""           # last compact flow line (SNAPSHOT flow= field)
+FLOW_LAST_GAME_CTX = False  # True while the last scan had a game context
+FLOW_LAST_LOG = 0.0         # monotonic last compact [FLOW] log (anti-spam)
+FLOW_WAKE_LOGGED = 0.0      # monotonic of the wake the verbose flow was logged
+FOCUS_LOST_ACTIVE = False   # [STEAM-FOCUS-LOST-GAME] state latch (routing lost)
+FOCUS_LOST_LAST = 0.0       # monotonic last [STEAM-FOCUS-LOST-GAME] log
+FOCUS_DROP_LOGGED = 0.0     # monotonic of the wake [STEAM-FOCUS-DROP] logged
+# Snapshot resolution: the REAL game process (e.g. eso64.exe) vs the pad-fd
+# holder (e.g. winedevice.exe) — refreshed by obs.snapshot_state.
+MAIN_GAME_PID = None        # pid of the real running game process (or None)
+MAIN_GAME_NAME = ""         # comm of the real game process (e.g. eso64.exe)
 
 # ---------------------------------------------------------------------------
 # Shutdown flag (set by logcore._signal_handler, read by every daemon loop)

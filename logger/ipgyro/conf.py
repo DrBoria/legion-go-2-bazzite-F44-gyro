@@ -153,7 +153,7 @@ DECK_DRAIN_MAX = 16         # max frames coalesced from one deck burst drain
 #  2026-09-05 on user request; the full contract now lives in Agent.md,
 #  section "2026-09-05 ~22:3x — V22 ДИЗАЙН-ДОКУМЕНТ ...".)
 # ---------------------------------------------------------------------------
-LOG_VERSION = "v3.12"
+LOG_VERSION = "v3.13"
 
 # ---------------------------------------------------------------------------
 # v3.12 (todo 52r) — truthful mode/sleep/per-source delivery cadences.
@@ -172,6 +172,23 @@ PM_KERNEL_WINDOW = 120      # journalctl -k --since window for the backstop
 # pre-sleep pad gyro/button baseline against the first WAKE_GYRO_COMPARE_S of
 # post-wake pad flow and emit [GYRO-REGAINED]/[GYRO-STALL-AFTER-WAKE].
 WAKE_GYRO_COMPARE_S = 8.0   # seconds after wake to judge gyro regain/stall
+
+# ---------------------------------------------------------------------------
+# v3.13 (todo 52t) — PER-HOP FLOW PROOF cadences. The logger must PROVE WHERE
+# in the chain the gyro (and any data type) is lost, hop by hop, with evidence
+# on every line — never «не доказуемо» when a game is running and detectable.
+# H0 physical source -> H1 deck->Steam -> H2 Steam routing config (the game
+# AppID vs desktop 413080) -> H3 Steam pad 28de:11ff -> the game reader.
+# ---------------------------------------------------------------------------
+FLOW_MIN_LOG = 5.0          # min seconds between repeated compact [FLOW] lines
+FLOW_CHANGE_MIN = 2.0       # min seconds between repeated per-type verbose
+                            # [*FLOW] markers on a state-flapping transition
+WAKE_FLOW_S = 3.0           # per-hop flow verdict emitted ~2-5 s after wake
+FOCUS_LOST_HB = 10.0        # [STEAM-FOCUS-LOST-GAME] re-assert while held
+                            # (the routing proof stays loud, not a one-shot)
+PAD_STALL_REQ = 5.0         # [PAD-DEAD] needs PAD_STALL_REQ CONSECUTIVE quiet
+                            # seconds (accumulated), matching the old text; the
+                            # v3.12 bug fired on the FIRST quiet second.
 
 # v3.9 (todo 52f FIX-1 CLEAR NAMING): the HUMAN vocabulary every log/config
 # shows. Internal role/deck_kind keys (discover.py), mode internals and marker
