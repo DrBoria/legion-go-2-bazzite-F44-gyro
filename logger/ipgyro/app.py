@@ -40,8 +40,8 @@ from .hidraw import emit_hid_summary, handle_hidraw, scan_hidraw
 from .iio import discover_iio, sample_iio
 from .ipj import ipj_backlog, ipj_tail_loop
 from .logcore import _signal_handler, log, maybe_rotate, run_cmd
-from .obs import (_full_mode, pm_probe, pm_wake_check, startup_reconcile,
-                  state_tracker)
+from .obs import (_full_mode, loop_stall_watchdog_loop, pm_probe,
+                  pm_wake_check, startup_reconcile, state_tracker)
 from .pm import pm_backlog, pm_journal_loop
 from .steam import steam_scan, steam_state_verdict
 from .udev import udev_monitor_loop
@@ -83,7 +83,18 @@ def _load_config():
         "IPJ_WATCHDOG_S": "ipj_watchdog", "IPJ_LIVE_HB_S": "ipj_live",
         "GYRO_SRC_INTERVAL": "gyro_src", "DEV_INV_HB": "dev_inv",
         "PM_FOLLOW_HB": "pm_follow",
+        # v3.10 (todo 52l) sleep-in-game visibility tunables (D1-D7)
+        "WAKE_BURST_S": "wake_burst", "WAKE_BURST_IV": "wake_burst_iv",
+        "WAKE_REASSERT_S": "wake_reassert", "REGRAB_MISSING_S": "regrab_missing",
+        "LOOP_STALL_LOG_S": "loop_stall_log", "LOOP_STALL_HB": "loop_stall_hb",
+        "IPJ_WAKE_FLUSH_S": "ipj_wake_flush",
     })
+    # D3 — the two [GYRO-FEED] verdict instants come from two config keys.
+    try:
+        C.GYRO_FEED_S = (float(cfg.num("cadence", "gyro_feed_1")),
+                         float(cfg.num("cadence", "gyro_feed_2")))
+    except Exception:
+        pass
     _apply("full_mode", {
         "FULL_MODE_POST": "post", "FULL_MODE_WAKE": "wake",
         "FULL_MODE_GAME": "game",
@@ -181,6 +192,10 @@ def main():
     # (R6) reliable systemd-suspend journal follower for [SLEEP-ENTER]/[SLEEP-WAKE]
     pm_backlog()
     threading.Thread(target=pm_journal_loop, daemon=True).start()
+    # (D7) loop-stall watchdog thread: reports [LOOP-STALL] when the cadence
+    # loop produces nothing for >LOOP_STALL_LOG_S (a stall is logged as a cause
+    # rather than appearing only as missing data).
+    threading.Thread(target=loop_stall_watchdog_loop, daemon=True).start()
     log("LOGGER: v2 channels active — generic role registry (physical-source + "
         "deck-output by capability/transport), InputPlumber journal, Steam "
         "registry + controller log")
@@ -228,6 +243,14 @@ def main():
         "words gaming-mode|desktop, steady-state wording, controller=/virtual= "
         "snapshot fields; [SLEEP-ENTER]/[SLEEP-WAKE] only on journal-confirmed "
         "suspend/resume (no false wakes on main-loop stalls)")
+    log("LOGGER: v3.10 todo-52l sleep-in-game visibility active — D1 root fix "
+        "(non-blocking stdout mirror: a full journald pipe drops lines instead "
+        "of freezing the whole process), D2 dense post-wake burst thread "
+        "([WAKE-BURST] @0.1s for 30-60s, independent of the cadence loop), D3 "
+        "[GYRO-FEED] deck/physical/center verdicts at ~2s/~10s after wake, D4 "
+        "[REGRAB-MISSING] watchdog after dock, D5 [IPJ-WAKE] wake-ordered flush "
+        "(real journal ts + arrival delay), D6 post-wake [CEN-IMU]/[GYRO-SRC] "
+        "@1s + [RE-ENUM] on interface change, D7 [LOOP-STALL] watchdog thread")
 
     # (v3.8 F2) close the startup blind window ONCE, before the cadence loop:
     # replay the physical-source churn the udev thread recorded during init and

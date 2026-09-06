@@ -88,6 +88,17 @@ def _drop_hid(node):
     S.HID_DEVICES.pop(node, None)
 
 
+def _refresh_phys_id():
+    """(v3.10 D6) Refresh S.PHYS_ID_LAST to the CURRENT healthy physical-source
+    identity (sorted human labels, e.g. 'controller@1.1,controller@1.2'). Called
+    while the physical source is present so a later [DETACH] captures the exact
+    interface set that left; a dock that returns as a DIFFERENT set is then
+    flagged [RE-ENUM] by obs.reenum_check."""
+    phys = sorted(_hid_label(e) for e in S.HID_DEVICES.values()
+                  if e.get("role") == D.ROLE_PHYSICAL)
+    S.PHYS_ID_LAST = ",".join(phys) if phys else None
+
+
 # ---------------------------------------------------------------------------
 # Discovery + open/close
 # ---------------------------------------------------------------------------
@@ -172,6 +183,10 @@ def scan_hidraw():
         S.STARTUP_BASELINE_TS = time.monotonic()
     elif S.PHYS_STATE and not phys_now:
         S.PHYS_STATE = False
+        # (v3.10 D6) remember the physical identity at detach so a dock that
+        # returns as a DIFFERENT interface (controller@1.1 -> controller@1.3,
+        # IMU ts reset, state=(attached,detached)) is logged as [RE-ENUM].
+        S.PHYS_ID_BEFORE_DETACH = S.PHYS_ID_LAST
         # G2 owner tag + (v3.8 F1/F3) mode=desktop|game from a FORCED fresh
         # Steam poll (live focus AppID / active Steam-Input window + proc set,
         # transport only as fallback), so a desktop detach tags desktop even
@@ -184,10 +199,19 @@ def scan_hidraw():
         S.PHYS_STATE = True
         phys_n = sum(1 for e in S.HID_DEVICES.values()
                      if e["role"] == D.ROLE_PHYSICAL)
+        # (v3.10 D6) refresh the healthy physical identity and, if it differs
+        # from the one that detached, emit [RE-ENUM] (device identity changed
+        # across the wake/detach).
+        _refresh_phys_id()
+        O.reenum_check(now)
         # G2 owner tag + (v3.8 F1/F3) fresh Steam context (see [DETACH] above).
         mode_tag = O._live_mode_tag(force=True)
         log(O._dock_marker(mode_tag, phys_n))
         O._mark_dock(now)
+    else:
+        # physical source present and unchanged: keep the healthy identity fresh
+        # so a later detach captures the CURRENT interface, not a stale one.
+        _refresh_phys_id()
     return found
 
 

@@ -30,6 +30,7 @@ from .conf import (
     IPJ_SILENT_COOLDOWN,
     IPJ_SUSPEND_RE,
     IPJ_WATCHDOG_S,
+    IPJ_WAKE_FLUSH_S,
 )
 from .logcore import log, run_cmd
 
@@ -73,6 +74,43 @@ def _ipj_emit(line):
     else:
         log("IPJ: " + line.strip())
 
+
+def ipj_wake_flush(wake_mono):
+    """(D5, v3.10) Flush the InputPlumber journal once at a [SLEEP-WAKE]: scan a
+    short window ending at the wake instant and mirror any arbiter / gyro-center
+    / IMU source-switch lines the -f follower delivered LATE across resume
+    (journald can buffer lines written while the process was frozen). Each line
+    is logged with its REAL journal timestamp AND the logger arrival delay, so
+    flip-flops like the 13:02:08 keep / 13:02:11 filter gyro_center decisions
+    are correlated to the wake instant, not 11-14 s late. Idempotent per wake
+    (S.IPJ_WAKE_FLUSHED)."""
+    from .conf import GYRO_SRC_RE, IPJ_RE  # local: keep module deps flat
+    now = time.monotonic()
+    if now - S.IPJ_WAKE_FLUSHED < 5.0:
+        return
+    S.IPJ_WAKE_FLUSHED = now
+    window = IPJ_WAKE_FLUSH_S
+    out = run_cmd(["journalctl", "-u", "inputplumber", "-n", "400",
+                   "--no-pager", "-o", "short-iso",
+                   f"--since=-{int(window)}s"], timeout=8)
+    if not out:
+        return
+    n = 0
+    for line in out.splitlines():
+        low = line.lower()
+        if not (IPJ_RE.search(low) or GYRO_SRC_RE.search(low)):
+            continue
+        # the journal line already carries its real timestamp as the first
+        # token (short-iso: "2026-09-06T13:02:08+02:00 host ..."); the logger
+        # arrival delay is measured from the wake instant.
+        jts = line.split(" ", 1)[0] if line else "?"
+        delay = now - wake_mono
+        log(f"[IPJ-WAKE] journal_ts={jts} arrival_delay=+{delay:.1f}s "
+            f"{line.strip()}")
+        n += 1
+    if n:
+        log(f"[IPJ-WAKE] flushed {n} delayed InputPlumber line(s) at wake "
+            f"(wake-ordered; real journal ts + logger arrival delay)")
 
 def ipj_backlog():
     """One-shot recent journal backlog, logged at startup for context."""

@@ -88,6 +88,16 @@ _STALE_DECK_PIDS = (0x12FB,)
 _SNIFF_WAIT = 0.4
 _SNIFF_TRIES = 20
 
+# (v3.10 D1 ROOT-CAUSE FIX) codec-sniff cache: a node's codec is immutable while
+# the node exists, so sniff it ONCE (the first time it is seen) and reuse the
+# binding on every later scan. Without this, sniff_roles() re-opens EVERY hidraw
+# and select()-waits up to _SNIFF_WAIT*_SNIFF_TRIES = 8 s per quiet node on EVERY
+# scan_hidraw() (every SNAP_INTERVAL=3 s) — the real cause of the ~30 s
+# whole-loop stall that the stdout fix alone could not remove. The cache is
+# keyed by the /dev/hidrawN path; entries are dropped when a node disappears
+# (scan_hidraw_nodes no longer lists it), so a re-plugged device re-sniffs.
+_SNIFF_CACHE = {}
+
 
 # ---------------------------------------------------------------------------
 # Low-level: enumerate every /sys/class/hidraw node with transport+identity
@@ -237,10 +247,22 @@ def _entry_for(info, role, deck_kind, labels):
 
 def _sniff_codec(path):
     """Open a hidraw read-only and wait briefly for one frame; return the bound
-    (codec_name, first_raw) or (None, None). Non-blocking, bounded, safe."""
+    (codec_name, first_raw) or (None, None). Non-blocking, bounded, safe.
+
+    (v3.10 D1 ROOT-CAUSE FIX) The result is CACHED per path: a node's codec is
+    immutable while the node exists, so the expensive select()-wait (up to
+    _SNIFF_WAIT*_SNIFF_TRIES = 8 s per quiet node) runs only ONCE per node. Every
+    later scan_hidraw() (every SNAP_INTERVAL=3 s) returns the cached binding
+    instantly instead of re-blocking the whole cadence loop ~30 s. sniff_roles()
+    drops cache entries for nodes that are no longer enumerated, so a re-plugged
+    device re-sniffs."""
+    hit = _SNIFF_CACHE.get(path)
+    if hit is not None:
+        return hit
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError:
+        _SNIFF_CACHE[path] = (None, None)
         return None, None
     try:
         for _ in range(_SNIFF_TRIES):
@@ -257,12 +279,15 @@ def _sniff_codec(path):
             if chunk:
                 raw = chunk[:64]
                 name, _dec = CODECS.sniff(raw)
-                return (name, raw) if name else (None, None)
+                res = (name, raw) if name else (None, None)
+                _SNIFF_CACHE[path] = res
+                return res
     finally:
         try:
             os.close(fd)
         except Exception:
             pass
+    _SNIFF_CACHE[path] = (None, None)
     return None, None
 
 
@@ -314,6 +339,15 @@ def sniff_roles(labels=None):
     nodes = scan_hidraw_nodes()
     for info in nodes:
         info["name"] = _paired_name(_paired_entries(info, proc_map))
+
+    # (v3.10 D1) drop sniff-cache entries for nodes that are no longer present,
+    # so a re-plugged device (new /dev/hidrawN) re-sniffs instead of reusing a
+    # stale binding. Cheap: only runs when the enumerated set actually shrank.
+    live_paths = {info["path"] for info in nodes}
+    if len(_SNIFF_CACHE) != len(live_paths):
+        for p in list(_SNIFF_CACHE.keys()):
+            if p not in live_paths:
+                _SNIFF_CACHE.pop(p, None)
 
     registry = {}
     # pass 1: authoritative codec sniff -> confirmed roles

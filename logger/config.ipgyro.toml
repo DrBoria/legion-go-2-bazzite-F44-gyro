@@ -42,6 +42,17 @@ ipj_live = 15.0       # periodic [IPJ-LIVE] heartbeat while healthy
 gyro_src = 5.0        # periodic [GYRO-SRC] verdict cadence
 dev_inv = 60.0        # periodic [DEV-INV] re-assert cadence
 pm_follow = 60.0      # [PM-LIVE] heartbeat cadence
+# v3.10 (todo 52l) — sleep-in-game visibility (D1-D7). All post-wake dense
+# capture runs in a dedicated wake thread INDEPENDENT of the cadence loop.
+wake_burst = 60.0     # dense post-wake capture window (30-60s) after [SLEEP-WAKE]
+wake_burst_iv = 0.1   # dense deck/physical/IIO sampling cadence in the burst (10 Hz)
+gyro_feed_1 = 2.0     # first [GYRO-FEED] "did the gyro feed resume" verdict (~2s)
+gyro_feed_2 = 10.0    # second [GYRO-FEED] verdict (~10s)
+wake_reassert = 30.0  # post-wake [CEN-IMU]/[GYRO-SRC] re-assert window (@1s)
+regrab_missing = 15.0 # [DOCK] -> no [STEAM-REGRAB]/[DECK-ALIVE] -> [REGRAB-MISSING]
+loop_stall_log = 10.0 # main loop silent this long -> [LOOP-STALL]
+loop_stall_hb = 15.0  # re-assert a continuing [LOOP-STALL] only this often
+ipj_wake_flush = 8.0  # journal window flushed once at wake to catch delayed lines
 
 [full_mode]
 # (e) full-capture window: held this long after the last transition.

@@ -160,6 +160,35 @@ CFG = None                  # ipgyro.config.Cfg (set by app.main(); None = defau
 LABELS = None               # [labels] dict (resolved once by app.main())
 
 # ---------------------------------------------------------------------------
+# v3.10 (todo 52l) — sleep-in-game visibility (D1-D7) shared state.
+# ---------------------------------------------------------------------------
+# D2/D3/D6 — wake-burst thread lifecycle. The thread is spawned by pm._pm_emit
+# (the journal follower, a daemon thread) the instant a real [SLEEP-WAKE] is
+# journal-confirmed, and by obs.pm_wake_check (mono-gap backstop) as a fallback.
+# It runs dense 0.1s deck/physical/IIO sampling INDEPENDENT of the cadence loop,
+# so a stall in the loop can never stop the post-wake capture.
+WAKE_BURST_ACTIVE = False       # True while a wake-burst thread is running
+WAKE_BURST_UNTIL = 0.0          # monotonic end of the current burst window
+WAKE_BURST_START = 0.0          # monotonic start of the current burst
+# D4 — re-grab watchdog latch (the dock anchor is DOCK_AT above; the latch
+# ensures [REGRAB-MISSING] fires once per dock window while a late real
+# [STEAM-REGRAB]/[DECK-ALIVE] still measures [REGRAB-DT]).
+REGRAB_MISSING_LOGGED = False   # True once the current dock window logged [REGRAB-MISSING]
+# D6 — [RE-ENUM] identity diff across a detach/dock. capture.scan_hidraw keeps
+# S.PHYS_ID_LAST fresh while the physical source is present; at [DETACH] it is
+# captured into S.PHYS_ID_BEFORE_DETACH so a dock that returns as a DIFFERENT
+# interface (e.g. controller@1.1 -> controller@1.3, IMU ts reset, state
+# (attached,detached)) is logged as [RE-ENUM] — device identity changed.
+PHYS_ID_LAST = None             # last healthy physical-source identity tuple
+PHYS_ID_BEFORE_DETACH = None    # physical identity at the last [DETACH]
+# D7 — loop-stall watchdog latches (the cadence loop keeps S.LAST_TICK fresh via
+# pm_wake_check; the watchdog thread reports a >LOOP_STALL_LOG_S silence).
+LOOP_STALL_ACTIVE = False       # True while a >LOOP_STALL_LOG_S silence is on
+LOOP_STALL_LAST_LOG = 0.0       # monotonic last [LOOP-STALL]/[LOOP-RECOVERED] log
+# D5 — ipj wake flush dedupe (one short journal scan at the wake instant).
+IPJ_WAKE_FLUSHED = 0.0          # monotonic last ipj wake flush
+
+# ---------------------------------------------------------------------------
 # Shutdown flag (set by logcore._signal_handler, read by every daemon loop)
 # ---------------------------------------------------------------------------
 STOP = False                # set by SIGINT/SIGTERM for a clean exit

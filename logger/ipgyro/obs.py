@@ -25,10 +25,14 @@ Shared mutable state is ALWAYS accessed as S.<name> (see ipgyro.state).
 
 import time
 
+import threading
+import time
+
 from . import state as S
 from . import discover as D
 from .conf import (DECK_MODE_WORDS, FULL_MODE_GAME, FULL_MODE_POST,
-                   FULL_MODE_WAKE, MODE_TAG_WORDS, SESS_INTERVAL)
+                   FULL_MODE_WAKE, LOOP_STALL_HB, LOOP_STALL_LOG_S,
+                   MODE_TAG_WORDS, REGRAB_MISSING_S, SESS_INTERVAL)
 from .hidraw import _hid_label
 from .logcore import log, run_cmd
 
@@ -225,7 +229,9 @@ def _mark_dock(now):
     snapshot AFTER the event, arm full capture. (R8) also anchors DOCK_AT so the
     dock -> game-binds-again latency ([REGRAB-DT]) can be measured when Steam
     re-grabs / the deck stream resumes. G2: [RECONNECT-DT] carries the mode +
-    owner tag."""
+    owner tag. v3.10 (D4): resets the [REGRAB-MISSING] latch and arms the
+    re-grab watchdog so a dock that Steam NEVER re-binds is reported loudly
+    after REGRAB_MISSING_S instead of staying silently absent for 55 minutes."""
     if S.DETACH_AT is not None:
         dt = now - S.DETACH_AT
         log(f"[RECONNECT-DT] detach->dock took {dt:.1f}s "
@@ -235,22 +241,121 @@ def _mark_dock(now):
         S.DETACH_AT = None
     S.DOCK_AT = now
     S.REGRAB_DT_LOGGED = False
+    S.REGRAB_MISSING_LOGGED = False
     _enter_full("dock")
     snapshot_state("dock")
+    # D4 — arm the re-grab watchdog (fires [REGRAB-MISSING] if Steam never
+    # re-binds the deck within REGRAB_MISSING_S of this dock).
+    try:
+        _spawn_regrab_watchdog(now)
+    except Exception:
+        pass
 
 
 def mark_regrab(now, via):
     """(R8) Called when the game/Steam re-binds input after a dock (via =
     'steam-regrab' | 'deck-alive' | 'game-input'). Measures the dock ->
-    game-binds-again latency as [REGRAB-DT] once per dock window."""
+    game-binds-again latency as [REGRAB-DT] once per dock window. v3.10 (D4):
+    a real re-grab also cancels the [REGRAB-MISSING] watchdog latch."""
     if S.DOCK_AT is None or S.REGRAB_DT_LOGGED:
         return
     dt = now - S.DOCK_AT
     S.REGRAB_DT_LOGGED = True
+    S.REGRAB_MISSING_LOGGED = True   # a real re-grab means the deck WAS re-bound
     log(f"[REGRAB-DT] dock->{via} took {dt:.1f}s "
         f"(controller input re-bound after re-dock)")
     _enter_full("regrab")
     snapshot_state("regrab")
+
+
+# ---------------------------------------------------------------------------
+# v3.10 (todo 52l) — D4 [REGRAB-MISSING] watchdog + D7 [LOOP-STALL] watchdog.
+# ---------------------------------------------------------------------------
+
+def _spawn_regrab_watchdog(dock_at):
+    """(D4) Start a daemon thread that, REGRAB_MISSING_S after the dock, logs
+    [REGRAB-MISSING] if Steam never re-bound the deck (no [STEAM-REGRAB] /
+    [DECK-ALIVE] -> mark_regrab never ran). Turns today's silent 55-minute
+    absence into a loud, dated marker. Idempotent per dock window."""
+    def _watch():
+        deadline = dock_at + REGRAB_MISSING_S
+        while not S.STOP:
+            now = time.monotonic()
+            if now >= deadline:
+                # a NEWER dock superseded this one -> drop the stale watchdog
+                if S.DOCK_AT is not None and S.DOCK_AT > dock_at:
+                    return
+                if not S.REGRAB_MISSING_LOGGED and not S.REGRAB_DT_LOGGED:
+                    S.REGRAB_MISSING_LOGGED = True
+                    log(f"[REGRAB-MISSING] Steam did not re-grab deck within "
+                        f"{REGRAB_MISSING_S:.0f}s after dock "
+                        f"(no [STEAM-REGRAB]/[DECK-ALIVE] since "
+                        f"dock@{dock_at - S.BOOT_T0:.0f}s) — deck input may "
+                        f"stay unbound")
+                return
+            time.sleep(0.5)
+    try:
+        threading.Thread(target=_watch, daemon=True).start()
+    except Exception:
+        pass
+
+
+def reenum_check(now):
+    """(D6) Called by capture.scan_hidraw on every physical [DETACH]/[DOCK]
+    transition. When the physical controller comes back as a DIFFERENT interface
+    than the one that detached (e.g. controller@1.1 -> controller@1.3, IMU ts
+    reset, state=(attached,detached)), device identity changed across the wake
+    -> emit an explicit [RE-ENUM] marker so the re-enumeration is never silent.
+    `now` = the monotonic dock instant."""
+    before = S.PHYS_ID_BEFORE_DETACH
+    after = S.PHYS_ID_LAST
+    if not before or not after or before == after:
+        return
+    S.PHYS_ID_BEFORE_DETACH = None
+    log(f"[RE-ENUM] physical controller re-enumerated as a DIFFERENT interface "
+        f"across the detach/dock: {before} -> {after} "
+        f"(device identity changed; IMU/state may have reset)")
+
+
+# ---------------------------------------------------------------------------
+# D7 — [LOOP-STALL] watchdog thread. The cadence loop keeps S.LAST_TICK fresh
+# (via pm_wake_check); this thread reports when the loop produces nothing for
+# longer than LOOP_STALL_LOG_S, so a stall is logged as a CAUSE rather than
+# appearing only as missing data. [LOOP-RECOVERED] marks the end of the stall.
+# ---------------------------------------------------------------------------
+
+def loop_stall_tick(now):
+    """(D7) Called by the cadence loop every pass (through pm_wake_check) to
+    keep S.LAST_TICK fresh. Clears the in-stall latch when the loop resumes."""
+    if S.LOOP_STALL_ACTIVE:
+        S.LOOP_STALL_ACTIVE = False
+        if time.monotonic() - S.LOOP_STALL_LAST_LOG >= LOOP_STALL_HB:
+            S.LOOP_STALL_LAST_LOG = time.monotonic()
+            log(f"[LOOP-RECOVERED] main loop producing again after "
+                f"{now - S.LAST_TICK:.1f}s stall")
+    S.LAST_TICK = now
+
+
+def loop_stall_watchdog_loop():
+    """(D7) Daemon thread: every ~1 s check how long the cadence loop has been
+    silent (S.LAST_TICK). When it exceeds LOOP_STALL_LOG_S, log [LOOP-STALL]
+    (re-asserted at most every LOOP_STALL_HB) and set S.LOOP_STALL_ACTIVE so the
+    loop's next tick logs [LOOP-RECOVERED]. Runs in a daemon thread (the pm/ipj
+    threads already prove the threaded-watchdog pattern works)."""
+    while not S.STOP:
+        now = time.monotonic()
+        silent = now - S.LAST_TICK
+        if silent >= LOOP_STALL_LOG_S:
+            if not S.LOOP_STALL_ACTIVE:
+                S.LOOP_STALL_ACTIVE = True
+                S.LOOP_STALL_LAST_LOG = now
+                log(f"[LOOP-STALL] main loop silent {silent:.1f}s "
+                    f"(daemon threads stay alive; capture may be stalled)")
+            elif now - S.LOOP_STALL_LAST_LOG >= LOOP_STALL_HB:
+                S.LOOP_STALL_LAST_LOG = now
+                log(f"[LOOP-STALL] main loop still silent "
+                    f"({silent:.0f}s and counting)")
+        time.sleep(1.0)
 
 
 def _game_had_payload():
@@ -304,7 +409,10 @@ def pm_wake_check(now):
     gap WHILE SLEEP_PENDING is still True — that is the genuine-gap backstop.
     If the follower already consumed the resume line first (it clears
     SLEEP_PENDING and stamps S.SLEEP_WAKE_TS), we apply the wake consequences
-    (snapshot + full capture) exactly once via SLEEP_WAKE_TS/WAKE_HANDLED_TS."""
+    (snapshot + full capture) exactly once via SLEEP_WAKE_TS/WAKE_HANDLED_TS.
+    v3.10 (D2/D3/D5/D6): every genuine wake also spawns the post-wake dense
+    capture thread (fallback if the follower already ran it — spawn is
+    idempotent), and the loop tick feeds the D7 [LOOP-STALL] watchdog."""
     if S.SLEEP_PENDING and S.LAST_TICK and (now - S.LAST_TICK) > 5.0:
         # genuine resume: journal-confirmed enter + whole-process freeze. The
         # follower had not yet consumed the journal wake line before our tick.
@@ -316,13 +424,28 @@ def pm_wake_check(now):
             f"seen before the freeze; wake confirmed by the gap)")
         _enter_full("sleep-wake", hold=FULL_MODE_WAKE)
         snapshot_state("sleep-wake")
+        _spawn_wake_burst_fallback(S.SLEEP_WAKE_TS)
     elif S.SLEEP_WAKE_TS is not None and S.SLEEP_WAKE_TS > S.WAKE_HANDLED_TS:
         # the journal follower logged the real [SLEEP-WAKE] line; apply the
         # wake consequences here (once) so full capture re-arms after resume.
         S.WAKE_HANDLED_TS = S.SLEEP_WAKE_TS
         _enter_full("sleep-wake", hold=FULL_MODE_WAKE)
         snapshot_state("sleep-wake")
-    S.LAST_TICK = now
+        _spawn_wake_burst_fallback(S.SLEEP_WAKE_TS)
+    loop_stall_tick(now)
+
+
+def _spawn_wake_burst_fallback(wake_mono):
+    """(D2/D3/D5/D6) Spawn the post-wake dense capture thread from the main-loop
+    backstop. The journal follower (pm.py) normally spawns it first on the
+    [SLEEP-WAKE] line; this is the fallback when the follower's line was not
+    consumed before our tick. spawn_wake_burst is idempotent (one window per
+    wake), so calling it here too is safe."""
+    try:
+        from . import wake as W  # lazy: keep module-load order cycle-free
+        W.spawn_wake_burst(wake_mono)
+    except Exception:
+        pass
 
 
 def pm_probe():

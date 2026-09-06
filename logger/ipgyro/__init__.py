@@ -49,6 +49,20 @@ v3.9 (todo 52f) — two user-driven clarity fixes:
  confirmed suspend/resume (systemd-suspend phrases "Performing sleep
  operation ..." / "System returned from sleep operation ...") instead of the
  false mono-gap [SLEEP-WAKE] that fired every ~24-33 s main-loop stall.
+
+v3.10 (todo 52l) — SLEEP-IN-GAME VISIBILITY (D1-D7). The ~24-33 s main-loop
+stalls were forensically WHOLE-PROCESS freezes (all daemon threads silent too)
+from log() blocking on its stdout->journald mirror under heavy full-capture
+output. D1 root fix: stdout is O_NONBLOCK with bounded writes (a full pipe
+drops mirror lines, never freezes the process). D2/D3/D5/D6: a dedicated
+post-wake dense-capture thread (ipgyro.wake) samples deck hidraw + physical
+XInput right-gyro + center IIO at 0.1 s for 30-60 s after every real
+[SLEEP-WAKE], INDEPENDENT of the cadence loop, and emits [GYRO-FEED] verdicts
+at ~2 s/~10 s, post-wake [CEN-IMU]/[GYRO-SRC] at 1 s, an [IPJ-WAKE] wake-
+ordered flush, and [RE-ENUM] on interface change. D4: [REGRAB-MISSING]
+watchdog after dock. D7: [LOOP-STALL] watchdog thread. New markers
+([GYRO-FEED]/[REGRAB-MISSING]/[RE-ENUM]/[LOOP-STALL]/[WAKE-BURST]/[IPJ-WAKE]/
+[LOOP-RECOVERED]) only ADD; all existing marker tokens stay byte-compatible.
 """
 
-__version__ = "v3.9"
+__version__ = "v3.10"

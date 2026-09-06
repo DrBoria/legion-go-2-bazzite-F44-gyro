@@ -82,7 +82,10 @@ def _pm_emit(line):
     confirmed enter arms S.SLEEP_PENDING, so a mere process stall can never
     produce a sleep marker — the follower is the authoritative sleep source.
     On wake we additionally stamp S.SLEEP_WAKE_TS so the main thread applies
-    the wake consequences (snapshot + full capture) exactly once."""
+    the wake consequences (snapshot + full capture) exactly once, and spawn the
+    v3.10 post-wake dense capture thread (D2/D3/D5/D6) so the first seconds
+    after resume are sampled INDEPENDENT of the cadence loop (a 24-33 s
+    main-loop stall can no longer hide the wake transition)."""
     kind = _classify(line)
     if kind == "enter":
         if not S.SLEEP_PENDING:
@@ -93,6 +96,13 @@ def _pm_emit(line):
             S.SLEEP_PENDING = False
             S.SLEEP_WAKE_TS = time.monotonic()
             log("PM: [SLEEP-WAKE] " + line.strip())
+            # D2/D3/D5/D6 — dense post-wake capture in a daemon thread (the
+            # journal follower is itself a daemon thread, so this is safe).
+            try:
+                from . import wake as W  # lazy: keep module-load order flat
+                W.spawn_wake_burst(S.SLEEP_WAKE_TS)
+            except Exception:
+                pass
 
 
 def pm_backlog():

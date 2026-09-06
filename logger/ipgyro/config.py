@@ -51,6 +51,11 @@ DEFAULTS = {
         "steam_scan": 5.0, "steam_state": 30.0, "ipj_backlog": 150,
         "ipj_max_s": 25, "ipj_watchdog": 90.0, "ipj_live": 15.0,
         "gyro_src": 5.0, "dev_inv": 60.0, "pm_follow": 60.0,
+        # v3.10 (todo 52l) sleep-in-game visibility tunables (D1-D7)
+        "wake_burst": 60.0, "wake_burst_iv": 0.1,
+        "gyro_feed_1": 2.0, "gyro_feed_2": 10.0, "wake_reassert": 30.0,
+        "regrab_missing": 15.0, "loop_stall_log": 10.0, "loop_stall_hb": 15.0,
+        "ipj_wake_flush": 8.0,
     },
     "full_mode": {
         "post": 10.0, "wake": 30.0, "game": 3600.0,

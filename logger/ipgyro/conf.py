@@ -153,7 +153,7 @@ DECK_DRAIN_MAX = 16         # max frames coalesced from one deck burst drain
 #  2026-09-05 on user request; the full contract now lives in Agent.md,
 #  section "2026-09-05 ~22:3x — V22 ДИЗАЙН-ДОКУМЕНТ ...".)
 # ---------------------------------------------------------------------------
-LOG_VERSION = "v3.9"
+LOG_VERSION = "v3.10"
 
 # v3.9 (todo 52f FIX-1 CLEAR NAMING): the HUMAN vocabulary every log/config
 # shows. Internal role/deck_kind keys (discover.py), mode internals and marker
@@ -209,6 +209,32 @@ GYRO_JOURNAL_LINES = 200        # journalctl -n cap for the source-switch scan
 # (R4) full device-inventory cadence (startup + attach/detach are event-driven;
 # this is the periodic re-assert so a long-lived inventory is never stale).
 DEV_INV_HB = 60.0
+
+# ---------------------------------------------------------------------------
+# v3.10 (todo 52l) — sleep-in-game VISIBILITY fixes D1-D7.
+# ---------------------------------------------------------------------------
+# D2/D3/D6 — dense post-wake capture: after every [SLEEP-WAKE] a dedicated wake
+# burst thread force-reads deck hidraw + physical XInput right-gyro + center IIO
+# at WAKE_BURST_IV (0.1s) for WAKE_BURST_S seconds, INDEPENDENT of the cadence
+# loop (so a 24-33s main-loop stall can never hide the wake transition again —
+# the first ~16s after wake, when InputPlumber's gyro arbiter re-initialized,
+# is exactly what a stalled loop used to leave UNSAMPLED).
+WAKE_BURST_S = 60.0            # dense post-wake capture window (30-60s contract)
+WAKE_BURST_IV = 0.1            # dense sampling cadence inside the burst (10 Hz)
+GYRO_FEED_S = (2.0, 10.0)      # [GYRO-FEED] "did the feed resume" instants (~2s/~10s)
+WAKE_REASSERT_S = 30.0         # post-wake [CEN-IMU]/[GYRO-SRC] re-assert window (@1s)
+# D4 — re-grab watchdog: after every [DOCK], if no [STEAM-REGRAB]/[DECK-ALIVE]
+# within REGRAB_MISSING_S -> [REGRAB-MISSING] (turns a silent 55-minute absence
+# into a loud, dated marker).
+REGRAB_MISSING_S = 15.0
+# D7 — loop-stall watchdog: report when the cadence loop produces nothing for
+# longer than LOOP_STALL_LOG_S ([LOOP-STALL]); re-assert only every LOOP_STALL_HB.
+LOOP_STALL_LOG_S = 10.0
+LOOP_STALL_HB = 15.0
+# D5 — ipj wake flush: journal window (backward from the wake instant) scanned
+# once at wake to catch delayed arbiter/gyro-center flip-flops the -f follower
+# delivered late across resume.
+IPJ_WAKE_FLUSH_S = 8.0
 
 # (R2) full-mode per-frame capture: when full capture is armed, log a compact
 # per-frame line for every deck report and lift the physical-source decode
