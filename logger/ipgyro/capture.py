@@ -99,6 +99,34 @@ def _refresh_phys_id():
     S.PHYS_ID_LAST = ",".join(phys) if phys else None
 
 
+def _refresh_phys_nodes():
+    """(v3.14 todo 52x) Refresh S.PHYS_NODES_LAST (the current physical-source
+    node set as "label vid:pid" strings) and S.RIGHT_GYRO_PRESENT (True when a
+    physical node with pid 61ed is present = the right handle is physically
+    detached and its own gyro is a SEPARATE source; False when only the full
+    controller 61eb with the center gyro in the right_gyro slot is attached).
+    Called on every scan_hidraw pass so the [DETACH]/[DOCK] markers and the
+    SNAPSHOT right_gyro= field always reflect the current physical attach state.
+    The 61ed/61eb pids are OBSERVABLE identity only (never selectors) — the
+    right-handle-vs-center distinction is a physical-attach fact, not a codec."""
+    out = []
+    right = False
+    for e in S.HID_DEVICES.values():
+        if e.get("role") != D.ROLE_PHYSICAL:
+            continue
+        lbl = e.get("label") or "?"
+        if e.get("iface") is not None:
+            lbl += f"@1.{e['iface']}"
+        vp = ""
+        if e.get("vid") and e.get("pid"):
+            vp = f" {e['vid']}:{e['pid']}"
+            if str(e.get("pid")).upper() == "61ED":
+                right = True
+        out.append(f"{lbl}{vp}")
+    S.PHYS_NODES_LAST = sorted(out)
+    S.RIGHT_GYRO_PRESENT = right
+
+
 # ---------------------------------------------------------------------------
 # Discovery + open/close
 # ---------------------------------------------------------------------------
@@ -179,8 +207,13 @@ def scan_hidraw():
     # of the per-node HID lines above. An XInput<->DInput mode switch also shows
     # as a [DETACH]/[DOCK] pair (xinput64 node gone, another composite pid in) —
     # the [UDEV] lines carry the USB-level detail of which pid/iface changed.
+    # v3.14 (todo 52x): every [DETACH]/[DOCK] carries the physical nodes that
+    # left/arrived (with their observable vid:pid, so 17ef:61eb vs 61ed is
+    # explicit) and refreshes the right-handle-gyro presence (a 61ed node = the
+    # right handle is detached and its own gyro is a separate source).
     phys_now = any(e["role"] == D.ROLE_PHYSICAL
                    for e in S.HID_DEVICES.values())
+    _refresh_phys_nodes()
     if S.PHYS_STATE is None:
         # (v3.8 F2) first baseline: detach-tracking is live from this scan on.
         S.PHYS_STATE = phys_now

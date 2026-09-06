@@ -127,6 +127,23 @@ required consecutive quiet seconds and is suppressed when H2 routing is
 desktop. SNAPSHOT adds pad_gyro/s, the real game process (game_reader=eso64.exe)
 vs the pad-fd holder (pad_holder=winedevice.exe), and the flow= chain. New
 markers only ADD; every existing marker token stays byte-compatible.
+
+v3.14 (todo 52x) — FULL BOTH-MODE EVENT CAPTURE + PER-SECOND FLOW. The user's
+ground-truth correction: the v3.13 log MISSED the real gaming-mode detach/
+re-attach failure (in gaming mode a detach broke everything 4x; re-attach did
+NOT recover — only a game restart recovered; desktop detach worked; "very many
+logs not written"). v3.14 captures EVERY physical detach/re-attach in BOTH
+modes with full detail ([DETACH]/[DOCK] now carry the physical nodes that
+left/arrived with their observable vid:pid, so 17ef:61eb vs 61ed is explicit),
+emits the per-hop flow at least 1/s during live gameplay and every transition
+(not only on change/idle/SNAPSHOT), runs a dense per-second flow burst in the
+post-wake "config returned but H1 dead" window, tracks the right-handle gyro
+(17ef:61ed) as a SEPARATE carrier with its own H0-H3 verdicts (the gyroR flow
+column + [GYRO-CARRIER] marker), emits an explicit [RE-ATTACH-NO-RECOVERY]
+marker when a re-attach does NOT restore delivery while the game is still
+running, and fixes game_reader so a renderer/browser helper (CrRendererMain)
+is never reported as the real game reader. New markers only ADD; every existing
+marker token stays byte-compatible.
 """
 
-__version__ = "v3.13"
+__version__ = "v3.14"

@@ -153,7 +153,7 @@ DECK_DRAIN_MAX = 16         # max frames coalesced from one deck burst drain
 #  2026-09-05 on user request; the full contract now lives in Agent.md,
 #  section "2026-09-05 ~22:3x — V22 ДИЗАЙН-ДОКУМЕНТ ...".)
 # ---------------------------------------------------------------------------
-LOG_VERSION = "v3.13"
+LOG_VERSION = "v3.14"
 
 # ---------------------------------------------------------------------------
 # v3.12 (todo 52r) — truthful mode/sleep/per-source delivery cadences.
@@ -189,6 +189,34 @@ FOCUS_LOST_HB = 10.0        # [STEAM-FOCUS-LOST-GAME] re-assert while held
 PAD_STALL_REQ = 5.0         # [PAD-DEAD] needs PAD_STALL_REQ CONSECUTIVE quiet
                             # seconds (accumulated), matching the old text; the
                             # v3.12 bug fired on the FIRST quiet second.
+
+# ---------------------------------------------------------------------------
+# v3.14 (todo 52x) — FULL BOTH-MODE EVENT CAPTURE + PER-SECOND FLOW. The user's
+# ground-truth: the v3.13 log MISSED the real gaming-mode detach/re-attach
+# failure (detach broke everything 4x in gaming mode; re-attach did NOT recover;
+# only a game restart recovered; desktop detach worked; "very many logs not
+# written"). v3.14 must capture EVERY physical detach/re-attach in BOTH modes
+# with full detail, emit the per-hop flow at least 1/s during live gameplay and
+# every transition (not only on idle/change/SNAPSHOT), track the right-handle
+# gyro (17ef:61ed) as a SEPARATE carrier with its own H0-H3 verdicts, emit an
+# explicit [RE-ATTACH-NO-RECOVERY] marker when a re-attach does NOT restore
+# delivery while the game is still running, and run a dense per-second flow
+# burst in the post-wake "config returned but H1 dead" window.
+# ---------------------------------------------------------------------------
+FLOW_LIVE_S = 1.0           # per-second compact [FLOW] cadence while a game
+                            # context is live (live gameplay + transitions) —
+                            # the v3.13 gap was that [*FLOW] barely fired in a
+                            # live game; now the per-second flow is reliable.
+REATTACH_NO_RECOVERY_S = 3.0  # after a [DOCK] while a game is running, judge
+                            # whether delivery RESUMED or STAYS DEAD; if after
+                            # this window the per-hop flow is still not H3=ok
+                            # (or H1/H2 lost) emit [RE-ATTACH-NO-RECOVERY].
+POSTWAKE_DENSE_S = 20.0     # dense per-second flow burst window after every
+                            # [SLEEP-WAKE] covering the "config returned but
+                            # H1 dead" seconds (the v3.13 gap showed this window
+                            # only via 2 SNAPSHOTs, not second-by-second).
+CARRIER_CHANGE_HB = 0.0     # [GYRO-CARRIER] fires on every attach-state change
+                            # (center-only vs right-handle) — no anti-spam floor.
 
 # v3.9 (todo 52f FIX-1 CLEAR NAMING): the HUMAN vocabulary every log/config
 # shows. Internal role/deck_kind keys (discover.py), mode internals and marker

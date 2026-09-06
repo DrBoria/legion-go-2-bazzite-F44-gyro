@@ -308,6 +308,20 @@ def main():
         "seconds + is suppressed when routing=desktop. SNAPSHOT adds pad_gyro/s, "
         "real game process (game_reader=eso64.exe) vs pad-fd holder "
         "(pad_holder=winedevice.exe), and the flow= chain")
+    log("LOGGER: v3.14 todo-52x FULL BOTH-MODE EVENT CAPTURE + PER-SECOND FLOW "
+        "active — captures EVERY physical detach/re-attach in BOTH gaming and "
+        "desktop modes with full detail ([DETACH]/[DOCK] carry the physical "
+        "nodes that left/arrived with their observable vid:pid, so 17ef:61eb vs "
+        "61ed is explicit); per-hop flow emitted at least 1/s during live "
+        "gameplay + every transition (not only on change/idle/SNAPSHOT); dense "
+        "per-second flow burst in the post-wake 'config returned but H1 dead' "
+        "window; right-handle gyro (17ef:61ed) as a SEPARATE carrier with its "
+        "own H0-H3 verdicts (gyroR flow column + [GYRO-CARRIER]); "
+        "[RE-ATTACH-NO-RECOVERY] when a re-attach does NOT restore delivery "
+        "while the game is still running (the user's gaming-mode finding: "
+        "detach broke everything, re-attach did not recover, only a game "
+        "restart did); game_reader never reports a renderer/browser helper "
+        "(CrRendererMain) as the real game reader")
 
     # (v3.8 F2) close the startup blind window ONCE, before the cadence loop:
     # replay the physical-source churn the udev thread recorded during init and
