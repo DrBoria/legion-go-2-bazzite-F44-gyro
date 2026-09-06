@@ -336,10 +336,20 @@ def scan_evdev(devices, node_map):
     pad_node = _pad_event_node(pad) if pad is not None else None
 
     desired = {}
+    evr = S.EVREADER_ON
     for d in devices:
         # v3.11 — the game-facing pad must ALWAYS be captured even if the
         # gamepad heuristic ever fails to match it (it is the delivery proof).
         if not (is_gamepad(d) or _is_pad(d)):
+            continue
+        # v3.12 (todo 52r PART 2) — when the python-evdev reader owns the pad
+        # (S.EVREADER_ON), the pad node is EXCLUDED from this raw capture:
+        # evdev is multicast, so TWO open fds on the same node each see EVERY
+        # event; counting them twice (raw _process_event + evreader drain_events
+        # into the SAME pad counters) would DOUBLE pad_ev/s / pad_key/s /
+        # pad_abs/s / pad_gyro/s. When EVREADER_ON drops False (evdev reader
+        # stopped/unavailable), this reopens the pad via the raw fallback.
+        if evr and _is_pad(d):
             continue
         for h in d.get("handlers") or []:
             if h.startswith("event"):
@@ -429,8 +439,20 @@ def _process_event(name, etype, code, value, entry, now):
     the entry is the game-facing virtual pad (28de:11ff), every EV event is
     counted as [PAD→GAME] proof evidence (pad_ev/s), and EV_ABS on the gyro
     axes (ABS_RX/ABS_RY) is counted separately so gyro provability through the
-    pad can be asserted ([GYRO→PAD-AXIS])."""
+    pad can be asserted ([GYRO→PAD-AXIS]).
+    v3.12 (todo 52r FIX-C): BUTTONS and GYRO are counted as INDEPENDENT
+    per-data-type streams with SEPARATE counters — pad_key/s (EV_KEY buttons),
+    pad_abs/s (non-gyro EV_ABS sticks/triggers) and pad_gyro/s (ABS_RX/ABS_RY)
+    — so one busy stream can never starve the other's verdict (the v3.11
+    shared-latch starvation bug)."""
     is_pad = bool(entry.get("is_pad"))
+    # v3.12 (todo 52r PART 2) — belt-and-suspenders with the scan_evdev
+    # exclusion: when the python-evdev reader owns the pad (S.EVREADER_ON),
+    # skip raw processing of pad events entirely. This covers the transient
+    # window where the raw pad fd is still open before the next scan_evdev
+    # closes it — evdev multicast would otherwise double-count every pad event.
+    if is_pad and S.EVREADER_ON:
+        return
     if etype == EV_KEY:
         if value == 1:
             kname = KEY_NAMES.get(code, f"0x{code:03x}")
@@ -439,6 +461,8 @@ def _process_event(name, etype, code, value, entry, now):
         S.EV_ACT_LAST = now
         if is_pad:
             S.PAD_EV_COUNT += 1
+            S.PAD_KEY_COUNT += 1
+            S.PAD_KEY_LAST = now
             S.PAD_LAST_EV = now
     elif etype == EV_ABS:
         S.EV_ACT_COUNT += 1
@@ -450,6 +474,10 @@ def _process_event(name, etype, code, value, entry, now):
             if code in PAD_GYRO_AXES:
                 S.PAD_GYRO_AXIS_COUNT += 1
                 S.PAD_GYRO_LAST = now
+            else:
+                # non-gyro axis (stick/trigger) — its OWN counter (FIX-C)
+                S.PAD_STICK_COUNT += 1
+                S.PAD_STICK_LAST = now
         if now - entry["last_abs"] >= EV_THROTTLE:
             aname = ABS_NAMES.get(code, f"0x{code:02x}")
             log(f"EV {name} ABS {aname} {value}")

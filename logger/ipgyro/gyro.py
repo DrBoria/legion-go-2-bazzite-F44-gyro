@@ -111,8 +111,27 @@ def _observed_gyro_sources():
 
 def _gyro_src_verdict():
     """A compact human verdict of the active gyro source + why, from the live
-    observed state (used for the periodic [GYRO-SRC] re-assert)."""
+    observed state (used for the periodic [GYRO-SRC] re-assert).
+    v3.12 (todo 52r FIX-C): also publishes the per-source gyro carrier on S
+    (S.GYRO_SRC_CARRIER = 'center' while the handles are attached and the
+    center body IMU is carried in the XInput right_gyro slot; 'right-handle'
+    while the right handle is physically detached 17ef:61ed and its own gyro is
+    the live source; 'none' when no gyro source is observed) and S.GYRO_IS_LIVE
+    (bool) so the wake-vs-gyro compare can name WHICH physical gyro is live."""
     srcs = _observed_gyro_sources()
+    # -- per-source carrier (FIX-C) -------------------------------------------
+    if S.CEN_IMU is not None:
+        S.GYRO_SRC_CARRIER = "center"
+        S.GYRO_IS_LIVE = True
+    elif any(e.get("role") == D.ROLE_PHYSICAL
+             for e in S.HID_DEVICES.values()):
+        # physical XInput present but no center IIO -> the right-handle gyro
+        # (17ef:61ed) is the live source (right handle detached).
+        S.GYRO_SRC_CARRIER = "right-handle"
+        S.GYRO_IS_LIVE = True
+    else:
+        S.GYRO_SRC_CARRIER = "none"
+        S.GYRO_IS_LIVE = False
     if not srcs:
         return "none (no gyro source observed)"
     if len(srcs) == 1:

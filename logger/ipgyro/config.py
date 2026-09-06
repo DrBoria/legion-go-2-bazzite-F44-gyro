@@ -58,6 +58,9 @@ DEFAULTS = {
         "ipj_wake_flush": 8.0,
         # v3.11 (todo 52o) real input-delivery tracking cadences
         "pad_stall": 5.0, "pad_delivery_hb": 30.0,
+        # v3.12 (todo 52r) truthful mode/sleep/per-source cadences
+        "mode_scan": 5.0, "pm_kernel_poll": 5.0, "pm_kernel_window": 120,
+        "wake_gyro_compare": 8.0,
     },
     "full_mode": {
         "post": 10.0, "wake": 30.0, "game": 3600.0,

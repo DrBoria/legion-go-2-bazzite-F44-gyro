@@ -124,6 +124,23 @@ PM_FOLLOW_LAST = 0.0        # last [PM-LIVE] heartbeat (monotonic)
 SLEEP_WAKE_TS = None        # monotonic of the last journal-confirmed wake
 WAKE_HANDLED_TS = 0.0       # last wake consequences applied (monotonic)
 
+# ---------------------------------------------------------------------------
+# v3.12 (todo 52r FIX-B) — AUTHORITATIVE SLEEP bookkeeping. Every real suspend
+# emits [SLEEP-ENTER]/[SLEEP-WAKE] with wall timestamps + sleep duration, and
+# the SNAPSHOT sleep= field states entering|asleep|awake(+last duration). The
+# enter anchor is stamped the INSTANT the first authoritative signal (journal
+# follower: systemd-suspend unit and/or kernel PM lines) fires, i.e. reliably
+# BEFORE the process freezes; the duration = wake_mono - enter_mono.
+# ---------------------------------------------------------------------------
+SLEEP_STATE = "awake"       # 'awake' | 'entering' | 'asleep'
+SLEEP_ENTER_MONO = None     # monotonic of the last journal-confirmed enter
+SLEEP_ENTER_WALL = ""       # wall "HH:MM:SS" of the last confirmed enter
+SLEEP_ENTER_LOG = 0.0       # monotonic when the [SLEEP-ENTER] line was logged
+SLEEP_LAST_DUR = None       # last sleep duration seconds (float) or None
+SLEEP_WAKE_WALL = ""        # wall "HH:MM:SS" of the last confirmed wake
+WAKE_GYRO_COMPARED = 0.0    # monotonic of the last post-wake gyro compare
+WAKE_GYRO_STALLED = False   # True once the current wake logged a gyro stall
+
 # (R2) full-mode per-frame capture: last per-frame log time per hidraw node
 # (anti-spam floor so a pathological 240 frame/s deck cannot flood forever).
 FRAME_LOG_LAST = {}         # hidraw node -> monotonic last [FRAME] log time
@@ -158,6 +175,19 @@ TRACK_LIVE = False           # True once obs.startup_reconcile() has run
 # ---------------------------------------------------------------------------
 CFG = None                  # ipgyro.config.Cfg (set by app.main(); None = defaults)
 LABELS = None               # [labels] dict (resolved once by app.main())
+
+# ---------------------------------------------------------------------------
+# v3.12 (todo 52r) — REAL session-mode verdict (FIX-A). The v3.11 mode= was
+# derived from the TRANSPORT deck-output roles / the Steam-Input focused window,
+# which reported gaming-mode while the user sat in a DESKTOP session with ESO
+# running. mode.py now classifies the REAL Steam UI/session mode (a DESKTOP
+# session present vs a no-desktop Big Picture/gamescope GAMING session). A
+# running game NEVER changes this verdict. Read/written as S.<name>.
+# ---------------------------------------------------------------------------
+MODE = None              # 'desktop' | 'gaming' | 'unknown' (last verdict)
+MODE_SRC = []            # evidence strings behind the verdict ([MODE ... via])
+MODE_DETAIL = ""         # human reason for the verdict (unknown reasons etc.)
+MODE_LAST_LOG = 0.0      # monotonic last [MODE] change log (anti-spam)
 
 # ---------------------------------------------------------------------------
 # v3.10 (todo 52l) — sleep-in-game visibility (D1-D7) shared state.
@@ -195,6 +225,13 @@ IPJ_WAKE_FLUSHED = 0.0          # monotonic last ipj wake flush
 # proof the game got the input. The ONLY host-side proof is EV events on the
 # pad node WHILE the game process holds the pad fd. All state is read/written
 # as S.<name> (never rebound locally).
+#
+# v3.12 (todo 52r FIX-C) — BUTTONS and GYRO are modelled as INDEPENDENT
+# per-source streams with SEPARATE counters + anti-spam latches, so one stall
+# can never mask the other and the log can honestly show "buttons reached the
+# game, gyro did not" after a wake. The v3.11 SHARED [PAD→GAME] latch
+# (PAD_DELIVERY_LAST) starved the per-type verdict — split into per-data-type
+# delivery latches below (PAD_KEY_LATCH / PAD_STICK_LATCH / gyro axis latch).
 # ---------------------------------------------------------------------------
 # Pad identity (populated by devices.scan_evdev from /proc/bus/input/devices).
 # The pad is matched by NAME PREFIX + VID:PID 28de:11ff (NOT the churning
@@ -204,9 +241,18 @@ PAD_SYS = None              # sysfs path of the pad input (e.g. .../input65)
 PAD_NAME = None             # full pad name (e.g. 'Microsoft X-Box 360 pad 0')
 PAD_LAST_EV = 0.0           # monotonic of the last EV event observed on the pad
 PAD_EV_COUNT = 0            # EV events on the pad since the last per-second pass
-PAD_ABS_COUNT = 0           # EV_ABS events on the pad since the last pass
+PAD_ABS_COUNT = 0           # EV_ABS events (any axis) on the pad since the pass
 PAD_GYRO_AXIS_COUNT = 0     # gyro-axis (ABS_RX/ABS_RY) events on the pad
 PAD_GYRO_LAST = 0.0         # monotonic of the last gyro-axis pad event
+# v3.12 — per-DATA-TYPE pad counters (independent; the v3.11 shared-latch
+# starvation is why [PAD→GAME] could show 0 during proven delivery).
+PAD_KEY_COUNT = 0           # EV_KEY (button) events on the pad since the pass
+PAD_KEY_LAST = 0.0          # monotonic of the last pad EV_KEY event
+PAD_STICK_COUNT = 0         # non-gyro EV_ABS (sticks/triggers) on the pad
+PAD_STICK_LAST = 0.0        # monotonic of the last pad non-gyro EV_ABS event
+# per-DATA-TYPE anti-spam delivery latches (independent per stream).
+PAD_KEY_LATCH = 0.0         # last [PAD→GAME buttons pad_key/s] log
+PAD_STICK_LATCH = 0.0       # last [PAD→GAME sticks pad_abs/s] log
 PAD_DEAD_LOGGED = False     # True while a [PAD-DEAD] window is open (re-assert)
 PAD_DEAD_LAST = 0.0         # monotonic last [PAD-DEAD] log (anti-spam)
 PAD_RECREATED_LAST = 0.0    # monotonic last [PAD-RECREATED] log (anti-spam)
@@ -223,7 +269,22 @@ DECK_ACTION_COUNT = 0       # deck button/stick/trigger changes since the pass
 # Last [PAD→GAME] evidence (for the SNAPSHOT game_reader= field + markers).
 PAD_GAME_READER = False     # True when a game pid holds the pad fd
 PAD_GAME_READER_PID = None  # the game pid holding the pad fd (or None)
+PAD_GAME_READER_NAME = ""   # human name of the real game reader (e.g. eso64.exe)
+PAD_GAME_READER_APPID = None  # SteamAppId of the real game reader (e.g. 306130)
 PAD_GYRO_MAP = None         # 'pad-axes' | 'mouse' | 'none' | None (unknown)
+# v3.12 — WAKE-vs-GYRO attribution state. Pre-sleep gyro/button "was flowing"
+# baselines are captured at [SLEEP-ENTER] (before the freeze) so the post-wake
+# comparison can honestly say "gyro reached the pad before sleep, and does/does
+# not after wake while buttons keep flowing". gyro_is_live is a per-source
+# boolean re-derived by gyro.py each window.
+PRE_SLEEP_BTN = None        # None|bool: pad buttons flowing just before sleep
+PRE_SLEEP_GYRO = None       # None|bool: pad gyro axes flowing just before sleep
+GYRO_IS_LIVE = None         # per-source verdict: the physical gyro live now
+GYRO_SRC_CARRIER = None     # which physical gyro carries it (center/right-handle)
+# python-evdev reader liveness (evreader.py owns the pad node when active).
+EVREADER_ON = False         # True while the evdev pad reader thread is active
+EVREADER_ERR = ""           # last python-evdev reader error ('' = clean)
+EVREADER_STARTED = False    # True once start_evreader() ran (even if evdev off)
 
 # ---------------------------------------------------------------------------
 # Shutdown flag (set by logcore._signal_handler, read by every daemon loop)

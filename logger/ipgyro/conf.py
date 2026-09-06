@@ -153,7 +153,25 @@ DECK_DRAIN_MAX = 16         # max frames coalesced from one deck burst drain
 #  2026-09-05 on user request; the full contract now lives in Agent.md,
 #  section "2026-09-05 ~22:3x — V22 ДИЗАЙН-ДОКУМЕНТ ...".)
 # ---------------------------------------------------------------------------
-LOG_VERSION = "v3.11"
+LOG_VERSION = "v3.12"
+
+# ---------------------------------------------------------------------------
+# v3.12 (todo 52r) — truthful mode/sleep/per-source delivery cadences.
+# ---------------------------------------------------------------------------
+# (FIX-A) real session-mode scan cadence (mode.py classify is cheap; a change
+# log is anti-spammed internally). The [MODE ... via ...] change marker fires
+# on change; the periodic re-scan keeps the SNAPSHOT mode= field fresh.
+MODE_SCAN_INTERVAL = 5.0    # periodic real-mode re-scan (seconds)
+# (FIX-B) authoritative sleep: the second independent signal (kernel PM lines
+# via journalctl -k) is polled on this cadence as a backstop when the
+# systemd-suspend unit follower stalls; the mono-gap backstop in obs is gated
+# on S.SLEEP_PENDING as before.
+PM_KERNEL_POLL = 5.0        # kernel-PM journal backstop poll cadence (seconds)
+PM_KERNEL_WINDOW = 120      # journalctl -k --since window for the backstop
+# (FIX-C) post-wake gyro-vs-button compare window: after a wake we compare the
+# pre-sleep pad gyro/button baseline against the first WAKE_GYRO_COMPARE_S of
+# post-wake pad flow and emit [GYRO-REGAINED]/[GYRO-STALL-AFTER-WAKE].
+WAKE_GYRO_COMPARE_S = 8.0   # seconds after wake to judge gyro regain/stall
 
 # v3.9 (todo 52f FIX-1 CLEAR NAMING): the HUMAN vocabulary every log/config
 # shows. Internal role/deck_kind keys (discover.py), mode internals and marker

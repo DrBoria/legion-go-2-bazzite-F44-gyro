@@ -81,6 +81,32 @@ pad), the [DECK→STEAM] hop-1 re-anchor tag, and new SNAPSHOT counters
 (deck_rd/s, pad_ev/s, game_reader, gyro_map). Deck frames + Steam config are
 PRECONDITIONS only — never proof. New markers only ADD; every existing marker
 token stays byte-compatible.
+
+v3.12 (todo 52r "FIX LOGGER") — TRUTHFUL mode/sleep/per-source delivery. Three
+user ground-truth corrections fixed the v3.11 lies at their SOURCE:
+  FIX-A REAL MODE: mode= is no longer derived from the transport deck roles or
+    the Steam-Input focused window (which reported gaming-mode while the user
+    sat in a DESKTOP session running ESO). ipgyro.mode classifies the REAL
+    session mode: DESKTOP = a desktop session is present (DE shell process /
+    XDG_CURRENT_DESKTOP / graphical loginctl session on a seat); GAMING = a
+    no-desktop Big Picture/gamescope session. A running game NEVER switches
+    mode. [MODE desktop|gaming|unknown via <evidence>] at each change; SNAPSHOT
+    mode=desktop|gaming|unknown.
+  FIX-B AUTHORITATIVE SLEEP: the systemd-suspend journal follower is hardened
+    AND a second independent kernel-PM signal (journalctl -k) is added, so the
+    user's real suspend ALWAYS appears as [SLEEP-ENTER]/[SLEEP-WAKE] with wall
+    timestamps + sleep duration; SNAPSHOT sleep=entering|asleep|awake+<dur>.
+  FIX-C PER-SOURCE DELIVERY: buttons and gyro are INDEPENDENT per-source
+    streams with SEPARATE counters + anti-spam latches (pad_key/s, pad_abs/s,
+    pad_gyro/s) so one stall never masks the other; the per-source gyro carrier
+    (center while attached, right-handle while detached) is tracked; gyro loss
+    is attributed to the WAKE boundary ([GYRO-REGAINED]/[GYRO-STALL-AFTER-WAKE]
+    vs the pre-sleep baseline), never to a detach. game_reader is the REAL game
+    (<pid>:<name> via SteamAppId + wine/proton tree), not "any Steam process".
+  PART 2: the evdev-visible hops (Steam pad 28de:11ff) move onto python-evdev
+    (ipgyro.evreader: stable identity, churn-following reopen, independent
+    bounded non-blocking reader); the physical XInput hop stays raw-hidraw.
+    python-evdev is optional (falls back to the raw devices.py capture).
 """
 
-__version__ = "v3.11"
+__version__ = "v3.12"

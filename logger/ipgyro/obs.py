@@ -34,7 +34,7 @@ from . import discover as D
 from .conf import (DECK_MODE_WORDS, FULL_MODE_GAME, FULL_MODE_POST,
                    FULL_MODE_WAKE, LOOP_STALL_HB, LOOP_STALL_LOG_S,
                    MODE_TAG_WORDS, PAD_DELIVERY_HB, PAD_STALL_S,
-                   REGRAB_MISSING_S, SESS_INTERVAL)
+                   REGRAB_MISSING_S, SESS_INTERVAL, WAKE_GYRO_COMPARE_S)
 from .hidraw import _hid_label
 from .logcore import log, run_cmd
 
@@ -44,8 +44,13 @@ from .logcore import log, run_cmd
 # ---------------------------------------------------------------------------
 
 def _deck_mode(found_hid):
-    """Mode from the deck-output roles present (NOT pids): a GAMING (uhid) deck
-    and/or a DESKTOP (vhci) Steam Controller."""
+    """LEGACY transport-derived mode (v3.11 and earlier). KEPT ONLY as the
+    internal STATE-tracker vocabulary (no-deck / gaming / desktop / transition)
+    for the [STATE: steady-state ...] line. v3.12 (todo 52r FIX-A) does NOT use
+    this for the SNAPSHOT mode= field or the [DETACH]/[DOCK] mode= tag — those
+    now come from the REAL session-mode classifier (ipgyro.mode), because this
+    transport view reports "gaming" whenever a uhid gaming deck exists, which is
+    true even while the user sits in a DESKTOP session running ESO."""
     game = any(D.is_game_deck(h) for h in found_hid.values())
     desk = any(h.get("role") == D.ROLE_DECK
                and h.get("deck_kind") == D.DECK_DESK
@@ -60,36 +65,26 @@ def _deck_mode(found_hid):
 
 
 def _live_mode_tag(force=False):
-    """(v3.8 F1/F3) 'game'|'desktop'|'none' for the [DETACH]/[DOCK]/
-    [RECONNECT-DT] mode= tag. The LIVE Steam context is authoritative: the
-    focused AppID / active Steam-Input window (a real game AppID = game; the
-    desktop shell 413080 / Steam client 769 / none = desktop) PLUS the
-    running-game proc set (fallback only when focus is unknown). force=True
-    runs a fresh Steam poll NOW (F3) so the tag is never a stale periodic
-    [STEAM-STATE]. The transport-based deck_mode_of is used ONLY when the Steam
-    context is unavailable (verdict None)."""
-    from . import steam as ST   # lazy: steam.py imports obs at module level
+    """(v3.12 FIX-A) The REAL session-mode word ('desktop'|'gaming'|'unknown')
+    for the [DETACH]/[DOCK]/[RECONNECT-DT] mode= tag, from the ipgyro.mode
+    classifier (a DESKTOP session present vs a no-desktop Big Picture/gamescope
+    GAMING session). A running game NEVER changes this verdict — launching ESO
+    from the desktop stays desktop. force=True re-classifies NOW so the tag is
+    never a stale periodic verdict. The v3.11 transport/Steam-focus derivation
+    is GONE from this path (it produced the gaming-mode lie)."""
+    from . import mode as M   # lazy: mode.py imports only conf/logcore
     try:
         if force:
-            ST.steam_refresh(time.monotonic())
-        else:
-            ST.record_mode_verdict()
+            return M.scan(time.monotonic(), force=True)
+        return M.live()
     except Exception:
-        pass
-    if S.MODE_CTX is not None:
-        return S.MODE_CTX
-    # Steam context unavailable -> transport fallback (deck_output kind)
-    for e in S.HID_DEVICES.values():
-        m = D.deck_mode_of(e)
-        if m:
-            return m
-    return "none"
+        return "unknown"
 
 
 def _detach_marker(mode):
     """Byte-compatible [DETACH] line text (shared by capture.scan_hidraw and the
     startup-window synthesis so both always emit the identical format). The
-    mode=/owner= payload is the v3.9 human vocabulary (FIX-1)."""
+    mode=/owner= payload is the v3.12 REAL session-mode word (FIX-A)."""
     return (f"[DETACH] controller input GONE "
             f"(0 controller nodes open) mode={_human_mode_tag(mode)} "
             f"owner=controller — controller detached / off / "
@@ -112,8 +107,10 @@ def _human_deck_mode(m):
 
 
 def _human_mode_tag(m):
-    """'game' -> 'gaming-mode' / 'desktop' -> 'desktop' for the mode= tag on
-    [DETACH]/[DOCK]/[RECONNECT-DT] (v3.9 FIX-1 human vocabulary)."""
+    """'desktop' -> 'desktop' / 'gaming' -> 'gaming-mode' / 'unknown' ->
+    'unknown' for the mode= tag on [DETACH]/[DOCK]/[RECONNECT-DT] (v3.12
+    FIX-A real session-mode vocabulary; 'game'/'none' legacy keys kept for
+    byte-compat of any pre-v3.12 caller)."""
     return MODE_TAG_WORDS.get(m, m)
 
 
@@ -125,21 +122,27 @@ def _group_labels(role):
 
 
 def _fmt_state(st):
-    return ("mode={} controller=[{}] xbox-pad=[{}] iio={}".format(
-        _human_deck_mode(st["mode"]),
-        ",".join(st["legion_hid"]) or "-",
-        ",".join(st["xpad"]) or "-", st["iio"]))
+    return ("mode={} session-mode={} controller=[{}] xbox-pad=[{}] iio={}"
+            .format(
+                _human_deck_mode(st["mode"]),
+                _human_mode_tag(st.get("real", "unknown")),
+                ",".join(st["legion_hid"]) or "-",
+                ",".join(st["xpad"]) or "-", st["iio"]))
 
 
 def state_tracker(devices, found_hid):
-    """Diff the derived state against the previous scan and log transitions."""
-    mode = _deck_mode(found_hid)
+    """Diff the derived state against the previous scan and log transitions.
+    v3.12 (todo 52r FIX-A): the STATE line's mode= now reflects the REAL
+    session-mode verdict (desktop|gaming|unknown) alongside the transport deck
+    view, so a desktop+ESO session is never labelled gaming-mode."""
+    mode = _deck_mode(found_hid)          # transport view (STATE vocabulary)
+    real = _live_mode_tag(force=False)    # REAL session-mode word (FIX-A)
     legion_hid = sorted(_hid_label(h) for h in found_hid.values()
                         if h.get("role") == D.ROLE_PHYSICAL)
     xpad = sorted(
         (d.get("name") or "").strip()
         for d in devices if "x-box pad" in (d.get("name") or "").lower())
-    st = {"mode": mode, "legion_hid": legion_hid, "xpad": xpad,
+    st = {"mode": mode, "real": real, "legion_hid": legion_hid, "xpad": xpad,
           "iio": len(S.IIO_DEVICES)}
     if S.LAST_STATE is None:
         log("STATE: steady-state " + _fmt_state(st))
@@ -152,6 +155,10 @@ def state_tracker(devices, found_hid):
         changes.append("mode {} -> {}".format(
             _human_deck_mode(S.LAST_STATE["mode"]),
             _human_deck_mode(st["mode"])))
+    if st["real"] != S.LAST_STATE["real"]:
+        changes.append("session-mode {} -> {}".format(
+            _human_mode_tag(S.LAST_STATE["real"]),
+            _human_mode_tag(st["real"])))
     for key, noun in (("legion_hid", "controller hidraw"),
                       ("xpad", "kernel X-Box pad(evdev)")):
         old = set(S.LAST_STATE[key])
@@ -159,7 +166,7 @@ def state_tracker(devices, found_hid):
         if new - old:
             changes.append(f"{noun} attached: {', '.join(sorted(new - old))}")
         if old - new:
-            changes.append(f"{noun} detached: {', '.join(sorted(old - new))}")
+            changes.append(f"{noun} detached: {', '.join(sorted(old - old))}")
     if st["iio"] != S.LAST_STATE["iio"]:
         changes.append(f"iio devices {S.LAST_STATE['iio']} -> {st['iio']}")
     # (d/e) every mode/attach state transition arms full capture and snapshots
@@ -203,26 +210,46 @@ def snapshot_state(reason):
     controller=[...] (physical input) and virtual=[...] (Steam-facing output).
     v3.11 (todo 52o): adds the real-delivery counters deck_rd/s (deck frames,
     hop 1 only), pad_ev/s (EV events on the 28de:11ff pad), game_reader=yes/no
-    (a game pid holds the pad fd) and gyro_map=pad-axes|mouse|none."""
-    mode = _human_deck_mode(_deck_mode(S.HID_DEVICES))
+    (a game pid holds the pad fd) and gyro_map=pad-axes|mouse|none.
+    v3.12 (todo 52r): mode= is the REAL session-mode word (desktop|gaming|
+    unknown, FIX-A); adds sleep=<state> (FIX-B), the per-data-type pad counters
+    pad_key/s + pad_abs/s (FIX-C), game_reader=<pid>:<name> (real game) and the
+    per-source gyro carrier (FIX-C)."""
+    mode = _human_mode_tag(_live_mode_tag(force=False))   # REAL session-mode
     cen = S.CEN_IMU
     cen_s = f"{cen['entry']}({cen['name']})" if cen else "none"
     controller = _group_labels(D.ROLE_PHYSICAL)
     virtual = _group_labels(D.ROLE_DECK)
     pad_node = S.PAD_NODE or "-"
+    # -- sleep state word (FIX-B): entering|asleep|awake(+last duration) ------
+    if S.SLEEP_STATE == "entering":
+        sleep_s = "entering"
+    elif S.SLEEP_STATE == "asleep":
+        sleep_s = "asleep"
+    else:
+        sleep_s = "awake"
+        if S.SLEEP_LAST_DUR is not None:
+            sleep_s += f"+{S.SLEEP_LAST_DUR:.0f}s"
+    # -- real game reader (FIX: <pid>:<name>) ---------------------------------
+    if S.PAD_GAME_READER_PID is not None:
+        gr = f"{S.PAD_GAME_READER_PID}:{S.PAD_GAME_READER_NAME or '?'}"
+    else:
+        gr = "none"
+    gyro_carrier = S.GYRO_SRC_CARRIER or "unknown"
     log(f"[SNAPSHOT] reason={reason} mode={mode} "
         f"controller=[{','.join(controller) or '-'}] "
         f"virtual=[{','.join(virtual) or '-'}] "
         f"iio={len(S.IIO_DEVICES)} cen_imu={cen_s} "
-        f"gyro_src={S.GYRO_SRC or 'unknown'} "
+        f"gyro_src={S.GYRO_SRC or 'unknown'} gyro_carrier={gyro_carrier} "
         f"steam_focus={S.STEAM_UI_FOCUS or 'none'} "
         f"steam_procs={S.STEAM_APP_SUMMARY or '(none)'} "
         f"game={'yes' if S.GAME_FOCUSED else 'no'} "
         f"deck_keepalive={'yes' if S.DECK_KEEPALIVE else 'no'} "
         f"pad_node={pad_node} "
-        f"deck_rd/s={S.DECK_RD_COUNT} pad_ev/s={S.PAD_EV_COUNT} "
-        f"game_reader={'yes' if S.PAD_GAME_READER else 'no'} "
-        f"gyro_map={S.PAD_GYRO_MAP or 'unknown'}")
+        f"deck_rd/s={S.DECK_RD_COUNT} pad_key/s={S.PAD_KEY_COUNT} "
+        f"pad_abs/s={S.PAD_ABS_COUNT} "
+        f"game_reader={gr} gyro_map={S.PAD_GYRO_MAP or 'unknown'} "
+        f"sleep={sleep_s}")
 
 
 # ---------------------------------------------------------------------------
@@ -263,26 +290,132 @@ def _pad_reader_pids():
     return pids
 
 
+def _proc_environ_dict(pid):
+    """Decoded environ dict of one pid ('' on any failure)."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            raw = f.read()
+    except Exception:
+        return {}
+    env = {}
+    for kv in raw.split(b"\x00"):
+        k, _, v = kv.partition(b"=")
+        if k:
+            env[k.decode("ascii", "replace")] = v.decode("utf-8", "replace")
+    return env
+
+
+def _proc_comm(pid):
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip() or ""
+    except Exception:
+        return ""
+
+
 def _game_reader_pid():
-    """The game pid holding the pad fd, from S.STEAM_PROC_SET (pid -> (appid,
-    name, cmd)). Generic: any running Steam game process that holds the pad fd
-    counts (ESO SteamAppId=306130 is discovered generically, never hardcoded)."""
+    """(v3.12 FIX: REAL GAME PID) The ACTUAL game process holding the pad fd,
+    not "any Steam process". Resolution order:
+      1. a pad-fd reader that is itself a running Steam game (pid in
+         S.STEAM_PROC_SET, i.e. its environ carries SteamAppId/SteamGameId);
+      2. a pad-fd reader whose /proc environ carries a SteamAppId/SteamGameId
+         (covers Proton/wine children that inherit the env but are not in the
+         Steam proc set because they are not direct Steam-launched pids);
+      3. a pad-fd reader that is a child (wine/proton) of a Steam game process
+         (walk /proc/<pid>/task/<tid>/children up to the game) — e.g.
+         winedevice.exe / ESO's wine tree holding the pad fd.
+    Publishes S.PAD_READER_PIDS + the resolved game reader identity
+    (S.PAD_GAME_READER_PID / _NAME / _APPID). Returns the game pid or None.
+    Generic: the AppID is read from environ (ESO SteamAppId=306130 is
+    discovered, never hardcoded)."""
     readers = _pad_reader_pids()
     S.PAD_READER_PIDS = readers
+    if not readers:
+        S.PAD_GAME_READER_PID = None
+        S.PAD_GAME_READER_NAME = ""
+        S.PAD_GAME_READER_APPID = None
+        return None
+
+    # -- 1: a reader that is itself a running Steam game ----------------------
     for pid in sorted(readers):
         if pid in S.STEAM_PROC_SET:
+            _set_game_reader(pid)
             return pid
-    # fallback: any reader whose /proc environ carries a SteamAppId
+    # -- 2: a reader whose environ carries a SteamAppId ------------------------
     for pid in sorted(readers):
+        env = _proc_environ_dict(pid)
+        appid = env.get("SteamAppId") or env.get("SteamGameId")
+        if appid:
+            _set_game_reader(pid, appid=appid)
+            return pid
+    # -- 3: a reader that is a wine/proton child of a Steam game --------------
+    # Build parent->children once and walk upward from each reader to find a
+    # Steam game ancestor (the game owns the wine tree that reads the pad).
+    children = _proc_children_map()
+    for pid in sorted(readers):
+        anc = _steam_game_ancestor(pid, children)
+        if anc is not None:
+            _set_game_reader(pid, appid=S.STEAM_PROC_SET.get(anc, (None,))[0])
+            return pid
+    S.PAD_GAME_READER_PID = None
+    S.PAD_GAME_READER_NAME = ""
+    S.PAD_GAME_READER_APPID = None
+    return None
+
+
+def _set_game_reader(pid, appid=None):
+    """Publish the resolved real-game reader identity on S."""
+    S.PAD_GAME_READER_PID = pid
+    S.PAD_GAME_READER_NAME = _proc_comm(pid) or "?"
+    if appid is None:
+        appid = S.STEAM_PROC_SET.get(pid, (None,))[0]
+    S.PAD_GAME_READER_APPID = appid
+
+
+def _proc_children_map():
+    """{pid -> set(child pids)} from /proc/<pid>/task/<tid>/children (best-effort).
+    Reading a process's children requires the same uid OR root; the logger runs
+    as root so every tree is readable. Returns a dict."""
+    out = {}
+    try:
+        entries = os.listdir("/proc")
+    except Exception:
+        return out
+    for p in entries:
+        if not p.isdigit():
+            continue
         try:
-            with open(f"/proc/{pid}/environ", "rb") as f:
-                data = f.read()
+            tids = os.listdir(f"/proc/{p}/task")
         except Exception:
             continue
-        for kv in data.split(b"\x00"):
-            k, _, v = kv.partition(b"=")
-            if k in (b"SteamAppId", b"SteamGameId") and v:
-                return pid
+        for tid in tids:
+            try:
+                with open(f"/proc/{p}/task/{tid}/children") as f:
+                    raw = f.read().split()
+            except Exception:
+                continue
+            for c in raw:
+                if c.isdigit():
+                    out.setdefault(int(p), set()).add(int(c))
+    return out
+
+
+def _steam_game_ancestor(pid, children):
+    """Walk upward from `pid` to the nearest ancestor that is a running Steam
+    game (in S.STEAM_PROC_SET). Returns the ancestor pid or None. Uses the
+    children map inverted (child -> parent) by scanning all parents."""
+    # build child -> parent from the children map
+    parent_of = {}
+    for parent, kids in children.items():
+        for k in kids:
+            parent_of[k] = parent
+    cur = pid
+    seen = set()
+    while cur and cur not in seen:
+        seen.add(cur)
+        if cur in S.STEAM_PROC_SET:
+            return cur
+        cur = parent_of.get(cur)
     return None
 
 
@@ -304,19 +437,69 @@ def _gyro_map_verdict(now):
     return "none"
 
 
+def _wake_gyro_compare(now):
+    """(v3.12 FIX-C) Post-wake gyro-vs-button attribution. Called once per wake
+    (guarded by S.WAKE_GYRO_COMPARED) ~WAKE_GYRO_COMPARE_S after the wake. It
+    compares the PRE-SLEEP pad gyro/button baseline (captured at [SLEEP-ENTER])
+    against the POST-WAKE pad flow and emits:
+      * [GYRO-REGAINED]        pre-sleep gyro was flowing AND post-wake gyro is
+                               flowing again (buttons also flowing) — gyro OK;
+      * [GYRO-STALL-AFTER-WAKE] pre-sleep gyro was flowing but post-wake gyro is
+                               NOT on the pad while buttons/sticks still reach
+                               the game — the exact "gyro died after wake"
+                               symptom, attributed to the WAKE boundary (never
+                               to a detach);
+      * (no marker)            no pre-sleep gyro baseline / no game reader, so
+                               nothing provable to compare (honest silence).
+    The per-source gyro carrier (center vs right-handle) is read from
+    S.GYRO_SRC_CARRIER so the marker names WHICH physical gyro is live."""
+    if S.PRE_SLEEP_GYRO is not True:
+        return
+    if S.PAD_GAME_READER_PID is None:
+        return
+    btn_now = S.PAD_KEY_COUNT > 0 or S.PAD_STICK_COUNT > 0
+    gyro_now = S.PAD_GYRO_AXIS_COUNT > 0
+    carrier = S.GYRO_SRC_CARRIER or "unknown"
+    if gyro_now:
+        if not S.WAKE_GYRO_STALLED:
+            log(f"[GYRO-REGAINED] post-wake gyro-on-pad flowing again "
+                f"(gyro={S.PAD_GYRO_AXIS_COUNT}/s, carrier={carrier}) — gyro "
+                f"survived the wake")
+    elif btn_now:
+        S.WAKE_GYRO_STALLED = True
+        log(f"[GYRO-STALL-AFTER-WAKE] pre-sleep gyro was on the pad but "
+            f"post-wake gyro={S.PAD_GYRO_AXIS_COUNT}/s while buttons/sticks "
+            f"still reach the game (pad_key/s={S.PAD_KEY_COUNT} "
+            f"pad_abs/s={S.PAD_STICK_COUNT}) — gyro LOST at the WAKE boundary, "
+            f"NOT at detach (carrier={carrier})")
+    else:
+        log(f"[GYRO-STALL-AFTER-WAKE] post-wake NO pad flow at all yet "
+            f"(buttons={btn_now} gyro={gyro_now}) — game not re-delivering yet")
+
+
 def pad_verdict_scan(now):
-    """(v3.11) Per-second REAL-delivery verdict. Emits:
+    """(v3.11/v3.12) Per-second REAL-delivery verdict. v3.12 (todo 52r FIX-C)
+    models BUTTONS and GYRO as INDEPENDENT per-source streams with SEPARATE
+    counters + anti-spam latches, so one stall never masks the other and the log
+    can honestly show "buttons reached the game, gyro did not" after a wake.
+    Emits:
       * [DECK→STEAM]  deck frames flowing (hop 1: deck -> Steam) — upstream
                       only, a PRECONDITION, never proof the game got the input;
-      * [PAD→GAME]    pad EV events (28de:11ff) WHILE a game pid holds the pad
-                      fd — the ONLY host-side proof input reached the game;
+      * [PAD→GAME]    pad EV events (28de:11ff) WHILE the REAL game pid holds
+                      the pad fd — the ONLY host-side proof input reached the
+                      game. Split per data type: buttons (pad_key/s) and
+                      sticks (pad_abs/s) each get their OWN delivery latch so a
+                      busy button stream can never starve the stick/gyro verdict
+                      (the v3.11 shared-latch starvation bug);
       * [PAD-DEAD]    pad node + game reader present + deck delivering but ZERO
                       pad EV events for PAD_STALL_S (Valve steam-for-linux#13029:
                       game dropped the device and never re-acquired);
       * [GYRO→PAD-AXIS] gyro-driven ABS_RX/ABS_RY events on the pad while the
                       game holds it (gyro PROVABLY reached the game);
       * [GYRO-OUTPUT] gyro is bound to mouse/unmapped (not provable through the
-                      pad) — never fabricate a delivery claim.
+                      pad) — never fabricate a delivery claim;
+      * [GYRO-REGAINED]/[GYRO-STALL-AFTER-WAKE] once per wake (FIX-C) by
+                      comparing the pre-sleep gyro baseline vs post-wake flow.
     [PAD-RECREATED]/[GAME-LOST-PAD] are emitted by devices.scan_evdev. Resets
     the per-second pad counters after the verdict."""
     deck_rd = S.DECK_RD_COUNT
@@ -324,11 +507,12 @@ def pad_verdict_scan(now):
     deck_act = S.DECK_ACTION_COUNT
     pad_ev = S.PAD_EV_COUNT
     pad_abs = S.PAD_ABS_COUNT
+    pad_key = S.PAD_KEY_COUNT
+    pad_stick = S.PAD_STICK_COUNT
     pad_gyro = S.PAD_GYRO_AXIS_COUNT
     pad_node = S.PAD_NODE
     game_reader = _game_reader_pid()
     S.PAD_GAME_READER = game_reader is not None
-    S.PAD_GAME_READER_PID = game_reader
     S.PAD_GYRO_MAP = _gyro_map_verdict(now)
 
     # -- hop-1: deck frames flowing (upstream only, precondition) ------------
@@ -339,22 +523,30 @@ def pad_verdict_scan(now):
                 f"(mot={deck_mot} act={deck_act}) — HOP 1 deck->Steam only, "
                 f"NOT proof the game got the input")
 
-    # -- proof: pad EV events + a game pid holds the pad fd ------------------
+    # -- proof: pad EV events + the REAL game pid holds the pad fd ------------
     if game_reader is not None and pad_ev > 0:
         S.PAD_DEAD_LOGGED = False          # pad is alive -> clear [PAD-DEAD]
-        if now - S.PAD_DELIVERY_LAST >= PAD_DELIVERY_HB:
-            S.PAD_DELIVERY_LAST = now
-            log(f"[PAD→GAME] {pad_ev} EV events/s on pad {pad_node} "
-                f"(28de:11ff) read by game pid={game_reader} — input REACHED "
-                f"the game")
-        # -- gyro provability through the pad --------------------------------
+        gr = f"{game_reader}:{S.PAD_GAME_READER_NAME or '?'}"
+        # -- buttons (EV_KEY) — its OWN latch (FIX-C) -------------------------
+        if pad_key > 0:
+            if now - S.PAD_KEY_LATCH >= PAD_DELIVERY_HB:
+                S.PAD_KEY_LATCH = now
+                log(f"[PAD→GAME] buttons pad_key/s={pad_key} on pad {pad_node} "
+                    f"(28de:11ff) read by game {gr} — BUTTONS reached the game")
+        # -- sticks/triggers (non-gyro EV_ABS) — its OWN latch (FIX-C) ---------
+        if pad_stick > 0:
+            if now - S.PAD_STICK_LATCH >= PAD_DELIVERY_HB:
+                S.PAD_STICK_LATCH = now
+                log(f"[PAD→GAME] sticks pad_abs/s={pad_stick} on pad {pad_node} "
+                    f"(28de:11ff) read by game {gr} — STICKS reached the game")
+        # -- gyro provability through the pad (independent of buttons) --------
         if pad_gyro > 0:
             if not S.PAD_GYRO_AXIS_LOGGED or \
                     now - S.PAD_GYRO_AXIS_LAST >= PAD_DELIVERY_HB:
                 S.PAD_GYRO_AXIS_LOGGED = True
                 S.PAD_GYRO_AXIS_LAST = now
                 log(f"[GYRO→PAD-AXIS] {pad_gyro} gyro-axis ABS_RX/ABS_RY "
-                    f"events/s on pad {pad_node} read by game pid={game_reader} "
+                    f"events/s on pad {pad_node} read by game {gr} "
                     f"— gyro PROVABLY reached the game (mapped to pad axes)")
         else:
             # deck IMU moving but no gyro on the pad -> gyro bound to mouse
@@ -372,16 +564,28 @@ def pad_verdict_scan(now):
             if not S.PAD_DEAD_LOGGED or now - S.PAD_DEAD_LAST >= PAD_DELIVERY_HB:
                 S.PAD_DEAD_LOGGED = True
                 S.PAD_DEAD_LAST = now
-                log(f"[PAD-DEAD] pad {pad_node} present + game pid={game_reader} "
-                    f"holds it + deck delivering {deck_rd} rd/s but ZERO pad EV "
-                    f"events for {PAD_STALL_S:.0f}s — game dropped the device "
-                    f"and never re-acquired (Valve steam-for-linux#13029)")
+                log(f"[PAD-DEAD] pad {pad_node} present + game "
+                    f"{game_reader}:{S.PAD_GAME_READER_NAME or '?'} holds it + "
+                    f"deck delivering {deck_rd} rd/s but ZERO pad EV events for "
+                    f"{PAD_STALL_S:.0f}s — game dropped the device and never "
+                    f"re-acquired (Valve steam-for-linux#13029)")
         else:
             S.PAD_DEAD_LOGGED = False
+
+    # -- (FIX-C) once-per-wake gyro-vs-button compare -------------------------
+    if (S.SLEEP_WAKE_TS is not None and S.SLEEP_WAKE_TS > S.WAKE_GYRO_COMPARED
+            and now - S.SLEEP_WAKE_TS >= WAKE_GYRO_COMPARE_S):
+        S.WAKE_GYRO_COMPARED = S.SLEEP_WAKE_TS
+        try:
+            _wake_gyro_compare(now)
+        except Exception:
+            pass
 
     # -- reset the per-second pad counters (consumed by the next snapshot) ----
     S.PAD_EV_COUNT = 0
     S.PAD_ABS_COUNT = 0
+    S.PAD_KEY_COUNT = 0
+    S.PAD_STICK_COUNT = 0
     S.PAD_GYRO_AXIS_COUNT = 0
 
 
@@ -589,6 +793,9 @@ def pm_wake_check(now):
         S.SLEEP_PENDING = False
         S.SLEEP_WAKE_TS = now
         S.WAKE_HANDLED_TS = now
+        S.SLEEP_STATE = "awake"
+        if S.SLEEP_ENTER_MONO is not None:
+            S.SLEEP_LAST_DUR = now - S.SLEEP_ENTER_MONO
         log(f"PM: [SLEEP-WAKE] real resume — monotonic gap "
             f"{now - S.LAST_TICK:.1f}s (systemd-suspend journal enter was "
             f"seen before the freeze; wake confirmed by the gap)")
@@ -599,6 +806,7 @@ def pm_wake_check(now):
         # the journal follower logged the real [SLEEP-WAKE] line; apply the
         # wake consequences here (once) so full capture re-arms after resume.
         S.WAKE_HANDLED_TS = S.SLEEP_WAKE_TS
+        S.SLEEP_STATE = "awake"
         _enter_full("sleep-wake", hold=FULL_MODE_WAKE)
         snapshot_state("sleep-wake")
         _spawn_wake_burst_fallback(S.SLEEP_WAKE_TS)
@@ -710,3 +918,20 @@ def startup_reconcile(now):
     else:
         log(f"[STARTUP-WINDOW] detach tracking live at +{b:.0f}s baseline; "
             f"no pre-live physical churn recorded")
+
+
+# ---------------------------------------------------------------------------
+# v3.12 (todo 52r FIX-A) — periodic REAL session-mode re-scan. Keeps the
+# SNAPSHOT mode= field and the [MODE ... via ...] change marker fresh from the
+# ipgyro.mode classifier (desktop|gaming|unknown) without touching system state.
+# ---------------------------------------------------------------------------
+
+def mode_scan(now):
+    """Recompute the REAL session-mode verdict (ipgyro.mode.classify) and log
+    [MODE <word> via <evidence>] on change. Called on the MODE_SCAN_INTERVAL
+    cadence from app.main(). Never raises."""
+    from . import mode as M   # lazy: mode.py imports only conf/logcore
+    try:
+        M.scan(now, force=False)
+    except Exception:
+        pass

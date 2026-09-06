@@ -40,9 +40,11 @@ from .hidraw import emit_hid_summary, handle_hidraw, scan_hidraw
 from .iio import discover_iio, sample_iio
 from .ipj import ipj_backlog, ipj_tail_loop
 from .logcore import _signal_handler, log, maybe_rotate, run_cmd
-from .obs import (_full_mode, loop_stall_watchdog_loop, pad_verdict_scan,
-                  pm_probe, pm_wake_check, startup_reconcile, state_tracker)
-from .pm import pm_backlog, pm_journal_loop
+from .obs import (_full_mode, loop_stall_watchdog_loop, mode_scan,
+                  pad_verdict_scan, pm_probe, pm_wake_check, startup_reconcile,
+                  state_tracker)
+from .pm import pm_backlog, pm_journal_loop, pm_kernel_loop, pm_kernel_poll
+from .evreader import drain_events, start_evreader
 from .steam import steam_scan, steam_state_verdict
 from .udev import udev_monitor_loop
 
@@ -90,6 +92,10 @@ def _load_config():
         "IPJ_WAKE_FLUSH_S": "ipj_wake_flush",
         # v3.11 (todo 52o) real input-delivery tracking cadences
         "PAD_STALL_S": "pad_stall", "PAD_DELIVERY_HB": "pad_delivery_hb",
+        # v3.12 (todo 52r) truthful mode/sleep/per-source cadences
+        "MODE_SCAN_INTERVAL": "mode_scan", "PM_KERNEL_POLL": "pm_kernel_poll",
+        "PM_KERNEL_WINDOW": "pm_kernel_window",
+        "WAKE_GYRO_COMPARE_S": "wake_gyro_compare",
     })
     # D3 — the two [GYRO-FEED] verdict instants come from two config keys.
     try:
@@ -177,6 +183,13 @@ def main():
     log_snapshot(devices, full=True)
     # (R4) full device inventory with VID:PID/serial/syspath/class at startup
     log_device_inventory(devices, "startup")
+    # (v3.12 PART 2) python-evdev pad reader (independent, churn-following).
+    # Started BEFORE the raw scan: start_evreader() sets S.EVREADER_ON True
+    # synchronously, so the scan_evdev right after already EXCLUDES the pad node
+    # from the raw capture — the pad is owned by exactly ONE reader from the
+    # very first scan (evdev multicast would otherwise double-count pad events).
+    # Falls back to the raw devices.py capture if python-evdev is unavailable.
+    start_evreader()
     scan_evdev(devices, build_node_map(devices))
     discover_iio()
     # (R1) identify the attached center body IMU right after iio discovery
@@ -194,6 +207,9 @@ def main():
     # (R6) reliable systemd-suspend journal follower for [SLEEP-ENTER]/[SLEEP-WAKE]
     pm_backlog()
     threading.Thread(target=pm_journal_loop, daemon=True).start()
+    # (v3.12 FIX-B) SECOND INDEPENDENT sleep signal: kernel PM journal follower
+    # (catches a real suspend even if the systemd-suspend unit follower stalls).
+    threading.Thread(target=pm_kernel_loop, daemon=True).start()
     # (D7) loop-stall watchdog thread: reports [LOOP-STALL] when the cadence
     # loop produces nothing for >LOOP_STALL_LOG_S (a stall is logged as a cause
     # rather than appearing only as missing data). Arm S.LAST_TICK NOW (before
@@ -267,6 +283,18 @@ def main():
         "ABS_RX/ABS_RY vs [GYRO-OUTPUT] when bound to mouse/unmapped (not "
         "provable through the pad). SNAPSHOT adds deck_rd/s, pad_ev/s, "
         "game_reader, gyro_map")
+    log("LOGGER: v3.12 todo-52r TRUTHFUL logger active — FIX-A real session "
+        "mode ([MODE desktop|gaming|unknown via <evidence>] from ipgyro.mode: a "
+        "DESKTOP session present vs a no-desktop Big Picture/gamescope GAMING "
+        "session; a running game NEVER switches mode — no more gaming-mode-from-"
+        "transport); FIX-B authoritative sleep (journal follower + second "
+        "independent kernel-PM signal; [SLEEP-ENTER]/[SLEEP-WAKE] with wall + "
+        "duration; SNAPSHOT sleep=entering|asleep|awake+<dur>); FIX-C per-data-"
+        "type delivery (buttons pad_key/s + sticks pad_abs/s with SEPARATE "
+        "latches vs gyro pad_gyro/s; per-source gyro carrier center|right-handle; "
+        "[GYRO-REGAINED]/[GYRO-STALL-AFTER-WAKE] at the wake boundary, never "
+        "detach); REAL game pid (game_reader=<pid>:<name> via SteamAppId + "
+        "wine/proton tree); python-evdev backbone for the pad hop (evreader.py)")
 
     # (v3.8 F2) close the startup blind window ONCE, before the cadence loop:
     # replay the physical-source churn the udev thread recorded during init and
@@ -282,6 +310,7 @@ def main():
     last_gyro_src = time.monotonic()      # periodic [GYRO-SRC] cadence
     last_dev_inv = time.monotonic()       # periodic [DEV-INV] re-assert
     last_cen_imu = time.monotonic()       # periodic [CEN-IMU] re-assert
+    last_mode = time.monotonic()          # periodic real-mode re-scan (v3.12)
 
     try:
         while not S.STOP:
@@ -353,8 +382,17 @@ def main():
                 try:
                     session_scan()
                     pm_probe()   # (PM) throttled systemd sleep journal probe
+                    pm_kernel_poll(now)  # (v3.12 FIX-B) kernel-PM backstop
                 except Exception as e:
                     log(f"LOGGER: session scan error: {e}")
+
+            # -- periodic: REAL session-mode re-scan (v3.12 FIX-A) ------------
+            if now - last_mode >= C.MODE_SCAN_INTERVAL:
+                last_mode = now
+                try:
+                    mode_scan(now)
+                except Exception as e:
+                    log(f"LOGGER: mode scan error: {e}")
 
             # -- periodic: per-second hidraw liveness + FLOW STOP/RESUME -----
             if now - last_flow >= C.HID_FLOW_INTERVAL:
@@ -412,6 +450,13 @@ def main():
                     log(f"LOGGER: center imu scan error: {e}")
 
             # -- evdev + hidraw event capture (select drives loop cadence) ----
+            # (v3.12 PART 2) drain the python-evdev pad reader's bounded queue
+            # into the per-data-type counters (non-blocking; drop-oldest under
+            # pressure). No-op when python-evdev is not the active reader.
+            try:
+                drain_events(time.monotonic())
+            except Exception as e:
+                log(f"LOGGER: evdev drain error: {e}")
             try:
                 handle_evdev(time.monotonic())
             except Exception as e:
