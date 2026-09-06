@@ -144,6 +144,35 @@ per-hop flow proof and applies ONLY the minimal ground-truth fixes:
     17ef:61ed detached = right-handle carrier), not the always-present center
     IIO — the user's ground truth: when he detached, the RIGHT handle gyro
     worked (GyroR), not center. SNAPSHOT adds right_gyro=yes|no.
+
+v3.16 (todo 53e) — BINDING-AWARE GYRO + MOUSE OBSERVER + STICKS TRACKING.
+Research 53d showed gyro is a SEPARATE binding whose OUTPUT is decided by the
+ACTIVE config (pad-axes right-stick | mouse | disabled): after wake Steam
+reverts to the desktop config (413080) which re-binds gyro to MOUSE, so pad
+ABS_RX/ABS_RY stops while buttons/sticks (still pad outputs) keep reaching the
+game. v3.16 changes:
+  * bind.py parses the ACTIVE config's gyro binding from the per-appid
+    controller_*.vdf (the group bound to "gyro active" in the Default preset)
+    -> pad-axes|mouse|disabled|unknown ([GYRO-BINDING]); never guesses.
+  * buttons/sticks stay PAD-DOMAIN (pad-only verdict); gyro is BINDING-AWARE:
+    pad-axes -> pad ABS_RX/ABS_RY, mouse -> mouse-injection motion ([GYRO→MOUSE]/
+    [GYRO-STALL]), disabled -> verdict none (a config fact). config=413080 while
+    a game runs = GYRO RE-DOMAIN to the desktop/mouse config, NOT a global loss.
+  * false button loss fixed: "no game reader resolved" after wake is an
+    OBSERVATION GAP (reader pid changed) — pad live + carrying events + a game
+    context + a reader ever held the pad fd => H3 ok with
+    reader=unresolved(pid-changed), never lost.
+  * Steam pad churn after wake survived: on [PAD-RECREATED] the new pad fd is
+    re-opened immediately and [PAD-DEAD] is suppressed until the full stall
+    window (PAD_STALL_S) elapses AFTER the re-bind (S.PAD_REBIND_UNTIL).
+  * H1=lost only when deck-mot AND pad-gyro AND mouse-motion are ALL 0 while
+    the physical gyro is provably moving.
+  * mouseobs.py counts REL_X/REL_Y on the auto-detected virtual pointer node
+    (or extest-injected desktop motion) -> proves gyro->mouse output.
+  * sticks/joysticks as an EXPLICIT type: left stick ABS_X/ABS_Y vs right stick
+    ABS_RX/ABS_RY — honestly noted as SHARED with gyro-as-right-stick when the
+    config binds gyro to pad-axes. SNAPSHOT adds gyro_binding, mouse,
+    mouse_rel/s, stk_l/s + stk_r/s(rstick=physical|gyro-shared).
 """
 
-__version__ = "v3.15"
+__version__ = "v3.16"

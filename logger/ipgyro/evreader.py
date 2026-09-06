@@ -38,6 +38,7 @@ import threading
 import time
 
 from . import state as S
+from .conf import PAD_STALL_S
 from .logcore import log
 
 # python-evdev availability (checked once at import; never raises).
@@ -127,12 +128,18 @@ def _run_reader():
                 log(f"[PAD-RECREATED] pad node GONE ({last_node}) — Steam tore "
                     f"the virtual pad down; waiting for recreation")
                 last_node = None
+                # (v3.16 todo 53e) teardown starts a re-bind grace so a
+                # re-created node never reads as "0 pad events => lost".
+                S.PAD_REBIND_UNTIL = time.monotonic() + PAD_STALL_S
             time.sleep(1.0)
             continue
         if node != last_node:
             if last_node is not None:
+                S.PAD_REBIND_UNTIL = time.monotonic() + PAD_STALL_S
                 log(f"[PAD-RECREATED] pad eventN changed {last_node} -> {node} "
-                    f"(Steam recreated the virtual pad; python-evdev re-opened)")
+                    f"(Steam recreated the virtual pad; python-evdev re-opened; "
+                    f"pad channel re-bound — [PAD-DEAD] suppressed "
+                    f"{PAD_STALL_S}s)")
             else:
                 log(f"EVDEV: python-evdev pad reader opened {node} "
                     f"({PAD_NAME_PREFIX}, {PAD_VID}:{PAD_PID})")
@@ -215,9 +222,17 @@ def drain_events(now):
             if code in PAD_GYRO_AXES:
                 S.PAD_GYRO_AXIS_COUNT += 1
                 S.PAD_GYRO_LAST = now
+                # v3.16 (todo 53e) — right stick = ABS_RX/ABS_RY on the pad.
+                # Ambiguous with gyro-as-right-stick when the config binds gyro
+                # to the right stick (noted honestly in the sticks flow).
+                S.PAD_STICK_R_COUNT += 1
+                S.PAD_STICK_R_LAST = now
             else:
                 S.PAD_STICK_COUNT += 1
                 S.PAD_STICK_LAST = now
+                if code in (0x00, 0x01):   # ABS_X / ABS_Y = left stick
+                    S.PAD_STICK_L_COUNT += 1
+                    S.PAD_STICK_L_LAST = now
 
 
 # ---------------------------------------------------------------------------

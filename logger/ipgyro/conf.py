@@ -153,7 +153,7 @@ DECK_DRAIN_MAX = 16         # max frames coalesced from one deck burst drain
 #  2026-09-05 on user request; the full contract now lives in Agent.md,
 #  section "2026-09-05 ~22:3x — V22 ДИЗАЙН-ДОКУМЕНТ ...".)
 # ---------------------------------------------------------------------------
-LOG_VERSION = "v3.15"
+LOG_VERSION = "v3.16"
 
 # ---------------------------------------------------------------------------
 # v3.12 (todo 52r) — truthful mode/sleep/per-source delivery cadences.

@@ -45,6 +45,7 @@ from .obs import (_full_mode, loop_stall_watchdog_loop, mode_scan,
                   state_tracker)
 from .pm import pm_backlog, pm_journal_loop, pm_kernel_loop, pm_kernel_poll
 from .evreader import drain_events, start_evreader
+from .mouseobs import start_mouse_observer
 from .steam import steam_scan, steam_state_verdict
 from .udev import udev_monitor_loop
 
@@ -190,6 +191,11 @@ def main():
     # very first scan (evdev multicast would otherwise double-count pad events).
     # Falls back to the raw devices.py capture if python-evdev is unavailable.
     start_evreader()
+    # (v3.16 todo 53e) mouse-output observer (Part 2): counts REL_X/REL_Y
+    # pointer motion so a gyro->mouse config can be proven ([GYRO→MOUSE]) rather
+    # than misread as "gyro died" from 0 pad gyro-axis. Auto-detects a virtual
+    # pointer node vs extest-injected desktop motion. Idempotent, never raises.
+    start_mouse_observer()
     scan_evdev(devices, build_node_map(devices))
     discover_iio()
     # (R1) identify the attached center body IMU right after iio discovery
@@ -320,6 +326,21 @@ def main():
         "STATE (right handle 17ef:61ed detached = right-handle carrier), not the "
         "always-present center IIO (user: when he detached, the RIGHT handle "
         "gyro worked, not center). SNAPSHOT adds right_gyro=yes|no")
+    log("LOGGER: v3.16 todo-53e BINDING-AWARE gyro + mouse observer + "
+        "sticks/joysticks tracking active — bind.py parses the ACTIVE config's "
+        "gyro binding (pad-axes|mouse|disabled|unknown) from the per-appid "
+        "controller vdf ([GYRO-BINDING], never guesses). The gyro verdict is "
+        "binding-aware (pad-axes -> pad ABS_RX/ABS_RY; mouse -> [GYRO→MOUSE]/"
+        "[GYRO-STALL] via the REL observer; disabled -> a config fact) while "
+        "buttons/sticks stay PAD-DOMAIN; config=413080 while a game runs = "
+        "gyro RE-DOMAIN to the desktop/mouse config, NOT a global loss. False "
+        "button loss fixed (reader=unresolved after wake = observation gap, "
+        "not absence); Steam pad churn after wake survived ([PAD-RECREATED] "
+        "+ [PAD-DEAD] suppressed PAD_STALL_S after re-bind); H1=lost only when "
+        "deck-mot+pad-gyro+mouse all 0. Sticks/joysticks tracked as an explicit "
+        "type (stk_l/s ABS_X/ABS_Y, stk_r/s ABS_RX/ABS_RY — shared with "
+        "gyro-as-right-stick). SNAPSHOT adds gyro_binding, mouse, mouse_rel/s, "
+        "stk_l/s, stk_r/s")
 
     # (v3.8 F2) close the startup blind window ONCE, before the cadence loop:
     # replay the physical-source churn the udev thread recorded during init and

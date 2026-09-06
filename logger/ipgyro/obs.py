@@ -250,6 +250,14 @@ def snapshot_state(reason):
         pass
     flow_s = S.FLOW_COMPACT or "-"
     right_gyro = "yes" if S.RIGHT_HANDLE_PRESENT else "no"
+    # (v3.16 todo 53e) binding-aware gyro + mouse observer + sticks fields.
+    bind = S.GYRO_BINDING or "unknown"
+    mouse_mode = S.MOUSE_MODE or "none"
+    # Honesty (Part 3): ABS_RX/ABS_RY is a SHARED channel. When the active
+    # config binds gyro to pad-axes, Steam writes GYRO into the same right-stick
+    # axes, so stk_r/s is NOT attributable purely to the physical right stick;
+    # when binding=mouse/disabled the same events are physical-stick only.
+    rstick_chan = "gyro-shared" if bind == "pad-axes" else "physical"
     log(f"[SNAPSHOT] reason={reason} mode={mode} "
         f"controller=[{','.join(controller) or '-'}] "
         f"virtual=[{','.join(virtual) or '-'}] "
@@ -263,6 +271,10 @@ def snapshot_state(reason):
         f"pad_node={pad_node} "
         f"deck_rd/s={S.DECK_RD_COUNT} pad_key/s={S.PAD_KEY_COUNT} "
         f"pad_abs/s={S.PAD_ABS_COUNT} pad_gyro/s={S.PAD_GYRO_AXIS_COUNT} "
+        f"stk_l/s={S.PAD_STICK_L_COUNT} stk_r/s={S.PAD_STICK_R_COUNT}"
+        f"(rstick={rstick_chan}) "
+        f"gyro_binding={bind} mouse={mouse_mode} "
+        f"mouse_rel/s={S.MOUSE_REL_COUNT} "
         f"game_reader={gr} pad_holder={holder} "
         f"gyro_map={S.PAD_GYRO_MAP or 'unknown'} flow={flow_s} "
         f"sleep={sleep_s}")
@@ -551,43 +563,160 @@ def _gyro_map_verdict(now):
 
 
 def _wake_gyro_compare(now):
-    """(v3.12 FIX-C) Post-wake gyro-vs-button attribution. Called once per wake
-    (guarded by S.WAKE_GYRO_COMPARED) ~WAKE_GYRO_COMPARE_S after the wake. It
-    compares the PRE-SLEEP pad gyro/button baseline (captured at [SLEEP-ENTER])
-    against the POST-WAKE pad flow and emits:
-      * [GYRO-REGAINED]        pre-sleep gyro was flowing AND post-wake gyro is
-                               flowing again (buttons also flowing) — gyro OK;
-      * [GYRO-STALL-AFTER-WAKE] pre-sleep gyro was flowing but post-wake gyro is
-                               NOT on the pad while buttons/sticks still reach
-                               the game — the exact "gyro died after wake"
-                               symptom, attributed to the WAKE boundary (never
-                               to a detach);
-      * (no marker)            no pre-sleep gyro baseline / no game reader, so
-                               nothing provable to compare (honest silence).
-    The per-source gyro carrier (center vs right-handle) is read from
-    S.GYRO_SRC_CARRIER so the marker names WHICH physical gyro is live."""
+    """(v3.12 FIX-C, v3.16 binding-aware) Post-wake gyro-vs-button attribution.
+    Called once per wake (guarded by S.WAKE_GYRO_COMPARED) ~WAKE_GYRO_COMPARE_S
+    after the wake. v3.16 (todo 53e): the verdict is BINDING-AWARE — a post-wake
+    "0 pad gyro-axis" is NOT a gyro loss when the active config binds gyro to
+    MOUSE (gyro moved off the pad to the mouse output) or DISABLED (config fact).
+    The [GYRO-STALL-AFTER-WAKE] latch fires only for a genuine transport stall
+    (binding=pad-axes + deck motion + 0 pad gyro-axis, or binding=mouse + deck
+    motion + 0 mouse motion)."""
     if S.PRE_SLEEP_GYRO is not True:
         return
     if S.PAD_GAME_READER_PID is None:
         return
+    binding = S.GYRO_BINDING or "unknown"
     btn_now = S.PAD_KEY_COUNT > 0 or S.PAD_STICK_COUNT > 0
     gyro_now = S.PAD_GYRO_AXIS_COUNT > 0
+    mouse_now = S.MOUSE_REL_COUNT > 0
+    deck_mot = S.DECK_MOTION_COUNT
     carrier = S.GYRO_SRC_CARRIER or "unknown"
-    if gyro_now:
-        if not S.WAKE_GYRO_STALLED:
-            log(f"[GYRO-REGAINED] post-wake gyro-on-pad flowing again "
-                f"(gyro={S.PAD_GYRO_AXIS_COUNT}/s, carrier={carrier}) — gyro "
-                f"survived the wake")
-    elif btn_now:
+    # binding-aware "gyro is flowing on its configured output path"
+    if binding == "mouse":
+        gyro_flowing = mouse_now
+    elif binding == "disabled":
+        # config disables gyro -> not a transport loss; report the config fact.
         S.WAKE_GYRO_STALLED = True
-        log(f"[GYRO-STALL-AFTER-WAKE] pre-sleep gyro was on the pad but "
-            f"post-wake gyro={S.PAD_GYRO_AXIS_COUNT}/s while buttons/sticks "
-            f"still reach the game (pad_key/s={S.PAD_KEY_COUNT} "
-            f"pad_abs/s={S.PAD_STICK_COUNT}) — gyro LOST at the WAKE boundary, "
-            f"NOT at detach (carrier={carrier})")
+        log(f"[GYRO-STALL-AFTER-WAKE] post-wake active config binds gyro to "
+            f"DISABLED (config fact, NOT a transport loss) — no gyro output is "
+            f"expected on any path (carrier={carrier})")
+        return
+    else:
+        gyro_flowing = gyro_now
+    if gyro_flowing:
+        if not S.WAKE_GYRO_STALLED:
+            if binding == "mouse":
+                log(f"[GYRO-REGAINED] post-wake gyro->MOUSE flowing again "
+                    f"(mouse_rel/s={S.MOUSE_REL_COUNT}, carrier={carrier}) — "
+                    f"gyro survived the wake on the mouse output")
+            else:
+                log(f"[GYRO-REGAINED] post-wake gyro-on-pad flowing again "
+                    f"(gyro={S.PAD_GYRO_AXIS_COUNT}/s, carrier={carrier}) — "
+                    f"gyro survived the wake")
+    elif btn_now:
+        # buttons/sticks still reach the game but gyro is not flowing on its
+        # configured output path -> genuine stall (binding-aware).
+        S.WAKE_GYRO_STALLED = True
+        if binding == "mouse":
+            log(f"[GYRO-STALL-AFTER-WAKE] pre-sleep gyro was flowing but "
+                f"post-wake config binds gyro to MOUSE and 0 mouse motion "
+                f"(mouse_rel/s=0) while buttons/sticks still reach the game — "
+                f"gyro->mouse output STALLED at the WAKE boundary, NOT at "
+                f"detach (carrier={carrier})")
+        else:
+            log(f"[GYRO-STALL-AFTER-WAKE] pre-sleep gyro was on the pad but "
+                f"post-wake gyro={S.PAD_GYRO_AXIS_COUNT}/s while buttons/sticks "
+                f"still reach the game (pad_key/s={S.PAD_KEY_COUNT} "
+                f"pad_abs/s={S.PAD_STICK_COUNT}) — gyro LOST at the WAKE "
+                f"boundary, NOT at detach (carrier={carrier})")
     else:
         log(f"[GYRO-STALL-AFTER-WAKE] post-wake NO pad flow at all yet "
-            f"(buttons={btn_now} gyro={gyro_now}) — game not re-delivering yet")
+            f"(buttons={btn_now} gyro={gyro_now} mouse={mouse_now}) — game not "
+            f"re-delivering yet")
+
+
+def _wake_gyro_state(now):
+    """(v3.16 todo 53e) ONE explicit per-wake gyro classification, emitted once
+    per wake after the settle window (guarded by S.WAKE_GYRO_STATE_LOGGED). It
+    names WHY gyro is/isn't flowing after the wake, gated on the active config's
+    gyro binding — so wake#3's "gyro died" is reported correctly (gyro re-domain
+    to mouse / config-disabled), never as a global "everything lost":
+      gyro:dead-at-deck        physical gyro counters 0 (H0/H1 dead)
+      gyro:steam-not-emitting  deck motion>0, config game/right-stick, but no
+                               pad gyro-axis AND no mouse motion
+      gyro:as-mouse            config=mouse + mouse motion observed
+      gyro:config-disabled     binding read as disabled
+      gyro:regained            gyro flowing on its configured output path
+    Reuses the [GYRO-REGAINED]/[GYRO-STALL-AFTER-WAKE] latch but gates on the
+    binding."""
+    w = S.SLEEP_WAKE_TS
+    if w is None:
+        return
+    if S.WAKE_GYRO_STATE_LOGGED == w:
+        return
+    if now - w < WAKE_GYRO_COMPARE_S:
+        return
+    S.WAKE_GYRO_STATE_LOGGED = w
+    binding = S.GYRO_BINDING or "unknown"
+    carrier = S.GYRO_SRC_CARRIER or "unknown"
+    deck_mot = S.DECK_MOTION_COUNT
+    pad_gyro = S.PAD_GYRO_AXIS_COUNT
+    mouse_rel = S.MOUSE_REL_COUNT
+    iio_live = bool(S.IIO_FAST_UNTIL) and S.IIO_FAST_UNTIL > now
+    # physical gyro dead at the deck (H0/H1 counters 0) — most fundamental
+    if carrier in ("none",) or (not iio_live and deck_mot == 0):
+        state = "gyro:dead-at-deck"
+        detail = (f"physical gyro counters 0 after wake (carrier={carrier}, "
+                  f"iio_live={iio_live}, deck_mot={deck_mot}/s)")
+    else:
+        # (v3.16) ROUTING-AWARE: when Steam's config focus FELL from the game
+        # to the desktop/shell at the wake while the game still runs, name THAT
+        # (the recorded wake#3: focus 306130->413080, H2 lost for all types),
+        # never a vague "steam-not-emitting". With a mouse binding the gyro is
+        # genuinely re-domained to the desktop pointer; with any other binding
+        # the routing drop stops gyro (and any pad output) reaching the game.
+        pre_game = (S.PRE_SLEEP_FOCUS_KIND == "GAME")
+        fk = S.STEAM_FOCUS_KIND
+        fa_s = str(S.STEAM_FOCUS_APPID) if S.STEAM_FOCUS_APPID is not None \
+            else "none"
+        game_running = bool(S.STEAM_PROC_SET)
+        routing_fell = (pre_game and game_running and
+                        fk in ("769", "413080", "OTHER", None))
+        if routing_fell:
+            if binding == "mouse":
+                state = "gyro:routing-re-domain"
+                detail = (f"Steam focus fell GAME->{fa_s} at wake while the "
+                          f"game still runs + binding={binding} -> gyro output "
+                          f"re-domained to the desktop/mouse config (a config "
+                          f"re-domain; buttons/sticks judged by their own "
+                          f"pad-domain markers)")
+            else:
+                state = "gyro:routing-lost@wake"
+                detail = (f"Steam focus fell GAME->{fa_s} at wake while the "
+                          f"game still runs (binding={binding}) -> routing H2 "
+                          f"lost for the game: gyro (and any pad output) stops "
+                          f"reaching the game at the wake routing drop")
+        elif binding == "disabled":
+            state = "gyro:config-disabled"
+            detail = "active config binds gyro to DISABLED (config fact, not a transport loss)"
+        elif binding == "mouse":
+            if mouse_rel > 0:
+                state = "gyro:as-mouse"
+                detail = (f"config binds gyro to MOUSE + {mouse_rel} mouse-rel/s "
+                          f"delivered — gyro re-domained to the desktop/mouse output")
+            elif deck_mot > 0:
+                state = "gyro:steam-not-emitting"
+                detail = (f"config binds gyro to MOUSE + deck mot={deck_mot}/s but 0 "
+                          f"mouse motion — Steam not injecting the pointer")
+            else:
+                state = "gyro:as-mouse"
+                detail = "config binds gyro to MOUSE (no deck motion this window)"
+        else:
+            # binding pad-axes / unknown
+            if pad_gyro > 0:
+                state = "gyro:regained"
+                detail = f"gyro-on-pad flowing again ({pad_gyro}/s, binding={binding})"
+            elif deck_mot > 0:
+                state = "gyro:steam-not-emitting"
+                detail = (f"config binding={binding} + deck mot={deck_mot}/s but 0 "
+                          f"pad gyro-axis AND 0 mouse motion — Steam not emitting "
+                          f"gyro on any output")
+            else:
+                state = "gyro:regained"
+                detail = f"binding={binding}, no deck motion this window (idle)"
+    S.WAKE_GYRO_STATE = state
+    log(f"[WAKE-GYRO-STATE] {state} — {detail} (buttons/sticks verdict is "
+        f"separate: they are pad-domain and judged by their own marker)")
 
 
 def pad_verdict_scan(now):
@@ -627,6 +756,12 @@ def pad_verdict_scan(now):
     game_reader = _game_reader_pid()
     S.PAD_GAME_READER = game_reader is not None
     S.PAD_GYRO_MAP = _gyro_map_verdict(now)
+    # v3.16 (todo 53e) — binding-aware gyro + mouse observer + sticks.
+    binding = S.GYRO_BINDING or "unknown"
+    mouse_rel = S.MOUSE_REL_COUNT
+    mouse_mode = S.MOUSE_MODE or "none"
+    pad_stick_l = S.PAD_STICK_L_COUNT
+    pad_stick_r = S.PAD_STICK_R_COUNT
 
     # -- hop-1: deck frames flowing (upstream only, precondition) ------------
     if deck_rd > 0 and pad_node:
@@ -662,8 +797,30 @@ def pad_verdict_scan(now):
                     f"events/s on pad {pad_node} read by game {gr} "
                     f"— gyro PROVABLY reached the game (mapped to pad axes)")
         else:
-            # deck IMU moving but no gyro on the pad -> gyro bound to mouse
-            if deck_mot > 0 and S.PAD_GYRO_MAP == "mouse":
+            # v3.16 (todo 53e) — BINDING-AWARE gyro output. When the ACTIVE
+            # config binds gyro to MOUSE, prove it via pointer-motion delivery
+            # ([GYRO→MOUSE]) or report a stall ([GYRO-STALL]) if deck motion is
+            # present but no pointer motion is delivered. NEVER report gyro LOST
+            # from "0 pad gyro-axis" when binding=mouse (that is expected — gyro
+            # is not on the pad). When binding is pad-axes/unknown and the deck
+            # is moving but no gyro lands on the pad, keep the honest
+            # [GYRO-OUTPUT] note.
+            if binding == "mouse":
+                if mouse_rel > 0:
+                    if now - S.PAD_GYRO_AXIS_LAST >= PAD_DELIVERY_HB:
+                        S.PAD_GYRO_AXIS_LAST = now
+                        log(f"[GYRO→MOUSE] config binds gyro to MOUSE + deck "
+                            f"mot={deck_mot}/s + {mouse_rel} REL_X/REL_Y "
+                            f"pointer-motion/s delivered (mouse_mode={mouse_mode})"
+                            f" — gyro PROVABLY reached the desktop/mouse output")
+                elif deck_mot > 0:
+                    if now - S.PAD_GYRO_AXIS_LAST >= PAD_DELIVERY_HB:
+                        S.PAD_GYRO_AXIS_LAST = now
+                        log(f"[GYRO-STALL] config binds gyro to MOUSE + deck "
+                            f"mot={deck_mot}/s but 0 pointer-motion events "
+                            f"delivered (mouse_mode={mouse_mode}) — gyro->mouse "
+                            f"output STALLED (Steam not injecting the pointer)")
+            elif deck_mot > 0 and S.PAD_GYRO_MAP == "mouse":
                 if now - S.PAD_GYRO_AXIS_LAST >= PAD_DELIVERY_HB:
                     S.PAD_GYRO_AXIS_LAST = now
                     log(f"[GYRO-OUTPUT] deck IMU moving (mot={deck_mot}/s) but "
@@ -682,8 +839,17 @@ def pad_verdict_scan(now):
         # pad events) fires.
         routing_desktop = (S.STEAM_FOCUS_KIND in ("769", "413080", "OTHER")
                            or S.STEAM_FOCUS_KIND is None)
+        # (v3.16 todo 53e) Steam pad churn after wake: the pad node is torn
+        # down and re-created at a new eventN. A re-created node must NEVER
+        # masquerade as "0 pad events => lost", so [PAD-DEAD] accumulation is
+        # suppressed until PAD_STALL_S of silence has elapsed AFTER the re-bind
+        # grace (S.PAD_REBIND_UNTIL, set on every [PAD-RECREATED]). While in
+        # grace the stall counter stays 0; once the grace expires the full
+        # PAD_STALL_S consecutive-quiet window must re-accumulate from scratch.
+        in_rebind_grace = now < S.PAD_REBIND_UNTIL
         if (game_reader is not None and pad_node and deck_rd > 0
-                and pad_ev == 0 and not routing_desktop):
+                and pad_ev == 0 and not routing_desktop
+                and not in_rebind_grace):
             S.PAD_STALL_SECS += 1
             if S.PAD_STALL_SECS >= PAD_STALL_S:
                 if not S.PAD_DEAD_LOGGED or \
@@ -719,12 +885,27 @@ def pad_verdict_scan(now):
     except Exception as e:
         log(f"LOGGER: flow scan error: {e}")
 
+    # -- (v3.16) once-per-wake per-wake GYRO STATE classification -------------
+    # After the settle window of each wake, classify the gyro state explicitly
+    # (dead-at-deck | steam-not-emitting | as-mouse | config-disabled) so the
+    # wake#3 "gyro died" is reported correctly (gyro re-domain to mouse/config-
+    # disabled), never as a global "everything lost". Reuses the
+    # [GYRO-REGAINED]/[GYRO-STALL-AFTER-WAKE] latch but gates on the binding.
+    try:
+        _wake_gyro_state(now)
+    except Exception:
+        pass
+
     # -- reset the per-second pad counters (consumed by the next snapshot) ----
     S.PAD_EV_COUNT = 0
     S.PAD_ABS_COUNT = 0
     S.PAD_KEY_COUNT = 0
     S.PAD_STICK_COUNT = 0
     S.PAD_GYRO_AXIS_COUNT = 0
+    # v3.16 — reset the per-second stick + mouse counters too.
+    S.PAD_STICK_L_COUNT = 0
+    S.PAD_STICK_R_COUNT = 0
+    S.MOUSE_REL_COUNT = 0
 
 
 def _mark_detach(now):

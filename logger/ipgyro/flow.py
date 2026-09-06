@@ -134,12 +134,27 @@ def routing(inp):
 # ---------------------------------------------------------------------------
 
 def gyro_hops(inp, rt=None):
+    """v3.16 (todo 53e) BINDING-AWARE gyro hops. The gyro verdict is decoupled
+    from buttons/sticks: buttons/sticks are pad-domain, but gyro's OUTPUT is
+    decided by the ACTIVE config's gyro binding (S.GYRO_BINDING parsed from the
+    active controller vdf):
+      * binding=pad-axes -> prove via pad ABS_RX/ABS_RY ([GYRO→PAD-AXIS]);
+      * binding=mouse    -> prove via mouse-injection motion ([GYRO→MOUSE]),
+                            NEVER return gyro LOST from "0 pad gyro-axis";
+      * binding=disabled -> verdict = none (a config fact, not a transport loss);
+      * binding=unknown  -> fall back to pad evidence but never over-claim.
+    config=413080 (desktop/shell) while the game runs is a GYRO RE-DOMAIN (gyro
+    output moved to the desktop/mouse config), NOT a global loss — buttons/
+    sticks may still reach the game via the pad."""
     rt = rt if rt is not None else routing(inp)
     carrier = inp.get("carrier", "none")
     iio_moving = inp.get("iio_moving", False)
     deck_rd = inp.get("deck_rd", 0)
     deck_mot = inp.get("deck_mot", 0)
     game_deck = inp.get("game_deck", False)
+    binding = inp.get("gyro_binding") or "unknown"
+    pad_gyro = inp.get("pad_gyro", 0)
+    mouse_rel = inp.get("mouse_rel", 0)
     hops = [None, None, None, None]
 
     # -- H0 physical source ------------------------------------------------
@@ -162,23 +177,37 @@ def gyro_hops(inp, rt=None):
                        "physical XInput/IIO decode) — H0 lost")
 
     # -- H1 deck -> Steam ---------------------------------------------------
-    # The "lost" verdicts here are only meaningful when Steam is actually
-    # routing to a game (rt verdict == OK). During idle desktop with no game
-    # (rt == none) a deck not forwarding a tiny IIO noise blip is NOT a loss —
-    # it is idle (H1=none), so the chain never cries "lost" while no game runs.
+    # v3.16 fix (53a2 log-hole): H1=lost was fired on deck mot=0 even while the
+    # pad was PROVABLY delivering gyro (H3=ok) — the deck-mot counter does not
+    # track every gyro path. H1=lost now only when deck-mot AND pad-gyro AND
+    # mouse-motion are ALL 0 while the physical gyro is provably moving; if any
+    # downstream carrier (pad gyro-axis OR mouse motion) is live, the gyro IS
+    # being forwarded and H1 is ok/none, never lost.
     routing_game = rt["verdict"] == OK
+    gyro_downstream = pad_gyro > 0 or mouse_rel > 0
     if deck_rd > 0:
         if deck_mot > 0:
             hops[1] = _hop(1, OK, "%s mot/s %s rd/s" % (deck_mot, deck_rd),
                            ("deck-uhid delivering %s rd/s with %s IMU-mot/s — "
                             "the deck IS emitting gyro to Steam (H1 ok)")
                            % (deck_rd, deck_mot))
+        elif gyro_downstream:
+            # deck mot counter reads 0 but gyro IS arriving downstream (pad
+            # gyro-axis or mouse motion) — the deck-mot counter just does not
+            # track this gyro path; H1 is NOT lost.
+            hops[1] = _hop(1, OK, "mot=0 but gyro downstream",
+                           ("deck %s rd/s with 0 IMU-mot/s counter but gyro IS "
+                            "arriving downstream (pad_gyro=%s/s, mouse_rel="
+                            "%s/s) — the deck-mot counter does not track this "
+                            "gyro path; H1 ok") % (deck_rd, pad_gyro, mouse_rel))
         elif iio_moving and routing_game:
             hops[1] = _hop(1, LOST, "deck %s rd/s mot=0" % deck_rd,
                            ("deck delivering %s rd/s but 0 IMU-mot/s while the "
-                            "physical gyro is moving (iio_moving=True) and the "
-                            "game config is active — InputPlumber/deck NOT "
-                            "forwarding gyro to Steam (H1)") % deck_rd)
+                            "physical gyro is moving (iio_moving=True), the "
+                            "game config is active, and NO gyro arrives "
+                            "downstream (pad_gyro=0, mouse_rel=0) — "
+                            "InputPlumber/deck NOT forwarding gyro to Steam "
+                            "(H1)") % deck_rd)
         else:
             hops[1] = _hop(1, NONE, "deck %s rd/s mot=0" % deck_rd,
                            ("deck delivering %s rd/s but no physical motion to "
@@ -192,27 +221,67 @@ def gyro_hops(inp, rt=None):
                        "no gaming deck / no deck frames on hop 1 (H1 idle)")
 
     hops[2] = _hop(2, rt["verdict"], rt["short"], rt["detail"])
-    hops[3] = _gyro_h3(inp, rt, deck_mot)
+    hops[3] = _gyro_h3(inp, rt, deck_mot, binding, mouse_rel)
     return hops
 
 
-def _gyro_h3(inp, rt, deck_mot):
-    """H3 pad->game for gyro: gyro-axis ABS_RX/ABS_RY pad events while the game
-    holds the pad fd. If routing is already lost at H2 the pad hop is not
-    applicable (H3=none with the H2 proof) — the loss is AT H2, never vague."""
+def _gyro_h3(inp, rt, deck_mot, binding="unknown", mouse_rel=0):
+    """H3 for gyro, BINDING-AWARE (v3.16). The pad hop is only the proof path
+    when the config binds gyro to pad-axes; when it binds to mouse the proof is
+    mouse-injection motion ([GYRO→MOUSE]), and when it disables gyro the verdict
+    is none (a config fact, not a transport loss). config=413080 (desktop) while
+    the game runs is a gyro RE-DOMAIN, not a global loss."""
     if rt["verdict"] == NONE:
         return _hop(3, NONE, "no game target",
                     "no game routed (H2 none) — nothing to deliver to "
                     "(H3 N/A)")
     if rt["verdict"] == LOST:
+        fa = inp.get("focus_appid")
+        if str(fa) in ("413080", "769") and binding == "mouse":
+            # Only a MOUSE binding genuinely RE-DOMAINS gyro to the desktop
+            # pointer when Steam focus fell to the desktop config (53d). With
+            # any other binding (pad-axes/disabled/unknown) the routing loss
+            # applies to gyro like every other type — the game stops receiving
+            # it. Never claim "gyro re-domain, not lost" when the desktop
+            # config binds gyro to the pad (the recorded wake#3 case).
+            return _hop(3, NONE, "gyro re-domain @H2",
+                        ("Steam config focus = %s (desktop/shell) binds gyro "
+                         "to MOUSE -> gyro output re-domained to the "
+                         "desktop/mouse pointer (a config re-domain, NOT a "
+                         "gyro transport loss); buttons/sticks are judged by "
+                         "their own pad-domain marker") % (fa,))
         return _hop(3, NONE, "routing lost @H2",
                     "routing already lost at H2 (Steam config focus != the "
                     "running game) — the pad hop is not applicable: gyro never "
                     "leaves Steam for the game")
+    # -- binding-aware proof path -------------------------------------------
+    if binding == "disabled":
+        return _hop(3, NONE, "config disables gyro",
+                    "active config binds gyro to DISABLED — gyro is off by "
+                    "config (a config fact, NOT a transport loss); no gyro "
+                    "output is expected on any path")
     pad_node = inp.get("pad_node", False)
     pad_gyro = inp.get("pad_gyro", 0)
     pad_ev = inp.get("pad_ev", 0)
     game_reader = inp.get("game_reader", False)
+    if binding == "mouse":
+        # gyro is bound to MOUSE -> prove via mouse-injection motion, NEVER via
+        # 0 pad gyro-axis (which is expected when gyro is not on the pad).
+        if mouse_rel > 0:
+            return _hop(3, OK, "%s mouse-rel/s" % mouse_rel,
+                        ("config binds gyro to MOUSE and %s REL_X/REL_Y "
+                         "pointer-motion events/s are delivered while deck "
+                         "motion is present — gyro PROVABLY reached the "
+                         "desktop/mouse output ([GYRO→MOUSE])") % mouse_rel)
+        if deck_mot > 0:
+            return _hop(3, LOST, "0 mouse-rel/s mot!=0",
+                        ("config binds gyro to MOUSE + deck mot=%s/s but 0 "
+                         "pointer-motion events delivered — gyro->mouse output "
+                         "STALLED (Steam not injecting the pointer)") % deck_mot)
+        return _hop(3, NONE, "no deck motion",
+                    "config binds gyro to MOUSE but no deck motion this window "
+                    "— nothing to inject (idle)")
+    # binding == pad-axes (or unknown -> fall back to pad evidence)
     if not pad_node:
         return _hop(3, LOST, "no pad 28de:11ff",
                     "game config active but NO Steam virtual pad node "
@@ -231,11 +300,26 @@ def _gyro_h3(inp, rt, deck_mot):
                          "writing gyro to the pad (H3)") % deck_mot)
         return _hop(3, NONE, "reader idle",
                     "game reader present but no physical motion to forward")
-    if pad_ev > 0:
+    # No game reader resolved on the pad fd. When the deck is NOT moving there
+    # is no gyro to prove -> idle, never lost. When it IS moving (binding=pad-
+    # axes expects gyro on the pad) and the pad carries events while a reader
+    # EVER held the fd, this is the same post-wake observation gap as buttons
+    # (reader pid changed) — unproven this window, NEVER fabricated as lost.
+    if deck_mot <= 0:
+        return _hop(3, NONE, "no deck motion",
+                    "no deck motion this window — no gyro to prove on the pad "
+                    "(H3 idle)")
+    if pad_ev > 0 and not inp.get("pad_reader_known", False):
         return _hop(3, LOST, "no game reader",
-                    ("pad events %s/s but NO game reader holds the pad fd — "
-                     "data reaches Steam's pad but no game consumes it (H3)")
-                    % pad_ev)
+                    ("pad events %s/s + deck mot=%s/s but NO game reader holds "
+                     "the pad fd and none ever held it this session — data "
+                     "reaches Steam's pad but no game consumes it (H3)")
+                    % (pad_ev, deck_mot))
+    if pad_ev > 0:
+        return _hop(3, NONE, "reader=unresolved",
+                    ("pad carrying %s ev/s + deck mot=%s/s but no game reader "
+                     "resolved yet (post-wake pid change?) — gyro delivery "
+                     "unproven this window") % (pad_ev, deck_mot))
     return _hop(3, NONE, "no reader yet",
                 "game focused but no game reader on the pad fd yet")
 
@@ -247,7 +331,15 @@ def _gyro_h3(inp, rt, deck_mot):
 def btn_hops(inp, rt, sticks=False):
     """Buttons/sticks hops. The pad counter probed is pad_key (buttons) or
     pad_stick (sticks/triggers, pad_abs non-gyro). deck_act is the deck
-    button/stick/trigger CHANGE counter (hop-1 forwarding evidence)."""
+    button/stick/trigger CHANGE counter (hop-1 forwarding evidence).
+    v3.16 (todo 53e): buttons/sticks are PAD-DOMAIN — their verdict uses the
+    PAD path only (pad node live + EV_KEY/non-gyro EV_ABS events + game holds/
+    ever-held the pad fd). config=413080 must NOT by itself set buttons/sticks
+    lost (they are unaffected by the gyro binding). A "no game reader resolved"
+    after wake is frequently an OBSERVATION GAP (reader pid changed), not an
+    absence of a reader: if the pad is live + carrying this type's events while
+    a game context is present and a reader EVER held the pad fd, treat as
+    delivered (H3 ok) with reader=unresolved(pid-changed), never lost."""
     rt = rt if rt is not None else routing(inp)
     noun = "sticks" if sticks else "buttons"
     deck_act = inp.get("deck_act", 0)
@@ -257,6 +349,8 @@ def btn_hops(inp, rt, sticks=False):
     pad_ev = inp.get("pad_ev", 0)
     pad_node = inp.get("pad_node", False)
     game_reader = inp.get("game_reader", False)
+    pad_reader_known = inp.get("pad_reader_known", False)
+    game_ctx = inp.get("game_running") or bool(inp.get("game_appids"))
     hops = [None, None, None, None]
 
     # -- H0 physical source --------------------------------------------------
@@ -328,10 +422,28 @@ def btn_hops(inp, rt, sticks=False):
             hops[3] = _hop(3, NONE, "no press",
                            "game reader present but no %s press this window" % noun)
     elif pad_ev > 0:
-        hops[3] = _hop(3, LOST, "no game reader",
-                       ("pad events %s/s but NO game reader holds the pad fd — "
-                        "%s reach Steam's pad but no game consumes them (H3)")
-                       % (pad_ev, noun))
+        # v3.16 fix (false button loss): "no game reader resolved" after wake is
+        # frequently an OBSERVATION GAP (the reader pid changed / the pad was
+        # recreated), not an absence of a reader. If the pad is live + carrying
+        # THIS type's events while a game context is present and a reader EVER
+        # held the pad fd, treat as delivered (H3 ok) with reader=unresolved
+        # (pid-changed) rather than lost. Only claim loss when the pad node
+        # itself is dead/recreated-and-not-redelivering.
+        if pad_x > 0 and game_ctx and pad_reader_known:
+            hops[3] = _hop(3, OK, "pad_%s/s=%s reader=unresolved" %
+                           ("key" if not sticks else "abs", pad_x),
+                           ("%s pad events/s on a LIVE pad while a game context "
+                            "is present and a reader ever held the pad fd — "
+                            "the reader pid changed after wake (observation "
+                            "gap), NOT an absence of a reader; %s treated as "
+                            "delivered (H3 ok, reader=unresolved(pid-changed))")
+                           % (pad_x, noun))
+        else:
+            hops[3] = _hop(3, LOST, "no game reader",
+                           ("pad events %s/s but NO game reader holds the pad "
+                            "fd and none ever held it this session — %s reach "
+                            "Steam's pad but no game consumes them (H3)")
+                           % (pad_ev, noun))
     else:
         hops[3] = _hop(3, NONE, "no reader yet",
                        "game focused but no game reader on the pad fd yet")
@@ -532,11 +644,18 @@ def build_input(now):
         "game_pids": game_pids,
         # H3
         "game_reader": bool(S.PAD_GAME_READER),
+        "pad_reader_known": S.PAD_READER_KNOWN is not None,
         "pad_node": bool(S.PAD_NODE),
         "pad_ev": S.PAD_EV_COUNT,
         "pad_key": S.PAD_KEY_COUNT,
         "pad_stick": S.PAD_STICK_COUNT,
         "pad_gyro": S.PAD_GYRO_AXIS_COUNT,
+        # v3.16 (todo 53e) — binding-aware gyro + mouse observer + sticks
+        "gyro_binding": S.GYRO_BINDING or "unknown",
+        "mouse_rel": S.MOUSE_REL_COUNT,
+        "mouse_mode": S.MOUSE_MODE or "none",
+        "pad_stick_l": S.PAD_STICK_L_COUNT,
+        "pad_stick_r": S.PAD_STICK_R_COUNT,
         # wake boundary (pre-sleep focus captured at [SLEEP-ENTER])
         "pre_focus_appid": S.PRE_SLEEP_FOCUS_APPID,
         "pre_focus_kind": S.PRE_SLEEP_FOCUS_KIND,

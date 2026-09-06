@@ -28,6 +28,7 @@ from .conf import (
     GAMEPAD_KEY_BITS,
     KEY_NAMES,
     NAME_GAMEPAD_HINTS,
+    PAD_STALL_S,
 )
 from .logcore import log, run_cmd
 
@@ -298,9 +299,13 @@ def _scan_pad_identity(devices):
     pad = next((d for d in devices if _is_pad(d)), None)
     if pad is None:
         # pad node gone entirely -> [GAME-LOST-PAD] if a game reader was known
-        if S.PAD_NODE is not None and S.PAD_READER_KNOWN:
+        if S.PAD_NODE is not None:
             now = time.monotonic()
-            if now - S.PAD_GAME_LOST_LAST >= 5.0:
+            # (v3.16 todo 53e) Steam teardown STARTS a re-bind grace: a
+            # re-created node must never masquerade as "0 pad events => lost",
+            # so [PAD-DEAD] is suppressed until the grace expires.
+            S.PAD_REBIND_UNTIL = now + PAD_STALL_S
+            if S.PAD_READER_KNOWN and now - S.PAD_GAME_LOST_LAST >= 5.0:
                 S.PAD_GAME_LOST_LAST = now
                 log(f"[GAME-LOST-PAD] pad node {S.PAD_NODE} GONE while a game "
                     f"reader held it (Steam tore the virtual pad down; game "
@@ -313,12 +318,26 @@ def _scan_pad_identity(devices):
     node = _pad_event_node(pad)
     name = (pad.get("name") or "").strip()
     sysfs = pad.get("sysfs") or ""
+    now = time.monotonic()
     if S.PAD_NODE is not None and node is not None and node != S.PAD_NODE:
-        now = time.monotonic()
+        # Steam recreated the pad at a NEW eventN in-place (direct churn).
+        S.PAD_REBIND_UNTIL = now + PAD_STALL_S
         if now - S.PAD_RECREATED_LAST >= 5.0:
             S.PAD_RECREATED_LAST = now
             log(f"[PAD-RECREATED] pad eventN changed {S.PAD_NODE} -> {node} "
-                f"(Steam recreated the virtual pad {name}; old node torn down)")
+                f"(Steam recreated the virtual pad {name}; old node torn down; "
+                f"pad channel re-bound — [PAD-DEAD] suppressed {PAD_STALL_S}s)")
+    elif S.PAD_NODE is None and S.PAD_REBIND_UNTIL > 0 and \
+            now < S.PAD_REBIND_UNTIL:
+        # pad RETURNED inside the re-bind grace after Steam tore it down
+        # (gone -> recreated): extend the grace from the return so the new
+        # node is given the full stall window to prove itself.
+        S.PAD_REBIND_UNTIL = now + PAD_STALL_S
+        if now - S.PAD_RECREATED_LAST >= 5.0:
+            S.PAD_RECREATED_LAST = now
+            log(f"[PAD-RECREATED] pad node returned at {node} after Steam "
+                f"teardown (pad channel re-bound — [PAD-DEAD] suppressed "
+                f"{PAD_STALL_S}s)")
     S.PAD_NODE = node
     S.PAD_SYS = sysfs
     S.PAD_NAME = name
@@ -474,10 +493,20 @@ def _process_event(name, etype, code, value, entry, now):
             if code in PAD_GYRO_AXES:
                 S.PAD_GYRO_AXIS_COUNT += 1
                 S.PAD_GYRO_LAST = now
+                # v3.16 (todo 53e) — right stick = ABS_RX/ABS_RY on the pad.
+                # NOTE: ABS_RX/ABS_RY are ALSO the gyro-as-right-stick output,
+                # so a right-stick event here is ambiguous (physical stick OR
+                # gyro) when the config binds gyro to the right stick — the
+                # logger tracks the raw axis and notes the ambiguity.
+                S.PAD_STICK_R_COUNT += 1
+                S.PAD_STICK_R_LAST = now
             else:
                 # non-gyro axis (stick/trigger) — its OWN counter (FIX-C)
                 S.PAD_STICK_COUNT += 1
                 S.PAD_STICK_LAST = now
+                if code in (0x00, 0x01):   # ABS_X / ABS_Y = left stick
+                    S.PAD_STICK_L_COUNT += 1
+                    S.PAD_STICK_L_LAST = now
         if now - entry["last_abs"] >= EV_THROTTLE:
             aname = ABS_NAMES.get(code, f"0x{code:02x}")
             log(f"EV {name} ABS {aname} {value}")

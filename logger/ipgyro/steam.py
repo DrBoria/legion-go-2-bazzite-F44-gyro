@@ -72,6 +72,14 @@ def steam_scan(now):
     # periodic [STEAM-STATE]/[SNAPSHOT] game= tag and any transport-fallback
     # mode tag read the current focused-window context.
     record_mode_verdict()
+    # (v3.16 todo 53e) re-read the ACTIVE config's gyro binding (pad-axes |
+    # mouse | disabled | unknown) so the binding-aware gyro verdict knows
+    # whether gyro is provable through the pad or is a separate mouse output.
+    try:
+        from . import bind as BIND   # lazy: bind.py imports only state/logcore
+        BIND.binding_scan(now)
+    except Exception:
+        pass
 
 
 def _steam_registry(path):

@@ -335,6 +335,54 @@ MAIN_GAME_PID = None        # pid of the real running game process (or None)
 MAIN_GAME_NAME = ""         # comm of the real game process (e.g. eso64.exe)
 
 # ---------------------------------------------------------------------------
+# v3.16 (todo 53e) — BINDING-AWARE GYRO + MOUSE OBSERVER + STICKS tracking.
+# ---------------------------------------------------------------------------
+# The active Steam Input config's GYRO BINDING, parsed from the per-appid
+# controller_*.vdf under Steam Controller Configs/<steamid>/config/<appid>/
+# (research 53d): the SAME deck input is routed by the ACTIVE config — gyro is
+# bound to pad-axes (right-stick ABS_RX/ABS_RY on the pad) | mouse (a SEPARATE
+# injection, NOT the pad) | disabled | unknown (config unparseable). After wake
+# Steam's focus reverts to the desktop config (413080) which binds gyro to
+# MOUSE -> pad ABS_RX/ABS_RY stops while buttons/sticks (still pad outputs) keep
+# reaching the game. GYRO_BINDING drives the binding-aware gyro verdict so
+# config=413080 is a GYRO RE-DOMAIN, never a global "everything lost".
+GYRO_BINDING = None         # 'pad-axes' | 'mouse' | 'disabled' | 'unknown'|None
+GYRO_BINDING_SRC = ""       # evidence: which config file + appid the binding came from
+GYRO_BINDING_LAST = 0.0     # monotonic last [GYRO-BINDING] change log (anti-spam)
+# Per-wake gyro state (one explicit classification per wake after the settle
+# window): 'dead-at-deck' | 'steam-not-emitting' | 'as-mouse' | 'config-disabled'
+# | None (not yet classified / no pre-sleep gyro baseline).
+WAKE_GYRO_STATE = None
+WAKE_GYRO_STATE_LOGGED = 0.0  # monotonic of the wake the per-wake gyro state logged
+# Mouse-output observer (Part 2): counts REL_X/REL_Y pointer motion attributed
+# to the deck's gyro when the active config binds gyro to mouse. MOUSE_MODE
+# records whether a separate virtual-mouse evdev node was auto-detected
+# ('node') vs extest-injected pointer motion on the desktop ('extest') vs none.
+MOUSE_NODE = None           # '/dev/input/eventN' of the detected virtual mouse (or None)
+MOUSE_MODE = "none"         # 'node' | 'extest' | 'none'
+MOUSE_REL_COUNT = 0         # REL_X/REL_Y events on the mouse node since the pass
+MOUSE_REL_LAST = 0.0        # monotonic of the last mouse REL motion event
+# Pad-churn re-bind suppression: after a [PAD-RECREATED] (Steam recreated the
+# pad at a new eventN) the new node must be observed with ZERO events for the
+# full stall window before [PAD-DEAD] may fire — a re-created node must never
+# masquerade as "0 pad events => lost". PAD_REBIND_UNTIL is the monotonic until
+# which [PAD-DEAD] is suppressed after the last pad re-bind.
+PAD_REBIND_UNTIL = 0.0      # monotonic: suppress [PAD-DEAD] until this time
+PAD_REBIND_LOGGED = 0.0     # monotonic last [PAD-RECREATED]+rebind log (anti-spam)
+# Sticks/joysticks as an EXPLICIT tracked data type (Part 3, user request):
+# left stick = ABS_X/ABS_Y on the pad; right stick = ABS_RX/ABS_RY. NOTE:
+# ABS_RX/ABS_RY are ALSO the gyro-as-right-stick output, so "right stick moved
+# by the physical stick" vs "right stick driven by gyro" is not always
+# separable from the pad alone — the logger tracks the raw axes and notes the
+# ambiguity honestly where gyro is bound to the right stick.
+PAD_STICK_L_COUNT = 0       # left-stick (ABS_X/ABS_Y) pad events since the pass
+PAD_STICK_L_LAST = 0.0      # monotonic of the last left-stick pad event
+PAD_STICK_R_COUNT = 0       # right-stick (ABS_RX/ABS_RY) pad events since the pass
+PAD_STICK_R_LAST = 0.0      # monotonic of the last right-stick pad event
+PAD_STICK_L_LATCH = 0.0     # last [PAD→GAME sticks-left] log (anti-spam)
+PAD_STICK_R_LATCH = 0.0     # last [PAD→GAME sticks-right] log (anti-spam)
+
+# ---------------------------------------------------------------------------
 # Shutdown flag (set by logcore._signal_handler, read by every daemon loop)
 # ---------------------------------------------------------------------------
 STOP = False                # set by SIGINT/SIGTERM for a clean exit
