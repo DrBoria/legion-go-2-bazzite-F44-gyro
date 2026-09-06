@@ -23,6 +23,7 @@ module load order cycle-free).
 Shared mutable state is ALWAYS accessed as S.<name> (see ipgyro.state).
 """
 
+import os
 import time
 
 import threading
@@ -32,7 +33,8 @@ from . import state as S
 from . import discover as D
 from .conf import (DECK_MODE_WORDS, FULL_MODE_GAME, FULL_MODE_POST,
                    FULL_MODE_WAKE, LOOP_STALL_HB, LOOP_STALL_LOG_S,
-                   MODE_TAG_WORDS, REGRAB_MISSING_S, SESS_INTERVAL)
+                   MODE_TAG_WORDS, PAD_DELIVERY_HB, PAD_STALL_S,
+                   REGRAB_MISSING_S, SESS_INTERVAL)
 from .hidraw import _hid_label
 from .logcore import log, run_cmd
 
@@ -198,12 +200,16 @@ def snapshot_state(reason):
     NOW, so any before/after transition diff shows exactly what changed.
     (R1/R9) also states the center IMU identity + active gyro source. v3.9
     (FIX-1): human mode word + role-based grouping under human field names
-    controller=[...] (physical input) and virtual=[...] (Steam-facing output)."""
+    controller=[...] (physical input) and virtual=[...] (Steam-facing output).
+    v3.11 (todo 52o): adds the real-delivery counters deck_rd/s (deck frames,
+    hop 1 only), pad_ev/s (EV events on the 28de:11ff pad), game_reader=yes/no
+    (a game pid holds the pad fd) and gyro_map=pad-axes|mouse|none."""
     mode = _human_deck_mode(_deck_mode(S.HID_DEVICES))
     cen = S.CEN_IMU
     cen_s = f"{cen['entry']}({cen['name']})" if cen else "none"
     controller = _group_labels(D.ROLE_PHYSICAL)
     virtual = _group_labels(D.ROLE_DECK)
+    pad_node = S.PAD_NODE or "-"
     log(f"[SNAPSHOT] reason={reason} mode={mode} "
         f"controller=[{','.join(controller) or '-'}] "
         f"virtual=[{','.join(virtual) or '-'}] "
@@ -212,7 +218,171 @@ def snapshot_state(reason):
         f"steam_focus={S.STEAM_UI_FOCUS or 'none'} "
         f"steam_procs={S.STEAM_APP_SUMMARY or '(none)'} "
         f"game={'yes' if S.GAME_FOCUSED else 'no'} "
-        f"deck_keepalive={'yes' if S.DECK_KEEPALIVE else 'no'}")
+        f"deck_keepalive={'yes' if S.DECK_KEEPALIVE else 'no'} "
+        f"pad_node={pad_node} "
+        f"deck_rd/s={S.DECK_RD_COUNT} pad_ev/s={S.PAD_EV_COUNT} "
+        f"game_reader={'yes' if S.PAD_GAME_READER else 'no'} "
+        f"gyro_map={S.PAD_GYRO_MAP or 'unknown'}")
+
+
+# ---------------------------------------------------------------------------
+# v3.11 (todo 52o) — REAL input-delivery tracking. The game reads a SEPARATE
+# virtual pad node Steam creates ("Microsoft X-Box 360 pad", VID:PID 28de:11ff)
+# — deck frames (28de:12f0 -> Steam) are only HOP 1, never proof the game got
+# the input. The ONLY host-side proof is EV events on the pad node WHILE the
+# game process holds the pad fd (/proc/<pid>/fd -> /dev/input/eventN). Deck
+# frames + [STEAM-CONFIG active=GAME] are PRECONDITIONS, never proof.
+# ---------------------------------------------------------------------------
+
+def _pad_reader_pids():
+    """PIDs holding the pad fd open (/proc/<pid>/fd -> the pad eventN node).
+    The game (ESO via Proton/SDL/evdev) is the reader that matters."""
+    node = S.PAD_NODE
+    pids = set()
+    if not node:
+        return pids
+    try:
+        procs = os.listdir("/proc")
+    except Exception:
+        return pids
+    for p in procs:
+        if not p.isdigit():
+            continue
+        try:
+            fds = os.listdir(f"/proc/{p}/fd")
+        except Exception:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(f"/proc/{p}/fd/{fd}")
+            except Exception:
+                continue
+            if target == node:
+                pids.add(int(p))
+                break
+    return pids
+
+
+def _game_reader_pid():
+    """The game pid holding the pad fd, from S.STEAM_PROC_SET (pid -> (appid,
+    name, cmd)). Generic: any running Steam game process that holds the pad fd
+    counts (ESO SteamAppId=306130 is discovered generically, never hardcoded)."""
+    readers = _pad_reader_pids()
+    S.PAD_READER_PIDS = readers
+    for pid in sorted(readers):
+        if pid in S.STEAM_PROC_SET:
+            return pid
+    # fallback: any reader whose /proc environ carries a SteamAppId
+    for pid in sorted(readers):
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                data = f.read()
+        except Exception:
+            continue
+        for kv in data.split(b"\x00"):
+            k, _, v = kv.partition(b"=")
+            if k in (b"SteamAppId", b"SteamGameId") and v:
+                return pid
+    return None
+
+
+def _gyro_map_verdict(now):
+    """Infer how the active Steam config maps gyro, from pad EV evidence:
+      * gyro-axis (ABS_RX/ABS_RY) events on the pad -> 'pad-axes' (PROVABLE)
+      * no gyro-axis events but the deck IMU is moving and the pad is delivering
+        buttons/sticks -> gyro is bound elsewhere (mouse) -> 'mouse' (NOT
+        provable through the pad)
+      * otherwise -> 'none' (no gyro evidence)."""
+    if S.PAD_GYRO_AXIS_COUNT > 0:
+        return "pad-axes"
+    # deck IMU moving recently + pad delivering non-gyro events -> gyro bound
+    # to a different output (mouse) -> not provable through the pad.
+    deck_moving = S.DECK_MOTION_COUNT > 0
+    pad_active = S.PAD_ABS_COUNT > 0 or S.PAD_EV_COUNT > 0
+    if deck_moving and pad_active:
+        return "mouse"
+    return "none"
+
+
+def pad_verdict_scan(now):
+    """(v3.11) Per-second REAL-delivery verdict. Emits:
+      * [DECK→STEAM]  deck frames flowing (hop 1: deck -> Steam) — upstream
+                      only, a PRECONDITION, never proof the game got the input;
+      * [PAD→GAME]    pad EV events (28de:11ff) WHILE a game pid holds the pad
+                      fd — the ONLY host-side proof input reached the game;
+      * [PAD-DEAD]    pad node + game reader present + deck delivering but ZERO
+                      pad EV events for PAD_STALL_S (Valve steam-for-linux#13029:
+                      game dropped the device and never re-acquired);
+      * [GYRO→PAD-AXIS] gyro-driven ABS_RX/ABS_RY events on the pad while the
+                      game holds it (gyro PROVABLY reached the game);
+      * [GYRO-OUTPUT] gyro is bound to mouse/unmapped (not provable through the
+                      pad) — never fabricate a delivery claim.
+    [PAD-RECREATED]/[GAME-LOST-PAD] are emitted by devices.scan_evdev. Resets
+    the per-second pad counters after the verdict."""
+    deck_rd = S.DECK_RD_COUNT
+    deck_mot = S.DECK_MOTION_COUNT
+    deck_act = S.DECK_ACTION_COUNT
+    pad_ev = S.PAD_EV_COUNT
+    pad_abs = S.PAD_ABS_COUNT
+    pad_gyro = S.PAD_GYRO_AXIS_COUNT
+    pad_node = S.PAD_NODE
+    game_reader = _game_reader_pid()
+    S.PAD_GAME_READER = game_reader is not None
+    S.PAD_GAME_READER_PID = game_reader
+    S.PAD_GYRO_MAP = _gyro_map_verdict(now)
+
+    # -- hop-1: deck frames flowing (upstream only, precondition) ------------
+    if deck_rd > 0 and pad_node:
+        if now - S.PAD_DELIVERY_LAST >= PAD_DELIVERY_HB:
+            S.PAD_DELIVERY_LAST = now
+            log(f"[DECK→STEAM] deck delivering {deck_rd} rd/s "
+                f"(mot={deck_mot} act={deck_act}) — HOP 1 deck->Steam only, "
+                f"NOT proof the game got the input")
+
+    # -- proof: pad EV events + a game pid holds the pad fd ------------------
+    if game_reader is not None and pad_ev > 0:
+        S.PAD_DEAD_LOGGED = False          # pad is alive -> clear [PAD-DEAD]
+        if now - S.PAD_DELIVERY_LAST >= PAD_DELIVERY_HB:
+            S.PAD_DELIVERY_LAST = now
+            log(f"[PAD→GAME] {pad_ev} EV events/s on pad {pad_node} "
+                f"(28de:11ff) read by game pid={game_reader} — input REACHED "
+                f"the game")
+        # -- gyro provability through the pad --------------------------------
+        if pad_gyro > 0:
+            if not S.PAD_GYRO_AXIS_LOGGED or \
+                    now - S.PAD_GYRO_AXIS_LAST >= PAD_DELIVERY_HB:
+                S.PAD_GYRO_AXIS_LOGGED = True
+                S.PAD_GYRO_AXIS_LAST = now
+                log(f"[GYRO→PAD-AXIS] {pad_gyro} gyro-axis ABS_RX/ABS_RY "
+                    f"events/s on pad {pad_node} read by game pid={game_reader} "
+                    f"— gyro PROVABLY reached the game (mapped to pad axes)")
+        else:
+            # deck IMU moving but no gyro on the pad -> gyro bound to mouse
+            if deck_mot > 0 and S.PAD_GYRO_MAP == "mouse":
+                if now - S.PAD_GYRO_AXIS_LAST >= PAD_DELIVERY_HB:
+                    S.PAD_GYRO_AXIS_LAST = now
+                    log(f"[GYRO-OUTPUT] deck IMU moving (mot={deck_mot}/s) but "
+                        f"NO gyro on pad axes — gyro is bound to MOUSE output "
+                        f"(different virtual node); NOT provable through the "
+                        f"pad host-side")
+    else:
+        # -- [PAD-DEAD]: pad + game reader + deck delivering, zero pad EV -----
+        if (game_reader is not None and pad_node and deck_rd > 0
+                and pad_ev == 0):
+            if not S.PAD_DEAD_LOGGED or now - S.PAD_DEAD_LAST >= PAD_DELIVERY_HB:
+                S.PAD_DEAD_LOGGED = True
+                S.PAD_DEAD_LAST = now
+                log(f"[PAD-DEAD] pad {pad_node} present + game pid={game_reader} "
+                    f"holds it + deck delivering {deck_rd} rd/s but ZERO pad EV "
+                    f"events for {PAD_STALL_S:.0f}s — game dropped the device "
+                    f"and never re-acquired (Valve steam-for-linux#13029)")
+        else:
+            S.PAD_DEAD_LOGGED = False
+
+    # -- reset the per-second pad counters (consumed by the next snapshot) ----
+    S.PAD_EV_COUNT = 0
+    S.PAD_ABS_COUNT = 0
+    S.PAD_GYRO_AXIS_COUNT = 0
 
 
 def _mark_detach(now):

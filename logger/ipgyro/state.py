@@ -189,6 +189,43 @@ LOOP_STALL_LAST_LOG = 0.0       # monotonic last [LOOP-STALL]/[LOOP-RECOVERED] l
 IPJ_WAKE_FLUSHED = 0.0          # monotonic last ipj wake flush
 
 # ---------------------------------------------------------------------------
+# v3.11 (todo 52o) — REAL input-delivery tracking shared state. The game reads
+# a SEPARATE virtual pad node Steam creates ("Microsoft X-Box 360 pad",
+# VID:PID 28de:11ff) — deck frames (28de:12f0 -> Steam) are only HOP 1, never
+# proof the game got the input. The ONLY host-side proof is EV events on the
+# pad node WHILE the game process holds the pad fd. All state is read/written
+# as S.<name> (never rebound locally).
+# ---------------------------------------------------------------------------
+# Pad identity (populated by devices.scan_evdev from /proc/bus/input/devices).
+# The pad is matched by NAME PREFIX + VID:PID 28de:11ff (NOT the churning
+# eventN, which changes on every Steam teardown/recreate).
+PAD_NODE = None             # '/dev/input/eventN' of the 28de:11ff pad (or None)
+PAD_SYS = None              # sysfs path of the pad input (e.g. .../input65)
+PAD_NAME = None             # full pad name (e.g. 'Microsoft X-Box 360 pad 0')
+PAD_LAST_EV = 0.0           # monotonic of the last EV event observed on the pad
+PAD_EV_COUNT = 0            # EV events on the pad since the last per-second pass
+PAD_ABS_COUNT = 0           # EV_ABS events on the pad since the last pass
+PAD_GYRO_AXIS_COUNT = 0     # gyro-axis (ABS_RX/ABS_RY) events on the pad
+PAD_GYRO_LAST = 0.0         # monotonic of the last gyro-axis pad event
+PAD_DEAD_LOGGED = False     # True while a [PAD-DEAD] window is open (re-assert)
+PAD_DEAD_LAST = 0.0         # monotonic last [PAD-DEAD] log (anti-spam)
+PAD_RECREATED_LAST = 0.0    # monotonic last [PAD-RECREATED] log (anti-spam)
+PAD_GYRO_AXIS_LOGGED = False  # True while a [GYRO→PAD-AXIS] window is open
+PAD_GYRO_AXIS_LAST = 0.0    # monotonic last [GYRO→PAD-AXIS] log (anti-spam)
+PAD_DELIVERY_LAST = 0.0     # monotonic last [PAD→GAME] delivery log (anti-spam)
+PAD_GAME_LOST_LAST = 0.0    # monotonic last [GAME-LOST-PAD] log (anti-spam)
+PAD_READER_PIDS = set()     # pids holding the pad fd (game reader probe)
+PAD_READER_KNOWN = None     # last reader-pid set signature (change-only)
+# Per-second deck (hop-1) counters, reset by the obs pad_verdict_scan pass.
+DECK_RD_COUNT = 0           # deck frames read since the last per-second pass
+DECK_MOTION_COUNT = 0       # deck IMU-motion frames since the last pass
+DECK_ACTION_COUNT = 0       # deck button/stick/trigger changes since the pass
+# Last [PAD→GAME] evidence (for the SNAPSHOT game_reader= field + markers).
+PAD_GAME_READER = False     # True when a game pid holds the pad fd
+PAD_GAME_READER_PID = None  # the game pid holding the pad fd (or None)
+PAD_GYRO_MAP = None         # 'pad-axes' | 'mouse' | 'none' | None (unknown)
+
+# ---------------------------------------------------------------------------
 # Shutdown flag (set by logcore._signal_handler, read by every daemon loop)
 # ---------------------------------------------------------------------------
 STOP = False                # set by SIGINT/SIGTERM for a clean exit

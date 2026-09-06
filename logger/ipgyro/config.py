@@ -56,6 +56,8 @@ DEFAULTS = {
         "gyro_feed_1": 2.0, "gyro_feed_2": 10.0, "wake_reassert": 30.0,
         "regrab_missing": 15.0, "loop_stall_log": 10.0, "loop_stall_hb": 15.0,
         "ipj_wake_flush": 8.0,
+        # v3.11 (todo 52o) real input-delivery tracking cadences
+        "pad_stall": 5.0, "pad_delivery_hb": 30.0,
     },
     "full_mode": {
         "post": 10.0, "wake": 30.0, "game": 3600.0,

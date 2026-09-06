@@ -147,6 +147,10 @@ def scan_hidraw():
             "first_attach": now, "frames_seen": {},
             # per-report decode / motion / frame-continuity state
             "dec_count": 0, "mot_count": 0, "mot_last": 0.0, "mot_log": 0.0,
+            # v3.11 — deck user-action counter (button/stick/trigger change)
+            # since the last per-second pass; feeds the deck_rd/s + [DECK→STEAM]
+            # hop-1 delivery evidence (NOT proof the game got the input).
+            "act_count": 0,
             "btn_prev": "", "last_frame": None,
             "gap_active": False, "gap_at": 0.0,
             "bad_len_logged": False, "bad_hdr_logged": False, "jump_log": 0.0,
@@ -292,9 +296,14 @@ def _handle_deck_reports(e, chunk, t2):
         if _full_mode_active():
             _log_full_frame(e["node"], label, dec, raw, t2)
         # -- button-set change -> a DECODE line proving a press reached Steam
+        # (hop 1: deck -> Steam). v3.11: count it as a deck user-action so the
+        # [DECK→STEAM] hop-1 evidence is measurable. This is NOT proof the game
+        # got the input — only pad EV events (28de:11ff) + a game reader prove
+        # that ([PAD→GAME]).
         sig = ",".join(dec["buttons"])
         if sig != e["btn_prev"]:
             e["btn_prev"] = sig
+            e["act_count"] += 1
             log(f"DECODE {label} frame={dec['frame']} btn=[{sig or '-'}] "
                 f"ls=({dec['lsx']},{dec['lsy']}) rs=({dec['rsx']},{dec['rsy']}) "
                 f"lt={dec['lt']} rt={dec['rt']} "
@@ -566,11 +575,19 @@ def emit_hid_summary(now):
         is still active -> the exact direction/instant input stopped;
       - v3 ACTIVITY: ONE compact cross-direction correlation line
         (EV | physical-source reads | per-DECK reads + MOTION presence).
-    G3: also probes the deck-output consumer (reader PIDs) change-only."""
+    G3: also probes the deck-output consumer (reader PIDs) change-only.
+    v3.11: accumulates the per-second DECK (hop-1) counters into S
+    (DECK_RD_COUNT / DECK_MOTION_COUNT / DECK_ACTION_COUNT) so obs can emit
+    [DECK→STEAM] (deck frames flowing = hop 1 only, never proof the game got
+    the input) and the SNAPSHOT deck_rd/s field."""
     try:
         probe_consumers(now)
     except Exception:
         pass
+    # v3.11 — reset the per-second deck (hop-1) counters before accumulating.
+    S.DECK_RD_COUNT = 0
+    S.DECK_MOTION_COUNT = 0
+    S.DECK_ACTION_COUNT = 0
     # -- pre-pass: is the physical source still delivering? -------------------
     # (computed before the per-device loop so the result is order-independent)
     src_alive = False
@@ -598,6 +615,16 @@ def emit_hid_summary(now):
         mot_rd = e["mot_count"]
         e["dec_count"] = 0
         e["mot_count"] = 0
+        # v3.11 — accumulate the per-second DECK (hop-1) counters into S so obs
+        # can emit [DECK→STEAM] and the SNAPSHOT deck_rd/s field. Deck frames
+        # flowing = hop 1 (deck -> Steam) only — NEVER proof the game got the
+        # input (that needs pad EV events + a game reader, [PAD→GAME]).
+        if _is_deck(e):
+            act_rd = e["act_count"]
+            e["act_count"] = 0
+            S.DECK_RD_COUNT += reads
+            S.DECK_MOTION_COUNT += mot_rd
+            S.DECK_ACTION_COUNT += act_rd
         # -- loud flow-state transitions (detach-mode signal) -----------------
         # A GAMING deck (uhid) dropping from live (>0 rd/s) to 0 rd/s is the
         # exact instant Steam loses input on a detach ([DECK-DEAD]); resuming
@@ -617,7 +644,10 @@ def emit_hid_summary(now):
                 mk = "[DECK-ALIVE]" if _is_game_deck(e) else "[LEGION-ALIVE]"
                 log(f"{mk} {label} delivering again "
                     f"({reads} rd/s) — stream resumed")
-                # (R8) dock -> deck-stream-resumed latency (input back in game)
+                # (R8) dock -> deck-stream-resumed latency. v3.11: this is the
+                # deck stream resuming (hop 1: deck -> Steam) — the game only
+                # gets input once pad EV events (28de:11ff) + a game reader are
+                # seen ([PAD→GAME]); [DECK-ALIVE] is a precondition, not proof.
                 if _is_game_deck(e):
                     from . import obs as O   # lazy: obs imports _hid_label here
                     O.mark_regrab(now, "deck-alive")

@@ -35,13 +35,35 @@ from .logcore import log, run_cmd
 # ".../0003:17EF:61EB.0001/input/input6/event3" (also covers 28DE deck nodes).
 _VIDPID_RE = re.compile(r"(?:0003|0005):([0-9A-Fa-f]{4}):([0-9A-Fa-f]{4})")
 
+# v3.11 (todo 52o) — the GAME-FACING virtual pad Steam creates. Steam Input
+# reads the deck (28de:12f0) and emits a SEPARATE uinput evdev node named
+# "Microsoft X-Box 360 pad N" with VID:PID 28de:11ff that the GAME (ESO via
+# Proton/XInput/SDL/evdev) actually reads. This is the ONLY host-side proof of
+# game delivery. Identity is matched by NAME PREFIX + VID:PID — NEVER the
+# churning eventN (event numbers change on every Steam teardown/recreate).
+PAD_NAME_PREFIX = "Microsoft X-Box 360 pad"
+PAD_VID = "28DE"
+PAD_PID = "11FF"
+# Gyro axes on the pad (Steam maps gyro to ABS_RX/ABS_RY when the active config
+# binds gyro to the right-stick axes). Only these make gyro PROVABLE through
+# the pad; if gyro is bound to mouse it emits on a different (virtual mouse)
+# node and is NOT provable host-side through the pad.
+PAD_GYRO_AXES = (0x03, 0x04)   # ABS_RX, ABS_RY
+# The /proc/bus/input/devices 'I:' line carries the authoritative bus/vendor/
+# product (e.g. 'I: Bus=0003 Vendor=28de Product=11ff Version=0001').
+_I_LINE_RE = re.compile(
+    r"Bus=([0-9A-Fa-f]+)\s+Vendor=([0-9A-Fa-f]+)\s+Product=([0-9A-Fa-f]+)")
+
 
 # ---------------------------------------------------------------------------
 # /proc/bus/input/devices parsing
 # ---------------------------------------------------------------------------
 
 def parse_proc_input_devices():
-    """Return a list of device dicts parsed from /proc/bus/input/devices."""
+    """Return a list of device dicts parsed from /proc/bus/input/devices.
+    v3.11: each entry also carries the authoritative bus/vendor/product parsed
+    from the 'I:' line (e.g. Bus=0003 Vendor=28de Product=11ff) so a device can
+    be matched by VID:PID without depending on the sysfs path format."""
     devices = []
     try:
         with open("/proc/bus/input/devices") as f:
@@ -60,10 +82,17 @@ def parse_proc_input_devices():
         if line[0] in "INPSUHB":
             val = line[2:].strip()
             if cur is None:
-                cur = {"name": "", "phys": "", "sysfs": "", "handlers": [], "bmap": {}}
+                cur = {"name": "", "phys": "", "sysfs": "", "handlers": [],
+                       "bmap": {}, "bus": "", "vid": "", "pid": ""}
             # /proc/bus/input/devices lines carry the field name inside the value,
             # e.g. 'N: Name="Power Button"', 'P: Phys=...', 'H: Handlers=kbd event0'.
-            if line[0] == "N":
+            if line[0] == "I":
+                m = _I_LINE_RE.search(val)
+                if m:
+                    cur["bus"] = m.group(1).upper()
+                    cur["vid"] = m.group(2).upper()
+                    cur["pid"] = m.group(3).upper()
+            elif line[0] == "N":
                 cur["name"] = val.partition("=")[2].strip().strip('"')
             elif line[0] == "P":
                 cur["phys"] = val.partition("=")[2].strip()
@@ -236,16 +265,86 @@ def build_node_map(devices):
     return m
 
 
+# ---------------------------------------------------------------------------
+# v3.11 (todo 52o) — the game-facing virtual pad (28de:11ff) identity.
+# ---------------------------------------------------------------------------
+
+def _is_pad(dev):
+    """True when a /proc/bus/input/devices entry is Steam's game-facing virtual
+    pad: name starts with 'Microsoft X-Box 360 pad' AND VID:PID 28de:11ff (from
+    the 'I:' line). Matched by NAME + VID:PID, NEVER by the churning eventN."""
+    name = (dev.get("name") or "").strip()
+    if not name.startswith(PAD_NAME_PREFIX):
+        return False
+    return (dev.get("vid") == PAD_VID and dev.get("pid") == PAD_PID)
+
+
+def _pad_event_node(dev):
+    """The '/dev/input/eventN' node of a pad entry (first event handler), or
+    None. The eventN number churns across Steam teardown/recreate — callers
+    must always re-derive it from the current device set, never cache it."""
+    for h in dev.get("handlers") or []:
+        if h.startswith("event"):
+            return "/dev/input/" + h
+    return None
+
+
+def _scan_pad_identity(devices):
+    """(Re)derive the current game-facing pad identity from the device set and
+    publish it on S. Detects [PAD-RECREATED] when the pad's eventN node changed
+    (Steam tore the pad down and recreated it — Valve steam-for-linux#13029
+    mode) and [GAME-LOST-PAD] when the pad node disappeared entirely while a
+    game reader was present. Returns the pad entry or None."""
+    pad = next((d for d in devices if _is_pad(d)), None)
+    if pad is None:
+        # pad node gone entirely -> [GAME-LOST-PAD] if a game reader was known
+        if S.PAD_NODE is not None and S.PAD_READER_KNOWN:
+            now = time.monotonic()
+            if now - S.PAD_GAME_LOST_LAST >= 5.0:
+                S.PAD_GAME_LOST_LAST = now
+                log(f"[GAME-LOST-PAD] pad node {S.PAD_NODE} GONE while a game "
+                    f"reader held it (Steam tore the virtual pad down; game "
+                    f"lost the pad fd — Valve steam-for-linux#13029)")
+        S.PAD_NODE = None
+        S.PAD_SYS = None
+        S.PAD_NAME = None
+        S.PAD_READER_KNOWN = None
+        return None
+    node = _pad_event_node(pad)
+    name = (pad.get("name") or "").strip()
+    sysfs = pad.get("sysfs") or ""
+    if S.PAD_NODE is not None and node is not None and node != S.PAD_NODE:
+        now = time.monotonic()
+        if now - S.PAD_RECREATED_LAST >= 5.0:
+            S.PAD_RECREATED_LAST = now
+            log(f"[PAD-RECREATED] pad eventN changed {S.PAD_NODE} -> {node} "
+                f"(Steam recreated the virtual pad {name}; old node torn down)")
+    S.PAD_NODE = node
+    S.PAD_SYS = sysfs
+    S.PAD_NAME = name
+    return pad
+
+
 def scan_evdev(devices, node_map):
     """Open evdev nodes for every gamepad-like device; close nodes that are
-    gone. Called every snapshot cycle so devices come/go cleanly."""
+    gone. Called every snapshot cycle so devices come/go cleanly. v3.11: also
+    re-derives the game-facing virtual pad (28de:11ff) identity and tags its
+    EV_DEVICES entry so pad EV events are counted as [PAD→GAME] proof."""
+    # v3.11 — derive the pad identity FIRST (before the open loop) so the pad
+    # node is always captured even if it is not gamepad-heuristic-matched.
+    pad = _scan_pad_identity(devices)
+    pad_node = _pad_event_node(pad) if pad is not None else None
+
     desired = {}
     for d in devices:
-        if not is_gamepad(d):
+        # v3.11 — the game-facing pad must ALWAYS be captured even if the
+        # gamepad heuristic ever fails to match it (it is the delivery proof).
+        if not (is_gamepad(d) or _is_pad(d)):
             continue
         for h in d.get("handlers") or []:
             if h.startswith("event"):
-                desired["/dev/input/" + h] = node_map.get(h) or d.get("name") or ""
+                path = "/dev/input/" + h
+                desired[path] = node_map.get(h) or d.get("name") or ""
 
     now = time.monotonic()
     for path, nm in desired.items():
@@ -259,8 +358,17 @@ def scan_evdev(devices, node_map):
                 log(f"EV: cannot open {path}: {e}")
                 S.EV_OPEN_ERR[path] = now
             continue
-        S.EV_DEVICES[path] = {"fd": fd, "name": nm, "buf": bytearray(), "last_abs": 0.0}
-        log(f"EV: capturing {path} ({nm or '?'})")
+        is_pad = (path == pad_node)
+        S.EV_DEVICES[path] = {
+            "fd": fd, "name": nm, "buf": bytearray(), "last_abs": 0.0,
+            "is_pad": is_pad,
+        }
+        if is_pad:
+            log(f"EV: capturing {path} ({nm or '?'}) — GAME-FACING VIRTUAL PAD "
+                f"(28de:11ff); EV events here + a game pid holding the fd = "
+                f"proof input reached the game")
+        else:
+            log(f"EV: capturing {path} ({nm or '?'})")
 
     for path in list(S.EV_DEVICES.keys()):
         if path not in desired:
@@ -317,16 +425,31 @@ def handle_evdev(now):
 
 
 def _process_event(name, etype, code, value, entry, now):
-    """Log EV_KEY presses (value 1) and EV_ABS changes (throttled)."""
+    """Log EV_KEY presses (value 1) and EV_ABS changes (throttled). v3.11: when
+    the entry is the game-facing virtual pad (28de:11ff), every EV event is
+    counted as [PAD→GAME] proof evidence (pad_ev/s), and EV_ABS on the gyro
+    axes (ABS_RX/ABS_RY) is counted separately so gyro provability through the
+    pad can be asserted ([GYRO→PAD-AXIS])."""
+    is_pad = bool(entry.get("is_pad"))
     if etype == EV_KEY:
         if value == 1:
             kname = KEY_NAMES.get(code, f"0x{code:03x}")
             log(f"EV {name} KEY {kname} DOWN")
         S.EV_ACT_COUNT += 1
         S.EV_ACT_LAST = now
+        if is_pad:
+            S.PAD_EV_COUNT += 1
+            S.PAD_LAST_EV = now
     elif etype == EV_ABS:
         S.EV_ACT_COUNT += 1
         S.EV_ACT_LAST = now
+        if is_pad:
+            S.PAD_EV_COUNT += 1
+            S.PAD_ABS_COUNT += 1
+            S.PAD_LAST_EV = now
+            if code in PAD_GYRO_AXES:
+                S.PAD_GYRO_AXIS_COUNT += 1
+                S.PAD_GYRO_LAST = now
         if now - entry["last_abs"] >= EV_THROTTLE:
             aname = ABS_NAMES.get(code, f"0x{code:02x}")
             log(f"EV {name} ABS {aname} {value}")

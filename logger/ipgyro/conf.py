@@ -153,7 +153,7 @@ DECK_DRAIN_MAX = 16         # max frames coalesced from one deck burst drain
 #  2026-09-05 on user request; the full contract now lives in Agent.md,
 #  section "2026-09-05 ~22:3x — V22 ДИЗАЙН-ДОКУМЕНТ ...".)
 # ---------------------------------------------------------------------------
-LOG_VERSION = "v3.10"
+LOG_VERSION = "v3.11"
 
 # v3.9 (todo 52f FIX-1 CLEAR NAMING): the HUMAN vocabulary every log/config
 # shows. Internal role/deck_kind keys (discover.py), mode internals and marker
@@ -231,6 +231,18 @@ REGRAB_MISSING_S = 15.0
 # longer than LOOP_STALL_LOG_S ([LOOP-STALL]); re-assert only every LOOP_STALL_HB.
 LOOP_STALL_LOG_S = 10.0
 LOOP_STALL_HB = 15.0
+
+# ---------------------------------------------------------------------------
+# v3.11 (todo 52o) — REAL input-delivery tracking cadences. The game reads a
+# SEPARATE uinput evdev node Steam creates ("Microsoft X-Box 360 pad",
+# VID:PID 28de:11ff) — deck frames (28de:12f0 -> Steam) are only HOP 1, never
+# proof the game got the input. The pad identity constants live in devices.py
+# (this module holds NO device ids by policy); only cadences live here.
+# ---------------------------------------------------------------------------
+PAD_STALL_S = 5.0       # pad present + game reader + deck delivering, zero pad
+                        # EV events this long -> [PAD-DEAD] (Valve #13029 mode)
+PAD_DELIVERY_HB = 30.0  # re-assert a long-lived [PAD→GAME]/[GYRO→PAD-AXIS]
+                        # delivery state only this often (no per-second spam)
 # D5 — ipj wake flush: journal window (backward from the wake instant) scanned
 # once at wake to catch delayed arbiter/gyro-center flip-flops the -f follower
 # delivered late across resume.

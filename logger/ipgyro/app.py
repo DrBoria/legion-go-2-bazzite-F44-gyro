@@ -40,8 +40,8 @@ from .hidraw import emit_hid_summary, handle_hidraw, scan_hidraw
 from .iio import discover_iio, sample_iio
 from .ipj import ipj_backlog, ipj_tail_loop
 from .logcore import _signal_handler, log, maybe_rotate, run_cmd
-from .obs import (_full_mode, loop_stall_watchdog_loop, pm_probe,
-                  pm_wake_check, startup_reconcile, state_tracker)
+from .obs import (_full_mode, loop_stall_watchdog_loop, pad_verdict_scan,
+                  pm_probe, pm_wake_check, startup_reconcile, state_tracker)
 from .pm import pm_backlog, pm_journal_loop
 from .steam import steam_scan, steam_state_verdict
 from .udev import udev_monitor_loop
@@ -88,6 +88,8 @@ def _load_config():
         "WAKE_REASSERT_S": "wake_reassert", "REGRAB_MISSING_S": "regrab_missing",
         "LOOP_STALL_LOG_S": "loop_stall_log", "LOOP_STALL_HB": "loop_stall_hb",
         "IPJ_WAKE_FLUSH_S": "ipj_wake_flush",
+        # v3.11 (todo 52o) real input-delivery tracking cadences
+        "PAD_STALL_S": "pad_stall", "PAD_DELIVERY_HB": "pad_delivery_hb",
     })
     # D3 — the two [GYRO-FEED] verdict instants come from two config keys.
     try:
@@ -255,6 +257,16 @@ def main():
         "[REGRAB-MISSING] watchdog after dock, D5 [IPJ-WAKE] wake-ordered flush "
         "(real journal ts + arrival delay), D6 post-wake [CEN-IMU]/[GYRO-SRC] "
         "@1s + [RE-ENUM] on interface change, D7 [LOOP-STALL] watchdog thread")
+    log("LOGGER: v3.11 todo-52o REAL input-delivery tracking active — the game "
+        "reads a SEPARATE virtual pad (Microsoft X-Box 360 pad, 28de:11ff) that "
+        "Steam creates, NOT the deck (28de:12f0). Deck frames = [DECK→STEAM] "
+        "hop-1 only (precondition, never proof). [PAD→GAME] = pad EV events + "
+        "a game pid holds the pad fd (the ONLY host-side proof). "
+        "[PAD-DEAD]/[PAD-RECREATED]/[GAME-LOST-PAD] lifecycle (Valve "
+        "steam-for-linux#13029). [GYRO→PAD-AXIS] when gyro lands on pad "
+        "ABS_RX/ABS_RY vs [GYRO-OUTPUT] when bound to mouse/unmapped (not "
+        "provable through the pad). SNAPSHOT adds deck_rd/s, pad_ev/s, "
+        "game_reader, gyro_map")
 
     # (v3.8 F2) close the startup blind window ONCE, before the cadence loop:
     # replay the physical-source churn the udev thread recorded during init and
@@ -351,6 +363,14 @@ def main():
                     emit_hid_summary(now)
                 except Exception as e:
                     log(f"LOGGER: hid flow summary error: {e}")
+                # v3.11 — per-second REAL-delivery verdict ([DECK→STEAM]/
+                # [PAD→GAME]/[PAD-DEAD]/[GYRO→PAD-AXIS]/[GYRO-OUTPUT]). Runs on
+                # the same 1 s cadence as emit_hid_summary (which just reset the
+                # deck counters) so the pad/gyro counters are fresh.
+                try:
+                    pad_verdict_scan(now)
+                except Exception as e:
+                    log(f"LOGGER: pad verdict scan error: {e}")
 
             # -- periodic: Steam virtual-gamepad registry + controller log ----
             if now - last_steam >= C.STEAM_SCAN_INTERVAL:

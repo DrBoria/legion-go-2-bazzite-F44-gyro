@@ -448,7 +448,10 @@ def _steam_procs():
 def _steam_config_marker(focus):
     """(Слой 2) Unified [STEAM-CONFIG] active verdict from a focus label:
     shell 769 vs Big Picture 413080 vs a GAME AppID — logged at the moment the
-    focused AppID changes."""
+    focused AppID changes. v3.11 (todo 52o): this is a PRECONDITION only — it
+    proves Steam Input is configured for the game, NOT that input reached the
+    game. The game only gets input once pad EV events (28de:11ff) + a game pid
+    holding the pad fd are seen ([PAD→GAME])."""
     m = re.search(r"\bAppID (\d+)", focus or "")
     appid = m.group(1) if m else "?"
     if "GAME window" in (focus or ""):
@@ -459,7 +462,9 @@ def _steam_config_marker(focus):
         active = "413080"
     else:
         active = appid
-    log(f"[STEAM-CONFIG] active={active} ({focus})")
+    log(f"[STEAM-CONFIG] active={active} ({focus}) — Steam Input configured "
+        f"for this app (PRECONDITION only; NOT proof input reached the game — "
+        f"that needs [PAD→GAME])")
 
 
 # G1 (todo 52b): the deck identity (Serial 28de-... / ProductID 0x12F0) appears

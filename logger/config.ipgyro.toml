@@ -53,6 +53,12 @@ regrab_missing = 15.0 # [DOCK] -> no [STEAM-REGRAB]/[DECK-ALIVE] -> [REGRAB-MISS
 loop_stall_log = 10.0 # main loop silent this long -> [LOOP-STALL]
 loop_stall_hb = 15.0  # re-assert a continuing [LOOP-STALL] only this often
 ipj_wake_flush = 8.0  # journal window flushed once at wake to catch delayed lines
+# v3.11 (todo 52o) — real input-delivery tracking (game reads the Steam-created
+# virtual pad 28de:11ff, NOT the deck 28de:12f0). Deck frames are only hop 1.
+pad_stall = 5.0       # pad + game reader + deck delivering, zero pad EV events
+                      # this long -> [PAD-DEAD] (Valve steam-for-linux#13029 mode)
+pad_delivery_hb = 30.0 # re-assert a long-lived [PAD->GAME]/[GYRO->PAD-AXIS]
+                      # delivery state only this often (no per-second spam)
 
 [full_mode]
 # (e) full-capture window: held this long after the last transition.

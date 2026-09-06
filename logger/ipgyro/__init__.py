@@ -63,6 +63,24 @@ ordered flush, and [RE-ENUM] on interface change. D4: [REGRAB-MISSING]
 watchdog after dock. D7: [LOOP-STALL] watchdog thread. New markers
 ([GYRO-FEED]/[REGRAB-MISSING]/[RE-ENUM]/[LOOP-STALL]/[WAKE-BURST]/[IPJ-WAKE]/
 [LOOP-RECOVERED]) only ADD; all existing marker tokens stay byte-compatible.
+
+v3.11 (todo 52o) — CORRECT INPUT-DELIVERY TRACKING. The old v3.10 claim treated
+deck frames (28de:12f0 -> Steam) + [STEAM-CONFIG active=GAME] as proof the
+input reached the GAME — wrong: that only proves deck->Steam (hop 1). Steam
+Input reads the deck and creates a SEPARATE game-facing virtual pad
+("Microsoft X-Box 360 pad", VID:PID 28de:11ff, uinput evdev) that the GAME
+(ESO via Proton/XInput/SDL/evdev) actually reads. The ONLY host-side proof of
+game delivery is EV events on that pad node WHILE the game process holds the
+pad fd (/proc/<pid>/fd -> /dev/input/eventN). v3.11 adds a stable pad identity
+(devices.py: name prefix + 28de:11ff, NOT the churning eventN), the proof
+marker [PAD→GAME] (pad EV + game reader), the Valve steam-for-linux#13029
+lifecycle markers [PAD-DEAD]/[PAD-RECREATED]/[GAME-LOST-PAD], the gyro
+provability split ([GYRO→PAD-AXIS] when gyro lands on pad ABS_RX/ABS_RY vs
+[GYRO-OUTPUT] when it is bound to mouse/unmapped and NOT provable through the
+pad), the [DECK→STEAM] hop-1 re-anchor tag, and new SNAPSHOT counters
+(deck_rd/s, pad_ev/s, game_reader, gyro_map). Deck frames + Steam config are
+PRECONDITIONS only — never proof. New markers only ADD; every existing marker
+token stays byte-compatible.
 """
 
-__version__ = "v3.10"
+__version__ = "v3.11"
