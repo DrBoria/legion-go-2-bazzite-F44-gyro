@@ -194,7 +194,11 @@ def main():
     threading.Thread(target=pm_journal_loop, daemon=True).start()
     # (D7) loop-stall watchdog thread: reports [LOOP-STALL] when the cadence
     # loop produces nothing for >LOOP_STALL_LOG_S (a stall is logged as a cause
-    # rather than appearing only as missing data).
+    # rather than appearing only as missing data). Arm S.LAST_TICK NOW (before
+    # the thread starts) so the startup codec-sniff window (~30s before the
+    # cadence loop's first tick) cannot look like a 60000s+ silence and fire a
+    # spurious [LOOP-STALL].
+    S.LAST_TICK = time.monotonic()
     threading.Thread(target=loop_stall_watchdog_loop, daemon=True).start()
     log("LOGGER: v2 channels active — generic role registry (physical-source + "
         "deck-output by capability/transport), InputPlumber journal, Steam "
