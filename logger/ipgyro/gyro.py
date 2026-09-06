@@ -39,6 +39,7 @@ from .conf import (
     GYRO_JOURNAL_LINES,
     GYRO_JOURNAL_S,
     GYRO_SRC_RE,
+    RIGHT_HANDLE_PID,
 )
 from .logcore import log, run_cmd
 
@@ -109,6 +110,19 @@ def _observed_gyro_sources():
     return srcs
 
 
+def _right_handle_present():
+    """(v3.15 todo 52z) True when a physical node with the right-handle pid
+    (17ef:61ed) is observed in S.HID_DEVICES — i.e. the right handle is
+    physically DETACHED and its own gyro is a separate live source. The pid is
+    OBSERVABLE identity only (never a selector)."""
+    for e in S.HID_DEVICES.values():
+        if e.get("role") != D.ROLE_PHYSICAL:
+            continue
+        if str(e.get("pid") or "").upper() == RIGHT_HANDLE_PID:
+            return True
+    return False
+
+
 def _gyro_src_verdict():
     """A compact human verdict of the active gyro source + why, from the live
     observed state (used for the periodic [GYRO-SRC] re-assert).
@@ -117,16 +131,28 @@ def _gyro_src_verdict():
     center body IMU is carried in the XInput right_gyro slot; 'right-handle'
     while the right handle is physically detached 17ef:61ed and its own gyro is
     the live source; 'none' when no gyro source is observed) and S.GYRO_IS_LIVE
-    (bool) so the wake-vs-gyro compare can name WHICH physical gyro is live."""
+    (bool) so the wake-vs-gyro compare can name WHICH physical gyro is live.
+    v3.15 (todo 52z) FIX: the carrier is derived from the PHYSICAL ATTACH STATE,
+    not from the always-present center IIO. When the right handle is detached
+    (17ef:61ed present) the RIGHT-handle gyro is the live carrier even though
+    the center body IIO is still present — the user's ground truth: when he
+    detached, the RIGHT handle gyro worked (GyroR), not center."""
     srcs = _observed_gyro_sources()
-    # -- per-source carrier (FIX-C) -------------------------------------------
-    if S.CEN_IMU is not None:
+    # -- per-source carrier (FIX-C + v3.15 right-handle fix) ------------------
+    S.RIGHT_HANDLE_PRESENT = _right_handle_present()
+    if S.RIGHT_HANDLE_PRESENT:
+        # right handle physically detached: its own 17ef:61ed gyro is the live
+        # carrier (NOT the always-present center IIO).
+        S.GYRO_SRC_CARRIER = "right-handle"
+        S.GYRO_IS_LIVE = True
+    elif S.CEN_IMU is not None:
+        # full controller attached: the center body IMU is carried in the
+        # XInput right_gyro slot (center carrier).
         S.GYRO_SRC_CARRIER = "center"
         S.GYRO_IS_LIVE = True
     elif any(e.get("role") == D.ROLE_PHYSICAL
              for e in S.HID_DEVICES.values()):
-        # physical XInput present but no center IIO -> the right-handle gyro
-        # (17ef:61ed) is the live source (right handle detached).
+        # physical XInput present but no center IIO -> right-handle gyro live.
         S.GYRO_SRC_CARRIER = "right-handle"
         S.GYRO_IS_LIVE = True
     else:

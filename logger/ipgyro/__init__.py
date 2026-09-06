@@ -128,22 +128,22 @@ desktop. SNAPSHOT adds pad_gyro/s, the real game process (game_reader=eso64.exe)
 vs the pad-fd holder (pad_holder=winedevice.exe), and the flow= chain. New
 markers only ADD; every existing marker token stays byte-compatible.
 
-v3.14 (todo 52x) — FULL BOTH-MODE EVENT CAPTURE + PER-SECOND FLOW. The user's
-ground-truth correction: the v3.13 log MISSED the real gaming-mode detach/
-re-attach failure (in gaming mode a detach broke everything 4x; re-attach did
-NOT recover — only a game restart recovered; desktop detach worked; "very many
-logs not written"). v3.14 captures EVERY physical detach/re-attach in BOTH
-modes with full detail ([DETACH]/[DOCK] now carry the physical nodes that
-left/arrived with their observable vid:pid, so 17ef:61eb vs 61ed is explicit),
-emits the per-hop flow at least 1/s during live gameplay and every transition
-(not only on change/idle/SNAPSHOT), runs a dense per-second flow burst in the
-post-wake "config returned but H1 dead" window, tracks the right-handle gyro
-(17ef:61ed) as a SEPARATE carrier with its own H0-H3 verdicts (the gyroR flow
-column + [GYRO-CARRIER] marker), emits an explicit [RE-ATTACH-NO-RECOVERY]
-marker when a re-attach does NOT restore delivery while the game is still
-running, and fixes game_reader so a renderer/browser helper (CrRendererMain)
-is never reported as the real game reader. New markers only ADD; every existing
-marker token stays byte-compatible.
+v3.15 (todo 52z) — CORRECTED REBUILD on the v3.13 base. The over-engineered
+v3.14 (todo 52x) was REVERTED (user: "последний твой коммит ревертнуть, ты там
+чет лишнего нагородил и сделать нормально") — it introduced a game_reader
+regression (helper-exclusion rejected the real wine pad holder -> H3 always
+lost) and wrong detach/attach/carrier tracking. v3.15 keeps the correct v3.13
+per-hop flow proof and applies ONLY the minimal ground-truth fixes:
+  * game_reader reports the REAL game (eso64.exe), not a wine service host
+    (svchost/bufferselfpatch) — obs._main_game_proc resolves the pad-fd
+    reader's Steam-game ancestor first (user ran ESO and it showed svchost).
+  * a [DETACH] at a sleep-wake boundary while the controller was ATTACHED at
+    [SLEEP-ENTER] is a SUSPEND RE-ENUMERATION (suppressed as [DETACH-SUPPRESSED]),
+    not a real detach — the user's ground truth: "Sleep был точно с attached".
+  * the gyro carrier is derived from the PHYSICAL ATTACH STATE (right handle
+    17ef:61ed detached = right-handle carrier), not the always-present center
+    IIO — the user's ground truth: when he detached, the RIGHT handle gyro
+    worked (GyroR), not center. SNAPSHOT adds right_gyro=yes|no.
 """
 
-__version__ = "v3.14"
+__version__ = "v3.15"

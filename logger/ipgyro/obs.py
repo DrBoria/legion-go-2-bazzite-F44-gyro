@@ -83,52 +83,22 @@ def _live_mode_tag(force=False):
         return "unknown"
 
 
-def _phys_node_detail():
-    """(v3.14) The current physical-source node set as "label vid:pid" strings
-    (e.g. 'controller@1.1 17EF:61EB,controller@1.2 17EF:61EB') so a [DETACH]/
-    [DOCK] states WHICH physical nodes left/arrived and whether the right handle
-    (17ef:61ed) is among them. Reads S.HID_DEVICES role entries."""
-    from . import discover as D   # lazy: keep module-load order cycle-free
-    out = []
-    for e in S.HID_DEVICES.values():
-        if e.get("role") != D.ROLE_PHYSICAL:
-            continue
-        lbl = e.get("label") or "?"
-        if e.get("iface") is not None:
-            lbl += f"@1.{e['iface']}"
-        vp = ""
-        if e.get("vid") and e.get("pid"):
-            vp = f" {e['vid']}:{e['pid']}"
-        out.append(f"{lbl}{vp}")
-    return ",".join(sorted(out)) or "-"
-
-
-def _detach_marker(mode, nodes=None):
+def _detach_marker(mode):
     """Byte-compatible [DETACH] line text (shared by capture.scan_hidraw and the
     startup-window synthesis so both always emit the identical format). The
-    mode=/owner= payload is the v3.12 REAL session-mode word (FIX-A). v3.14
-    (todo 52x) appends the physical nodes that LEFT (with their observable
-    vid:pid, so 17ef:61eb vs 61ed is explicit) so every detach in BOTH modes is
-    captured with full detail."""
-    if nodes is None:
-        nodes = _phys_node_detail()
+    mode=/owner= payload is the v3.12 REAL session-mode word (FIX-A)."""
     return (f"[DETACH] controller input GONE "
             f"(0 controller nodes open) mode={_human_mode_tag(mode)} "
-            f"owner=controller nodes_left=[{nodes}] — controller detached / "
-            f"off / mode switch ([UDEV] shows the USB detail)")
+            f"owner=controller — controller detached / off / "
+            f"mode switch ([UDEV] shows the USB detail)")
 
 
-def _dock_marker(mode, phys_n, nodes=None):
+def _dock_marker(mode, phys_n):
     """Byte-compatible [DOCK] line text (shared by capture.scan_hidraw and the
-    startup-window synthesis so both always emit the identical format). v3.14
-    (todo 52x) appends the physical nodes that ARRIVED (with their observable
-    vid:pid, so 17ef:61eb vs 61ed is explicit)."""
-    if nodes is None:
-        nodes = _phys_node_detail()
+    startup-window synthesis so both always emit the identical format)."""
     return (f"[DOCK] controller input BACK "
             f"({phys_n} controller nodes open) mode={_human_mode_tag(mode)} "
-            f"owner=controller nodes_arrived=[{nodes}] — controller docked / "
-            f"re-attached")
+            f"owner=controller — controller docked / re-attached")
 
 
 def _human_deck_mode(m):
@@ -279,14 +249,13 @@ def snapshot_state(reason):
     except Exception:
         pass
     flow_s = S.FLOW_COMPACT or "-"
-    right_gyro = "yes" if S.RIGHT_GYRO_PRESENT else "no"
-    phys_nodes = ",".join(S.PHYS_NODES_LAST) or "-"
+    right_gyro = "yes" if S.RIGHT_HANDLE_PRESENT else "no"
     log(f"[SNAPSHOT] reason={reason} mode={mode} "
         f"controller=[{','.join(controller) or '-'}] "
         f"virtual=[{','.join(virtual) or '-'}] "
         f"iio={len(S.IIO_DEVICES)} cen_imu={cen_s} "
         f"gyro_src={S.GYRO_SRC or 'unknown'} gyro_carrier={gyro_carrier} "
-        f"right_gyro={right_gyro} phys_nodes=[{phys_nodes}] "
+        f"right_gyro={right_gyro} "
         f"steam_focus={S.STEAM_UI_FOCUS or 'none'} "
         f"steam_procs={S.STEAM_APP_SUMMARY or '(none)'} "
         f"game={'yes' if S.GAME_FOCUSED else 'no'} "
@@ -371,15 +340,6 @@ _HELPER_TOKENS = frozenset((
     "explorer", "steamwebhelper", "reaper", "proton", "services", "plugplay",
     "rundll32", "start", "conhost", "crashpad", "steamclient", "steam",
     "bash", "sh", "python", "gamemode", "steamdeck", "vrserver",
-    # v3.14 (todo 52x #4) — browser/renderer/helper processes must NEVER be
-    # reported as the game reader. The v3.13 post-wake SNAPSHOT showed
-    # game_reader=CrRendererMain (a Chromium renderer that inherited the pad fd
-    # via Steam's web helper) instead of the REAL game/Proton reader (eso64.exe
-    # or the wine process that owns the pad fd). These tokens exclude every
-    # renderer/browser/GPU/audio helper from the real-game resolution.
-    "crrenderer", "renderer", "crutility", "gpu", "gpuprocess", "utility",
-    "network", "audio", "audioservice", "dbus", "zygote", "browser", "cef",
-    "chromium", "chrome", "webhelper", "steamweb",
 ))
 
 
@@ -395,13 +355,46 @@ def _looks_helper(comm):
 
 
 def _main_game_proc():
-    """(v3.13) Return (pid, comm) of the REAL running game process from
+    """(v3.13/v3.15) Return (pid, comm) of the REAL running game process from
     S.STEAM_PROC_SET (pid -> (appid, name, cmd)), filtered to the appid of the
     resolved game reader when available and excluding Proton/wine/Steam helper
     processes — e.g. (54802, 'eso64.exe'). Purely /proc-derived (never a
     hardcoded game name). Returns (None, '') when no game process is
-    detectable."""
+    detectable.
+
+    v3.15 (todo 52z) FIX: the old "longest non-helper name wins" heuristic
+    reported a wine service host (svchost.exe / bufferselfpatch / CrRendererMain)
+    instead of the actual game binary (eso64.exe) — the user ran ESO and the
+    SNAPSHOT game_reader= showed svchost. The REAL game is the process that owns
+    the wine tree which reads the pad fd (the pad-fd reader's Steam-game
+    ancestor). We resolve that FIRST (walk up from each pad-fd reader to a
+    Steam game process) and only fall back to the longest-non-helper heuristic
+    when no reader ancestor is found. This restores the v3.13 proof (H3=ok with
+    the real reader) WITHOUT the v3.14 helper-exclusion regression in
+    _game_reader_pid() (that function is untouched and still resolves the pad-fd
+    reader itself)."""
     want = S.PAD_GAME_READER_APPID
+
+    # -- 1: the real game = the Steam-game ancestor of a pad-fd reader --------
+    # The pad-fd reader (winedevice.exe / the wine child holding the pad) is a
+    # descendant of the actual game (eso64.exe). Walking up from the reader to a
+    # Steam game process names the REAL game, never a wine service host.
+    try:
+        children = _proc_children_map()
+        for pid in sorted(S.PAD_READER_PIDS):
+            anc = _steam_game_ancestor(pid, children)
+            if anc is None:
+                continue
+            _appid, name, _cmd = S.STEAM_PROC_SET.get(anc, (None, "", ""))
+            if want and _appid != want:
+                continue
+            if _looks_helper(name):
+                continue
+            return (anc, name or "?")
+    except Exception:
+        pass
+
+    # -- 2: fallback — longest non-helper name under the reader appid ---------
     best = (None, "")
     for pid in sorted(S.STEAM_PROC_SET):
         appid, name, _cmd = S.STEAM_PROC_SET[pid]
@@ -457,19 +450,12 @@ def _game_reader_pid():
         return None
 
     # -- 1: a reader that is itself a running Steam game ----------------------
-    # v3.14 (todo 52x #4): skip helper/renderer/browser readers (CrRendererMain
-    # etc.) so a Chromium renderer that inherited the pad fd is NEVER reported
-    # as the real game reader.
     for pid in sorted(readers):
-        if pid in S.STEAM_PROC_SET and not _looks_helper(_proc_comm(pid)):
+        if pid in S.STEAM_PROC_SET:
             _set_game_reader(pid)
             return pid
     # -- 2: a reader whose environ carries a SteamAppId ------------------------
-    # v3.14: only a NON-helper reader counts (a renderer inherits SteamAppId but
-    # is not the game reader).
     for pid in sorted(readers):
-        if _looks_helper(_proc_comm(pid)):
-            continue
         env = _proc_environ_dict(pid)
         appid = env.get("SteamAppId") or env.get("SteamGameId")
         if appid:
@@ -480,8 +466,6 @@ def _game_reader_pid():
     # Steam game ancestor (the game owns the wine tree that reads the pad).
     children = _proc_children_map()
     for pid in sorted(readers):
-        if _looks_helper(_proc_comm(pid)):
-            continue
         anc = _steam_game_ancestor(pid, children)
         if anc is not None:
             _set_game_reader(pid, appid=S.STEAM_PROC_SET.get(anc, (None,))[0])
@@ -746,11 +730,8 @@ def pad_verdict_scan(now):
 def _mark_detach(now):
     """(Слой 1/3) [DETACH] consequences: remember the instant (for reconnect
     dt), snapshot AFTER the event, arm full capture across the re-dock window.
-    The mode/owner tag lives on the [DETACH] line itself (capture.scan_hidraw).
-    v3.14 (todo 52x): records the physical nodes that LEFT so a re-attach judge
-    and the node-level detail are never lost."""
+    The mode/owner tag lives on the [DETACH] line itself (capture.scan_hidraw)."""
     S.DETACH_AT = now
-    S.PHYS_NODES_LAST = []
     _enter_full("detach")
     snapshot_state("detach")
 
@@ -762,10 +743,7 @@ def _mark_dock(now):
     re-grabs / the deck stream resumes. G2: [RECONNECT-DT] carries the mode +
     owner tag. v3.10 (D4): resets the [REGRAB-MISSING] latch and arms the
     re-grab watchdog so a dock that Steam NEVER re-binds is reported loudly
-    after REGRAB_MISSING_S instead of staying silently absent for 55 minutes.
-    v3.14 (todo 52x): records the dock instant + whether a game context was live
-    so flow.py can judge [RE-ATTACH-NO-RECOVERY] (a re-attach while the game is
-    running that does NOT restore delivery)."""
+    after REGRAB_MISSING_S instead of staying silently absent for 55 minutes."""
     if S.DETACH_AT is not None:
         dt = now - S.DETACH_AT
         log(f"[RECONNECT-DT] detach->dock took {dt:.1f}s "
@@ -774,8 +752,6 @@ def _mark_dock(now):
             f"[STEAM-REGRAB]/[DECK-ALIVE])")
         S.DETACH_AT = None
     S.DOCK_AT = now
-    S.LAST_DOCK_TS = now
-    S.LAST_DOCK_GAME = bool(S.STEAM_PROC_SET) or bool(S.PAD_GAME_READER)
     S.REGRAB_DT_LOGGED = False
     S.REGRAB_MISSING_LOGGED = False
     _enter_full("dock")

@@ -44,6 +44,7 @@ from .conf import (
     HID_MOTION_LOG_MIN,
     LEGO_MOTION_LOG_MIN,
     LEGO_RAW_HB,
+    WAKE_DETACH_GRACE_S,
 )
 from .iio import _fmt, _mag
 from .logcore import log
@@ -80,6 +81,27 @@ def _full_mode_active():
     return S.GAME_RECORD or time.monotonic() < S.FULL_RECORD_UNTIL
 
 
+def _is_suspend_reenum(now):
+    """(v3.15 todo 52z) True when a physical [DETACH] at `now` is a SUSPEND
+    RE-ENUMERATION artifact rather than a real user detach: the controller was
+    ATTACHED at [SLEEP-ENTER] (S.PHYS_ATTACHED_AT_SLEEP is True) and we are
+    within WAKE_DETACH_GRACE_S after the matching [SLEEP-WAKE]. During suspend
+    the USB controller powers down; on the first scan after resume the logger
+    briefly sees 0 physical nodes before the controller re-enumerates — the
+    user's ground truth: "Sleep был точно с attached". Such a detach must NOT
+    be reported as a real detach/attach cycle."""
+    if not S.PHYS_ATTACHED_AT_SLEEP:
+        return False
+    w = S.SLEEP_WAKE_TS
+    if w is None:
+        return False
+    if now < w:
+        # detach fired just before the wake was stamped (the wake line and the
+        # first post-resume scan race) — still a suspend re-enum if close.
+        return (w - now) <= WAKE_DETACH_GRACE_S
+    return (now - w) <= WAKE_DETACH_GRACE_S
+
+
 def _drop_hid(node):
     try:
         os.close(S.HID_DEVICES[node]["fd"])
@@ -97,34 +119,6 @@ def _refresh_phys_id():
     phys = sorted(_hid_label(e) for e in S.HID_DEVICES.values()
                   if e.get("role") == D.ROLE_PHYSICAL)
     S.PHYS_ID_LAST = ",".join(phys) if phys else None
-
-
-def _refresh_phys_nodes():
-    """(v3.14 todo 52x) Refresh S.PHYS_NODES_LAST (the current physical-source
-    node set as "label vid:pid" strings) and S.RIGHT_GYRO_PRESENT (True when a
-    physical node with pid 61ed is present = the right handle is physically
-    detached and its own gyro is a SEPARATE source; False when only the full
-    controller 61eb with the center gyro in the right_gyro slot is attached).
-    Called on every scan_hidraw pass so the [DETACH]/[DOCK] markers and the
-    SNAPSHOT right_gyro= field always reflect the current physical attach state.
-    The 61ed/61eb pids are OBSERVABLE identity only (never selectors) — the
-    right-handle-vs-center distinction is a physical-attach fact, not a codec."""
-    out = []
-    right = False
-    for e in S.HID_DEVICES.values():
-        if e.get("role") != D.ROLE_PHYSICAL:
-            continue
-        lbl = e.get("label") or "?"
-        if e.get("iface") is not None:
-            lbl += f"@1.{e['iface']}"
-        vp = ""
-        if e.get("vid") and e.get("pid"):
-            vp = f" {e['vid']}:{e['pid']}"
-            if str(e.get("pid")).upper() == "61ED":
-                right = True
-        out.append(f"{lbl}{vp}")
-    S.PHYS_NODES_LAST = sorted(out)
-    S.RIGHT_GYRO_PRESENT = right
 
 
 # ---------------------------------------------------------------------------
@@ -207,18 +201,46 @@ def scan_hidraw():
     # of the per-node HID lines above. An XInput<->DInput mode switch also shows
     # as a [DETACH]/[DOCK] pair (xinput64 node gone, another composite pid in) —
     # the [UDEV] lines carry the USB-level detail of which pid/iface changed.
-    # v3.14 (todo 52x): every [DETACH]/[DOCK] carries the physical nodes that
-    # left/arrived (with their observable vid:pid, so 17ef:61eb vs 61ed is
-    # explicit) and refreshes the right-handle-gyro presence (a 61ed node = the
-    # right handle is detached and its own gyro is a separate source).
     phys_now = any(e["role"] == D.ROLE_PHYSICAL
                    for e in S.HID_DEVICES.values())
-    _refresh_phys_nodes()
+
+    # (v3.15 todo 52z) record the controller attach state at [SLEEP-ENTER] so a
+    # [DETACH] at the matching wake can be recognised as a SUSPEND re-enumeration
+    # (the USB controller powered down during sleep and re-enumerates on wake)
+    # rather than a real user detach — the user's ground truth: "Sleep был точно
+    # с attached". The sleep-state word flips to entering/asleep exactly once per
+    # suspend; we latch the physical presence at that instant.
+    if S.SLEEP_STATE in ("entering", "asleep") and \
+            S.PHYS_ATTACHED_AT_SLEEP is None:
+        S.PHYS_ATTACHED_AT_SLEEP = bool(phys_now)
+    # Once awake and past the wake grace window, clear the latch so a LATER real
+    # detach (well after the wake) is treated as a genuine user detach, not a
+    # stale suspend re-enum.
+    elif S.SLEEP_STATE == "awake" and S.PHYS_ATTACHED_AT_SLEEP is not None:
+        w = S.SLEEP_WAKE_TS
+        if w is None or (now - w) > WAKE_DETACH_GRACE_S:
+            S.PHYS_ATTACHED_AT_SLEEP = None
+
     if S.PHYS_STATE is None:
         # (v3.8 F2) first baseline: detach-tracking is live from this scan on.
         S.PHYS_STATE = phys_now
         S.STARTUP_BASELINE_TS = time.monotonic()
     elif S.PHYS_STATE and not phys_now:
+        # (v3.15) suspend re-enumeration suppression: a physical [DETACH] within
+        # WAKE_DETACH_GRACE_S after a [SLEEP-WAKE] while the controller was
+        # ATTACHED at [SLEEP-ENTER] is the controller re-enumerating after the
+        # suspend power-down, NOT a real user detach. Suppress the false
+        # [DETACH]/[DOCK] cycle and keep the attach state True so the logger
+        # reflects reality (the controller was attached the whole time).
+        if _is_suspend_reenum(now):
+            log("[DETACH-SUPPRESSED] physical controller briefly absent at the "
+                "wake boundary while it was ATTACHED at sleep-enter — this is "
+                "the controller re-enumerating after suspend (powered down "
+                "during sleep), NOT a real detach; attach state kept attached")
+            # keep PHYS_STATE True: the controller is still logically attached
+            S.PHYS_STATE = True
+            _refresh_phys_id()
+            return found
         S.PHYS_STATE = False
         # (v3.10 D6) remember the physical identity at detach so a dock that
         # returns as a DIFFERENT interface (controller@1.1 -> controller@1.3,

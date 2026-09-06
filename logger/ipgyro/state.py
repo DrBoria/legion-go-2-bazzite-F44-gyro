@@ -141,6 +141,25 @@ SLEEP_WAKE_WALL = ""        # wall "HH:MM:SS" of the last confirmed wake
 WAKE_GYRO_COMPARED = 0.0    # monotonic of the last post-wake gyro compare
 WAKE_GYRO_STALLED = False   # True once the current wake logged a gyro stall
 
+# ---------------------------------------------------------------------------
+# v3.15 (todo 52z) — corrected detach/attach + carrier tracking.
+# ---------------------------------------------------------------------------
+# The controller attach state at [SLEEP-ENTER]: True when the physical
+# controller was ATTACHED when the system went to sleep. A [DETACH] detected
+# within WAKE_DETACH_GRACE_S after the matching [SLEEP-WAKE] while this was
+# True is a SUSPEND RE-ENUMERATION (the USB controller powered down during
+# sleep and re-enumerates on wake), NOT a real user detach — the user's ground
+# truth: "Sleep был точно с attached". We suppress the false [DETACH]/[DOCK]
+# cycle around that wake.
+PHYS_ATTACHED_AT_SLEEP = None  # True/False/None: controller attached at enter
+# The physical attach state is derived from the OBSERVABLE node pids, so a
+# right-handle detach (17ef:61ed present) is distinguished from the full
+# controller (17ef:61eb). RIGHT_HANDLE_PRESENT = True when a physical node with
+# pid 61ed is observed (right handle detached, its own gyro is the live
+# carrier); False when only the full controller 61eb is attached (center gyro
+# in the XInput right_gyro slot). Drives the gyro_carrier verdict.
+RIGHT_HANDLE_PRESENT = False  # True when the right handle (17ef:61ed) is present
+
 # (R2) full-mode per-frame capture: last per-frame log time per hidraw node
 # (anti-spam floor so a pathological 240 frame/s deck cannot flood forever).
 FRAME_LOG_LAST = {}         # hidraw node -> monotonic last [FRAME] log time
@@ -314,37 +333,6 @@ FOCUS_DROP_LOGGED = 0.0     # monotonic of the wake [STEAM-FOCUS-DROP] logged
 # holder (e.g. winedevice.exe) — refreshed by obs.snapshot_state.
 MAIN_GAME_PID = None        # pid of the real running game process (or None)
 MAIN_GAME_NAME = ""         # comm of the real game process (e.g. eso64.exe)
-
-# ---------------------------------------------------------------------------
-# v3.14 (todo 52x) — FULL BOTH-MODE EVENT CAPTURE + PER-SECOND FLOW shared state.
-# ---------------------------------------------------------------------------
-# Per-second live flow emission (flow.py): the last monotonic a compact [FLOW]
-# line was logged while a game context was live, so the per-second cadence
-# (FLOW_LIVE_S) is enforced without spamming idle desktop.
-FLOW_LIVE_LAST = 0.0        # monotonic last per-second live-game [FLOW] log
-# Re-attach recovery judge (obs._mark_dock + flow.py): after a [DOCK] while a
-# game is running we judge whether delivery RESUMED or STAYS DEAD and emit
-# [RE-ATTACH-NO-RECOVERY] once per dock window when it did NOT recover.
-LAST_DOCK_TS = None         # monotonic of the last [DOCK] (re-attach judge)
-LAST_DOCK_GAME = False      # True when a game context was live at the last dock
-REATTACH_NR_LOGGED = 0.0    # monotonic of the dock whose no-recovery was logged
-# Dense post-wake per-second flow burst (flow.py): after every [SLEEP-WAKE] a
-# per-second compact [FLOW] + per-type verbose burst runs for POSTWAKE_DENSE_S
-# covering the "config returned but H1 dead" window second-by-second.
-POSTWAKE_DENSE_UNTIL = 0.0  # monotonic end of the dense post-wake flow burst
-POSTWAKE_DENSE_LOGGED = 0.0 # monotonic of the wake whose dense burst ran
-# Right-handle gyro as a SEPARATE carrier (17ef:61ed detached right handle).
-# RIGHT_GYRO_PRESENT = True when a physical node with pid 61ed (right handle
-# detached, its own gyro) is observed; False when only the full controller
-# (61eb, center gyro in the right_gyro slot) is attached. Refreshed by
-# obs/gyro each scan; drives the gyroR: per-type flow column + [GYRO-CARRIER].
-RIGHT_GYRO_PRESENT = False  # True when the right handle (17ef:61ed) is detached
-RIGHT_GYRO_CARRIER = None   # 'right-handle' | 'center' | None (last verdict)
-CARRIER_LAST_LOG = ""       # last [GYRO-CARRIER] verdict string (change-only)
-# Physical node set detail for [DETACH]/[DOCK] (which nodes left/arrived, with
-# their observable vid:pid so 17ef:61eb vs 61ed is explicit). Refreshed by
-# capture.scan_hidraw on every physical transition.
-PHYS_NODES_LAST = []        # list of "label vid:pid" strings at last scan
 
 # ---------------------------------------------------------------------------
 # Shutdown flag (set by logcore._signal_handler, read by every daemon loop)

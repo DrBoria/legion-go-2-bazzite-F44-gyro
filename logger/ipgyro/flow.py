@@ -50,15 +50,7 @@ obs (obs lazily imports this module), so module-load order stays cycle-free.
 import time
 
 from . import state as S
-from .conf import (
-    FLOW_CHANGE_MIN,
-    FLOW_LIVE_S,
-    FLOW_MIN_LOG,
-    FOCUS_LOST_HB,
-    POSTWAKE_DENSE_S,
-    REATTACH_NO_RECOVERY_S,
-    WAKE_FLOW_S,
-)
+from .conf import FLOW_CHANGE_MIN, FLOW_MIN_LOG, FOCUS_LOST_HB, WAKE_FLOW_S
 from .logcore import log
 
 OK, LOST, NONE = "ok", "lost", "none"
@@ -191,65 +183,6 @@ def gyro_hops(inp, rt=None):
             hops[1] = _hop(1, NONE, "deck %s rd/s mot=0" % deck_rd,
                            ("deck delivering %s rd/s but no physical motion to "
                             "forward (idle — no gyro to carry)") % deck_rd)
-    elif game_deck and routing_game:
-        hops[1] = _hop(1, LOST, "deck 0 rd/s",
-                       "gaming deck present but 0 rd/s while the game config "
-                       "is active — deck stream to Steam STOPPED (H1)")
-    else:
-        hops[1] = _hop(1, NONE, "no deck frames",
-                       "no gaming deck / no deck frames on hop 1 (H1 idle)")
-
-    hops[2] = _hop(2, rt["verdict"], rt["short"], rt["detail"])
-    hops[3] = _gyro_h3(inp, rt, deck_mot)
-    return hops
-
-
-def right_gyro_hops(inp, rt=None):
-    """(v3.14) RIGHT-HANDLE gyro as a SEPARATE carrier. When the right handle is
-    physically detached (its own 17ef:61ed device present) it carries its OWN
-    gyro source, distinct from the center-body IMU that rides the XInput
-    right_gyro slot while attached. This gives the RIGHT column of the per-type
-    tables a real per-hop verdict instead of always н/п.
-
-    H0 physical: the 17ef:61ed right-handle node is present (right_gyro_present).
-    H1 deck->Steam: the same deck hop carries whatever gyro InputPlumber forwards
-        (deck mot/s) — the right-handle gyro reaches Steam through the deck.
-    H2 routing: identical Steam routing hop (shared with center).
-    H3 pad->game: gyro-axis ABS_RX/ABS_RY pad events while the game holds the
-        pad fd — the ONLY host-side proof the right-handle gyro reached the game.
-
-    When the right handle is NOT detached (only center exists) this returns None
-    and the caller emits the explicit "carrier=center only" state instead."""
-    if not inp.get("right_gyro_present"):
-        return None
-    rt = rt if rt is not None else routing(inp)
-    deck_rd = inp.get("deck_rd", 0)
-    deck_mot = inp.get("deck_mot", 0)
-    game_deck = inp.get("game_deck", False)
-    hops = [None, None, None, None]
-
-    # -- H0 physical: the detached right handle 17ef:61ed is the source ------
-    hops[0] = _hop(0, OK, "right-handle 17ef:61ed",
-                   "right handle physically DETACHED — its own 17ef:61ed gyro "
-                   "source is present (right-handle carrier)")
-
-    # -- H1 deck -> Steam ----------------------------------------------------
-    routing_game = rt["verdict"] == OK
-    if deck_rd > 0:
-        if deck_mot > 0:
-            hops[1] = _hop(1, OK, "%s mot/s %s rd/s" % (deck_mot, deck_rd),
-                           ("deck-uhid delivering %s rd/s with %s IMU-mot/s — "
-                            "the right-handle gyro IS being forwarded to Steam "
-                            "(H1 ok)") % (deck_rd, deck_mot))
-        elif routing_game:
-            hops[1] = _hop(1, LOST, "deck %s rd/s mot=0" % deck_rd,
-                           ("deck delivering %s rd/s but 0 IMU-mot/s while the "
-                            "game config is active — InputPlumber/deck NOT "
-                            "forwarding the right-handle gyro to Steam (H1)")
-                           % deck_rd)
-        else:
-            hops[1] = _hop(1, NONE, "deck %s rd/s mot=0" % deck_rd,
-                           "deck delivering but no motion to forward (idle)")
     elif game_deck and routing_game:
         hops[1] = _hop(1, LOST, "deck 0 rd/s",
                        "gaming deck present but 0 rd/s while the game config "
@@ -420,12 +353,8 @@ def type_hops(dtype, inp):
 
 def compute(inp):
     """Per-type hop lists for a flow snapshot: {'gyro': [H0..H3], 'buttons':
-    [...], 'sticks': [...], 'gyroR': [H0..H3]|None}. 'gyroR' is the RIGHT-HANDLE
-    gyro chain (v3.14) — present only when the right handle is physically
-    detached (17ef:61ed); None when only the center gyro exists (attached)."""
-    per = {dtype: type_hops(dtype, inp) for dtype, _t, _n in TYPE_ORDER}
-    per["gyroR"] = right_gyro_hops(inp)
-    return per
+    [...], 'sticks': [...]}."""
+    return {dtype: type_hops(dtype, inp) for dtype, _t, _n in TYPE_ORDER}
 
 
 def _type_compact(hops):
@@ -442,18 +371,11 @@ def _type_compact(hops):
 
 def compact(inp, per=None):
     """One compact flow line for the SNAPSHOT/FLOW markers, e.g.
-    'gyro:H0ok,H1ok,H2game,H3ok|btns:H0ok,H1ok,H2game,H3ok|stx:...'. v3.14 appends
-    a 'gyroR:...' column when the right handle is detached (its own gyro source);
-    when only center exists the column is omitted (the [GYRO-CARRIER] marker
-    states carrier=center explicitly on the attach-state change)."""
+    'gyro:H0ok,H1ok,H2game,H3ok|btns:H0ok,H1ok,H2game,H3ok|stx:...'."""
     per = per if per is not None else compute(inp)
     toks = {"gyro": "gyro", "buttons": "btns", "sticks": "stx"}
-    parts = ["%s:%s" % (toks[d], _type_compact(per[d]))
-             for d, _t, _n in TYPE_ORDER]
-    rgh = per.get("gyroR")
-    if rgh is not None:
-        parts.append("gyroR:%s" % _type_compact(rgh))
-    return "|".join(parts)
+    return "|".join("%s:%s" % (toks[d], _type_compact(per[d]))
+                    for d, _t, _n in TYPE_ORDER)
 
 
 def _hops_chain(hops):
@@ -482,14 +404,9 @@ def _terminal(dtype, hops, first):
 
 
 def type_marker(dtype, hops):
-    """[GYRO-FLOW ...] / [BTNS-FLOW ...] / [STX-FLOW ...] verbose marker.
-    v3.14: dtype 'gyroR' (the right-handle gyro carrier) maps to the GYRO token
-    with a right-handle noun so the RIGHT column has its own verbose marker."""
-    if dtype == "gyroR":
-        token, noun = "GYRO", "right-handle gyro"
-    else:
-        token = dict((d, t) for d, t, _n in TYPE_ORDER)[dtype]
-        noun = dict((d, n) for d, _t, n in TYPE_ORDER)[dtype]
+    """[GYRO-FLOW ...] / [BTNS-FLOW ...] / [STX-FLOW ...] verbose marker."""
+    token = dict((d, t) for d, t, _n in TYPE_ORDER)[dtype]
+    noun = dict((d, n) for d, _t, n in TYPE_ORDER)[dtype]
     first = first_lost(hops)
     return "[%s-FLOW %s] — %s" % (token, _hops_chain(hops),
                                   _terminal(noun, hops, first))
@@ -554,65 +471,18 @@ def focus_drop_line(inp, wake_mono, delay):
                 inp.get("focus_kind") or "?"))
 
 
-def reattach_no_recovery_line(inp, per, dock_delay):
-    """(v3.14) [RE-ATTACH-NO-RECOVERY] — a physical re-attach ([DOCK]) happened
-    while a game is STILL RUNNING, but after the recovery-judge window delivery
-    did NOT resume (the per-hop flow is not H3=ok for the data types that were
-    flowing before the detach). This is the user's REAL gaming-mode finding:
-    re-attach did NOT recover; only a game restart did. Emits the per-hop
-    verdicts so the exact dead hop is never missed again. dock_delay = seconds
-    since the dock."""
-    verdicts = []
-    for dtype, _t, _n in TYPE_ORDER:
-        hops = per.get(dtype)
-        if not hops:
-            continue
-        verdicts.append("%s:%s" % (dtype, _type_compact(hops)))
-    rgh = per.get("gyroR")
-    if rgh is not None:
-        verdicts.append("gyroR:%s" % _type_compact(rgh))
-    return ("[RE-ATTACH-NO-RECOVERY] re-attach at +%.1fs while the game is "
-            "still running did NOT restore delivery — per-hop verdicts "
-            "[%s]; delivery STAYS DEAD until a game restart (the user's "
-            "gaming-mode finding: detach broke everything, re-attach did not "
-            "recover)" % (dock_delay, " ".join(verdicts)))
-
-
-def gyro_carrier_line(carrier, right_present):
-    """(v3.14) [GYRO-CARRIER] — explicit statement of the gyro carrier on every
-    attach-state change. When the right handle is attached only the CENTER gyro
-    exists (carrier=center); when the right handle is physically detached
-    (17ef:61ed) it is its own carrier (carrier=right-handle). Emitted each time
-    the attach state changes so the RIGHT column is never silently н/п."""
-    if right_present:
-        return ("[GYRO-CARRIER] carrier=right-handle — right handle physically "
-                "detached (17ef:61ed): its own gyro is a SEPARATE source with "
-                "its own H0-H3 verdicts (gyroR column); center body IMU not in "
-                "the XInput right_gyro slot")
-    return ("[GYRO-CARRIER] carrier=center — right handle attached: only the "
-            "center body IMU gyro exists (carried in the XInput right_gyro "
-            "slot); no separate right-handle gyro source (RIGHT column = n/a)")
-
-
-def verdicts_and_markers(inp, pre_wake_focus=None, dock_delay=None):
+def verdicts_and_markers(inp, pre_wake_focus=None):
     """PURE replay harness entry: for ONE flow snapshot return
     (per_type_hops_dict, markers[]). markers contains every marker the live
     logic WOULD emit for exactly this input: the three per-type verbose
     [*FLOW] lines, the compact [FLOW] line, plus [STEAM-FOCUS-LOST-GAME] when
     the routing condition holds, and [STEAM-FOCUS-DROP-AFTER-WAKE] when the
     recorded pre-sleep focus was a game and the post-wake focus is not.
-    v3.14: also emits the right-handle gyro verbose marker ([GYRO-FLOW] for the
-    gyroR carrier) when the right handle is detached, and [RE-ATTACH-NO-RECOVERY]
-    when dock_delay is given and the per-hop flow is not H3=ok (a re-attach that
-    did not restore delivery while the game is running).
     pre_wake_focus = (pre_appid, pre_kind) or None (no wake boundary)."""
     per = compute(inp)
     markers = []
     for dtype, _t, _n in TYPE_ORDER:
         markers.append(type_marker(dtype, per[dtype]))
-    rgh = per.get("gyroR")
-    if rgh is not None:
-        markers.append(type_marker("gyroR", rgh))
     markers.append("[FLOW] " + compact(inp, per))
     if focus_lost_condition(inp):
         markers.append(focus_lost_line(inp))
@@ -623,32 +493,7 @@ def verdicts_and_markers(inp, pre_wake_focus=None, dock_delay=None):
                             fa != pre_wake_focus[0]):
             markers.append(focus_drop_line(inp, inp.get("wake_mono") or 0.0,
                                            inp.get("wake_delay") or 0.0))
-    if dock_delay is not None and _reattach_no_recovery(per):
-        markers.append(reattach_no_recovery_line(inp, per, dock_delay))
     return per, markers
-
-
-def _reattach_no_recovery(per):
-    """(v3.14) True when a re-attach did NOT restore delivery: the game context
-    is live (routing H2 == game) but NO data type reaches H3=ok (and at least
-    one hop is lost/none downstream of a live H0). Used to decide whether to
-    emit [RE-ATTACH-NO-RECOVERY] after a dock while the game is running."""
-    any_h3_ok = False
-    any_live_h0 = False
-    for dtype, _t, _n in TYPE_ORDER:
-        hops = per.get(dtype)
-        if not hops:
-            continue
-        if hops[3]["verdict"] == OK:
-            any_h3_ok = True
-        if hops[0]["verdict"] in (OK, NONE) and hops[0]["verdict"] != LOST:
-            any_live_h0 = True
-    rgh = per.get("gyroR")
-    if rgh is not None:
-        if rgh[3]["verdict"] == OK:
-            any_h3_ok = True
-    # no data type reaching the game while a physical source is live = dead
-    return (not any_h3_ok) and any_live_h0
 
 
 # ---------------------------------------------------------------------------
@@ -672,7 +517,6 @@ def build_input(now):
         # H0
         "carrier": S.GYRO_SRC_CARRIER or "none",
         "phys_present": phys,
-        "right_gyro_present": bool(S.RIGHT_GYRO_PRESENT),
         "iio_moving": bool(S.IIO_FAST_UNTIL) and S.IIO_FAST_UNTIL > now,
         # H1
         "deck_rd": S.DECK_RD_COUNT,
@@ -716,75 +560,17 @@ def _game_ctx(inp):
     return inp["game_running"] or inp["game_reader"] or bool(inp["game_appids"])
 
 
-def _emit_verbose_all(per):
-    """Emit the per-type verbose [*FLOW] markers for every data type (incl. the
-    right-handle gyroR carrier when present)."""
-    for dtype, _t, _n in TYPE_ORDER:
-        log(type_marker(dtype, per[dtype]))
-    rgh = per.get("gyroR")
-    if rgh is not None:
-        log(type_marker("gyroR", rgh))
-
-
-def _dense_post_wake_due(now):
-    """(v3.14) True while inside the dense post-wake per-second flow burst
-    window (POSTWAKE_DENSE_S after the last [SLEEP-WAKE]) and the burst for this
-    wake has not yet run. Covers the "config returned but H1 dead" seconds
-    second-by-second (the v3.13 gap showed this window only via 2 SNAPSHOTs)."""
-    w = S.SLEEP_WAKE_TS
-    if w is None:
-        return False
-    if S.POSTWAKE_DENSE_LOGGED == w:
-        return False
-    if now - w > POSTWAKE_DENSE_S:
-        return False
-    return True
-
-
-def _reattach_judge_due(now):
-    """(v3.14) True when a [DOCK] happened while a game was running and the
-    recovery-judge window (REATTACH_NO_RECOVERY_S) has elapsed without the
-    no-recovery marker being logged for that dock. Returns the dock delay or
-    None."""
-    if S.LAST_DOCK_TS is None or not S.LAST_DOCK_GAME:
-        return None
-    if S.REATTACH_NR_LOGGED == S.LAST_DOCK_TS:
-        return None
-    if now - S.LAST_DOCK_TS < REATTACH_NO_RECOVERY_S:
-        return None
-    return now - S.LAST_DOCK_TS
-
-
-def _gyro_carrier_change(now):
-    """(v3.14) Emit [GYRO-CARRIER] on every attach-state change (center-only vs
-    right-handle detached). Publishes S.RIGHT_GYRO_CARRIER + the change-only
-    latch so the RIGHT column is never silently н/п."""
-    right = bool(S.RIGHT_GYRO_PRESENT)
-    carrier = "right-handle" if right else "center"
-    if S.RIGHT_GYRO_CARRIER == carrier:
-        return
-    S.RIGHT_GYRO_CARRIER = carrier
-    log(gyro_carrier_line(carrier, right))
-
-
 def flow_scan(now):
-    """(v3.13/v3.14) Per-hop flow proof — called every second from obs.
-    pad_verdict_scan. v3.14 (todo 52x) makes the per-second flow RELIABLE in
-    live gameplay + every transition (not only on change/idle/SNAPSHOT) and
-    captures every physical detach/re-attach in BOTH modes. Emits:
-      * the compact [FLOW ...] line on change, once per wake, at least 1/s while
-        a game context is live (FLOW_LIVE_S), and every second inside the dense
-        post-wake burst window (POSTWAKE_DENSE_S);
-      * [GYRO-FLOW]/[BTNS-FLOW]/[STX-FLOW] (and the right-handle gyroR verbose)
-        on per-type verdict transitions while a game context is live, once per
-        wake, and every second inside the dense post-wake burst;
+    """(v3.13) Per-hop flow proof — called every second from obs.pad_verdict_
+    scan. Emits:
+      * the compact [FLOW ...] line on change (transition of any type verdict /
+        routing target) and once per wake;
+      * [GYRO-FLOW]/[BTNS-FLOW]/[STX-FLOW] verbose markers on per-type verdict
+        transitions while a game context is live, and once per wake (~2-5 s);
       * [STEAM-FOCUS-LOST-GAME] when a running game is detectable but Steam's
         active config focus is not that game (the routing proof, never vague);
       * [STEAM-FOCUS-DROP-AFTER-WAKE] once per wake when the pre-sleep focus
-        was a game and the post-wake focus is not;
-      * [RE-ATTACH-NO-RECOVERY] once per dock when a re-attach while the game is
-        running did NOT restore delivery (the user's gaming-mode finding);
-      * [GYRO-CARRIER] on every attach-state change (center-only vs right-handle).
+        was a game and the post-wake focus is not.
     Always refreshes S.FLOW_COMPACT so every [SNAPSHOT] flow= field is current.
     Never raises."""
     try:
@@ -792,24 +578,15 @@ def flow_scan(now):
         per = compute(inp)
         ctx = _game_ctx(inp)
         post_wake = _post_wake_due(now)
-        dense_wake = _dense_post_wake_due(now)
         sig = compact(inp, per)
 
-        # -- change detection per type (incl. the right-handle gyroR carrier) --
+        # -- change detection per type --------------------------------------
         type_changed = {}
         for dtype, _t, _n in TYPE_ORDER:
             k = _type_key(per[dtype])
             if k != S.FLOW_STATE.get(dtype):
                 type_changed[dtype] = True
                 S.FLOW_STATE[dtype] = k
-        rgh = per.get("gyroR")
-        if rgh is not None:
-            rk = _type_key(rgh)
-            if rk != S.FLOW_STATE.get("gyroR"):
-                type_changed["gyroR"] = True
-                S.FLOW_STATE["gyroR"] = rk
-        elif "gyroR" in S.FLOW_STATE:
-            S.FLOW_STATE.pop("gyroR", None)
 
         emit_compact = False
         if post_wake is not None:
@@ -817,31 +594,19 @@ def flow_scan(now):
             emit_compact = True
             # verbose per-hop markers once per wake (~2-5 s after) — even with
             # no game the chain must be stated (H3=none / desktop).
-            _emit_verbose_all(per)
-        elif dense_wake:
-            # (v3.14 #5) dense post-wake burst: per-second [FLOW] + verbose so
-            # the "config returned but H1 dead" window is captured second-by-
-            # second, not just in 2 SNAPSHOTs.
-            emit_compact = True
-            _emit_verbose_all(per)
+            for dtype, _t, _n in TYPE_ORDER:
+                log(type_marker(dtype, per[dtype]))
         elif type_changed:
             if ctx or S.FLOW_LAST_GAME_CTX or \
                     now - S.FLOW_LAST_LOG >= FLOW_MIN_LOG:
                 emit_compact = True
-                for dtype in list(type_changed):
+                for dtype, _t, _n in TYPE_ORDER:
                     if type_changed.get(dtype) and \
                             (ctx or S.FLOW_LAST_GAME_CTX):
                         log(type_marker(dtype, per[dtype]))
-        elif ctx and now - S.FLOW_LIVE_LAST >= FLOW_LIVE_S:
-            # (v3.14 #3/#6) per-second flow in live gameplay: emit the compact
-            # [FLOW] at least 1/s while a game context is live, even when no
-            # verdict changed — the v3.13 gap was that [*FLOW]/[FLOW] barely
-            # fired during a live game.
-            emit_compact = True
 
         if emit_compact and sig != S.FLOW_COMPACT:
             log("[FLOW] " + sig)
-            S.FLOW_LIVE_LAST = now
 
         # -- routing proof markers ------------------------------------------
         if ctx and focus_lost_condition(inp):
@@ -857,21 +622,6 @@ def flow_scan(now):
 
         # -- wake focus-drop proof (once per wake) ---------------------------
         _focus_drop_after_wake(now)
-
-        # -- (v3.14) dense post-wake burst lifetime --------------------------
-        if dense_wake and S.POSTWAKE_DENSE_LOGGED != S.SLEEP_WAKE_TS:
-            if now - S.SLEEP_WAKE_TS >= POSTWAKE_DENSE_S:
-                S.POSTWAKE_DENSE_LOGGED = S.SLEEP_WAKE_TS
-
-        # -- (v3.14) re-attach-no-recovery judge (once per dock) -------------
-        dock_delay = _reattach_judge_due(now)
-        if dock_delay is not None:
-            S.REATTACH_NR_LOGGED = S.LAST_DOCK_TS
-            if _reattach_no_recovery(per):
-                log(reattach_no_recovery_line(inp, per, dock_delay))
-
-        # -- (v3.14) gyro-carrier change marker ------------------------------
-        _gyro_carrier_change(now)
 
         S.FLOW_LAST_GAME_CTX = ctx
         S.FLOW_COMPACT = sig

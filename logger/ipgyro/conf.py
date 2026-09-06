@@ -153,7 +153,7 @@ DECK_DRAIN_MAX = 16         # max frames coalesced from one deck burst drain
 #  2026-09-05 on user request; the full contract now lives in Agent.md,
 #  section "2026-09-05 ~22:3x — V22 ДИЗАЙН-ДОКУМЕНТ ...".)
 # ---------------------------------------------------------------------------
-LOG_VERSION = "v3.14"
+LOG_VERSION = "v3.15"
 
 # ---------------------------------------------------------------------------
 # v3.12 (todo 52r) — truthful mode/sleep/per-source delivery cadences.
@@ -191,32 +191,29 @@ PAD_STALL_REQ = 5.0         # [PAD-DEAD] needs PAD_STALL_REQ CONSECUTIVE quiet
                             # v3.12 bug fired on the FIRST quiet second.
 
 # ---------------------------------------------------------------------------
-# v3.14 (todo 52x) — FULL BOTH-MODE EVENT CAPTURE + PER-SECOND FLOW. The user's
-# ground-truth: the v3.13 log MISSED the real gaming-mode detach/re-attach
-# failure (detach broke everything 4x in gaming mode; re-attach did NOT recover;
-# only a game restart recovered; desktop detach worked; "very many logs not
-# written"). v3.14 must capture EVERY physical detach/re-attach in BOTH modes
-# with full detail, emit the per-hop flow at least 1/s during live gameplay and
-# every transition (not only on idle/change/SNAPSHOT), track the right-handle
-# gyro (17ef:61ed) as a SEPARATE carrier with its own H0-H3 verdicts, emit an
-# explicit [RE-ATTACH-NO-RECOVERY] marker when a re-attach does NOT restore
-# delivery while the game is still running, and run a dense per-second flow
-# burst in the post-wake "config returned but H1 dead" window.
+# v3.15 (todo 52z) — corrected rebuild on the v3.13 base (the over-engineered
+# v3.14 was reverted). Ground-truth fixes:
+#  * game_reader reports the REAL game (eso64.exe), not a wine service host
+#    (svchost/bufferselfpatch) — obs._main_game_proc resolves the pad-fd
+#    reader's Steam-game ancestor first.
+#  * a [DETACH] at a sleep-wake boundary when the controller was ATTACHED at
+#    [SLEEP-ENTER] is a SUSPEND RE-ENUMERATION artifact (the USB controller
+#    powered down during sleep and re-enumerates on wake), NOT a real detach —
+#    the user's ground truth: "Sleep был точно с attached". The logger must not
+#    report a false detach/attach cycle around a wake.
+#  * the gyro carrier is derived from the PHYSICAL ATTACH STATE (right handle
+#    17ef:61ed detached = right-handle carrier), not from the always-present
+#    center IIO — the user's ground truth: when he detached, the RIGHT handle
+#    gyro worked (GyroR), not center.
 # ---------------------------------------------------------------------------
-FLOW_LIVE_S = 1.0           # per-second compact [FLOW] cadence while a game
-                            # context is live (live gameplay + transitions) —
-                            # the v3.13 gap was that [*FLOW] barely fired in a
-                            # live game; now the per-second flow is reliable.
-REATTACH_NO_RECOVERY_S = 3.0  # after a [DOCK] while a game is running, judge
-                            # whether delivery RESUMED or STAYS DEAD; if after
-                            # this window the per-hop flow is still not H3=ok
-                            # (or H1/H2 lost) emit [RE-ATTACH-NO-RECOVERY].
-POSTWAKE_DENSE_S = 20.0     # dense per-second flow burst window after every
-                            # [SLEEP-WAKE] covering the "config returned but
-                            # H1 dead" seconds (the v3.13 gap showed this window
-                            # only via 2 SNAPSHOTs, not second-by-second).
-CARRIER_CHANGE_HB = 0.0     # [GYRO-CARRIER] fires on every attach-state change
-                            # (center-only vs right-handle) — no anti-spam floor.
+WAKE_DETACH_GRACE_S = 8.0   # after a [SLEEP-WAKE], a physical [DETACH] within
+                            # this window while the controller was attached at
+                            # [SLEEP-ENTER] is treated as a suspend re-enum
+                            # (suppressed as a real detach), not a user detach.
+RIGHT_HANDLE_PID = "61ED"   # observable pid of the detached right handle (its
+                            # own gyro source) — identity only, never a selector.
+FULL_CTRL_PID = "61EB"      # observable pid of the full controller (center gyro
+                            # in the XInput right_gyro slot while attached).
 
 # v3.9 (todo 52f FIX-1 CLEAR NAMING): the HUMAN vocabulary every log/config
 # shows. Internal role/deck_kind keys (discover.py), mode internals and marker
