@@ -27,6 +27,17 @@ capture.py (per-device role+codec pipeline; hidraw.py is now a thin facade),
 udev/obs/gyro/steam/ipj/app re-wired role-based + G1 (Steam-side
 grab/release/regrab), G2 (mode/owner tags), G3 (consumer-delivery probe),
 G4 (real-PID IPJ watchdog).
+
+v3.8 (todo 52e) — desktop-detach VISIBILITY fix (a real no-game desktop detach
+was invisible/mislabeled): F1 mode=game|desktop now comes from the LIVE Steam
+context (focused AppID / active Steam-Input window + running-game proc set) at
+the moment of a [DETACH]/[DOCK]/[RECONNECT-DT], with the transport-based
+deck_mode_of only as the fallback when Steam context is unavailable; F2 the
+startup blind window is closed (udev-recorded physical churn is replayed and
+[STARTUP-WINDOW] synthesized before the cadence loop); F3 a fresh Steam poll is
+forced at every physical change; F4 game=yes means the ACTIVE Steam-Input
+window is a game (focused AppID), so lingering ESO/Proton/launcher procs no
+longer keep game=yes after the user is back on the desktop shell.
 """
 
-__version__ = "v3.7"
+__version__ = "v3.8"

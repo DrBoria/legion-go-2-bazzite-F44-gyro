@@ -40,7 +40,8 @@ from .hidraw import emit_hid_summary, handle_hidraw, scan_hidraw
 from .iio import discover_iio, sample_iio
 from .ipj import ipj_backlog, ipj_tail_loop
 from .logcore import _signal_handler, log, maybe_rotate, run_cmd
-from .obs import _full_mode, pm_probe, pm_wake_check, state_tracker
+from .obs import (_full_mode, pm_probe, pm_wake_check, startup_reconcile,
+                  state_tracker)
 from .pm import pm_backlog, pm_journal_loop
 from .steam import steam_scan, steam_state_verdict
 from .udev import udev_monitor_loop
@@ -216,6 +217,20 @@ def main():
         f"({CFG.CONFIG_PATH}), role+codec discovery (no device ids), "
         "G1 Steam-side grab/release/regrab, G2 mode/owner tags, G3 consumer "
         "delivery probe, G4 real-PID IPJ watchdog")
+    log("LOGGER: v3.8 todo-52e desktop-detach visibility active — mode= tag "
+        "from LIVE Steam focus AppID + running-game procs (transport only as "
+        "fallback, F1); startup blind window closed ([STARTUP-WINDOW] "
+        "replay/synthesis of pre-loop physical churn, F2); fresh Steam poll "
+        "forced at every [DETACH]/[DOCK] (F3); game=yes = active Steam-Input "
+        "window, not lingering ESO/Proton procs (F4)")
+
+    # (v3.8 F2) close the startup blind window ONCE, before the cadence loop:
+    # replay the physical-source churn the udev thread recorded during init and
+    # synthesize any [DETACH]/[DOCK] the pre-loop gap would have silently lost.
+    try:
+        startup_reconcile(time.monotonic())
+    except Exception as e:
+        log(f"LOGGER: startup reconcile error: {e}")
 
     last_snap = last_hb = last_iio = last_sess = last_iio_rescan = \
         last_flow = last_steam = time.monotonic()

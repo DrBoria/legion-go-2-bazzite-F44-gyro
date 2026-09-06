@@ -119,6 +119,27 @@ PM_FOLLOW_LAST = 0.0        # last [PM-LIVE] heartbeat (monotonic)
 FRAME_LOG_LAST = {}         # hidraw node -> monotonic last [FRAME] log time
 
 # ---------------------------------------------------------------------------
+# v3.8 — todo 52e desktop-detach visibility (F1-F4).
+# ---------------------------------------------------------------------------
+# (F1/F4) parsed Steam focus + the LIVE mode verdict shared with obs/capture.
+# STEAM_FOCUS_APPID/KIND are derived from STEAM_UI_FOCUS; MODE_CTX is the
+# 'game'|'desktop' verdict computed from the active Steam-Input window (focused
+# AppID) with the running-game proc set as fallback when focus is unknown.
+STEAM_FOCUS_APPID = None     # focused AppID parsed from STEAM_UI_FOCUS
+STEAM_FOCUS_KIND = None      # 'GAME'|'769'|'413080'|'OTHER'|None
+MODE_CTX = None              # live mode verdict: 'game'|'desktop'|None
+MODE_CTX_DETAIL = ""         # human reason for the last MODE_CTX
+GAME_FOCUSED = False         # F4: the active Steam-Input window IS a game
+
+# (F2) startup blind window: physical-source churn recorded by the udev thread
+# between process start and the first main-loop scan (the startup scan already
+# set PHYS_STATE as the baseline). Replayed ONCE by obs.startup_reconcile() so
+# a detach+re-dock fully inside the init gap is never silently lost.
+STARTUP_CHURN = []           # [{"kind": "detach"|"dock", "ts": monotonic}]
+STARTUP_BASELINE_TS = None   # monotonic of the first PHYS_STATE baseline scan
+TRACK_LIVE = False           # True once obs.startup_reconcile() has run
+
+# ---------------------------------------------------------------------------
 # Runtime config (todo 52a/52b) — set ONCE by app.main() from ipgyro.config.
 # S.CFG is the effective Cfg (tomllib /etc/ip-gyro-logger/config.toml merged
 # over strict defaults); S.LABELS is the resolved [labels] role->display dict.

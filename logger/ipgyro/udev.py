@@ -99,6 +99,21 @@ def udev_monitor_loop():
             log(f"[UDEV] action={action} devname={devname} subsystem={subsys} "
                 f"vid={vid or ''} pid={pid or ''}{who} "
                 f"devpath={ev.get('DEVPATH', '')}")
+            # (v3.8 F2) during the startup blind window (S.TRACK_LIVE still
+            # False = the main loop has not gone live yet) record physical-
+            # source churn so obs.startup_reconcile() can synthesize the
+            # [DETACH]/[DOCK] markers the init-gap scan never diffed. Debounced:
+            # a redock burst (add/remove/add within ~1.5 s) collapses into ONE
+            # detach + ONE dock event.
+            if (not S.TRACK_LIVE and role == D.ROLE_PHYSICAL
+                    and action in ("add", "remove")
+                    and len(S.STARTUP_CHURN) < 32):
+                kind = "dock" if action == "add" else "detach"
+                _ts = time.monotonic()
+                prev = S.STARTUP_CHURN[-1] if S.STARTUP_CHURN else None
+                if prev is None or (prev["kind"] != kind
+                                    and _ts - prev["ts"] >= 1.5):
+                    S.STARTUP_CHURN.append({"kind": kind, "ts": _ts})
 
         try:
             ev = {}

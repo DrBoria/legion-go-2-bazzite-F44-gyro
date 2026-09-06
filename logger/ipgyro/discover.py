@@ -373,7 +373,13 @@ def is_game_deck(e):
 
 def deck_mode_of(e):
     """'game' when the deck is the UHID gaming deck, 'desktop' when it is the
-    vhci Steam Controller — the G2 mode tag for [DETACH]/[DOCK]/[RECONNECT-DT]."""
+    vhci Steam Controller — the G2 mode tag for [DETACH]/[DOCK]/[RECONNECT-DT].
+
+    v3.8 (todo 52e F1): this transport-based verdict is now ONLY the fallback
+    used when the live Steam context is unavailable (obs._live_mode_tag first
+    asks the focused-AppID / active-Steam-Input-window verdict and the running-
+    game proc set, because a machine whose only deck is the UHID GAMING deck
+    can otherwise never report mode=desktop for a real desktop detach)."""
     if e.get("role") != ROLE_DECK:
         return None
     return "desktop" if e.get("deck_kind") == DECK_DESK else "game"

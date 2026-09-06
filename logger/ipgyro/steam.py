@@ -68,6 +68,10 @@ def steam_scan(now):
         _steam_controller_ui_log(os.path.join(
             base, ".local/share/Steam/logs/controller_ui.txt"))
     _steam_procs()
+    # (v3.8 F1/F4) after every scan keep the live mode verdict fresh so the
+    # periodic [STEAM-STATE]/[SNAPSHOT] game= tag and any transport-fallback
+    # mode tag read the current focused-window context.
+    record_mode_verdict()
 
 
 def _steam_registry(path):
@@ -202,6 +206,88 @@ def _steam_ui_focus(kind, appid):
     return f"focused AppID {appid} ({kind})"
 
 
+# ---------------------------------------------------------------------------
+# v3.8 (todo 52e) — LIVE game-mode context (F1/F3/F4). The mode=game|desktop tag
+# for [DETACH]/[DOCK]/[RECONNECT-DT] and the game=yes tag are now driven by the
+# ACTIVE Steam-Input window (focused AppID), with the running-game proc set only
+# as the fallback when no focus event has been seen yet. The transport-based
+# deck_mode_of (discover.py) is used only when this whole verdict is None.
+# ---------------------------------------------------------------------------
+
+def _focus_appid_kind(focus):
+    """Parse a S.STEAM_UI_FOCUS label into (appid, kind). kind is one of
+    'GAME' | '769' | '413080' | 'OTHER' | None (None = no focus label yet).
+    'GAME' = an actual game AppID with Steam Input on its window (the ONLY
+    "game" signal per F4); 769 = Steam client UI, 413080 = Big Picture /
+    desktop shell, OTHER = a non-Steam-Input window -> all desktop."""
+    if not focus:
+        return None, None
+    m = re.search(r"\bAppID (\d+)", focus)
+    appid = m.group(1) if m else None
+    if "GAME window" in focus:
+        return appid, "GAME"
+    if appid == "769":
+        return appid, "769"
+    if appid == "413080":
+        return appid, "413080"
+    return appid, ("OTHER" if appid else None)
+
+
+def _set_focus(focus):
+    """Store the focus label AND its parsed AppID/kind together (the parsed
+    fields feed the live mode verdict without re-parsing every call)."""
+    S.STEAM_UI_FOCUS = focus
+    S.STEAM_FOCUS_APPID, S.STEAM_FOCUS_KIND = _focus_appid_kind(focus)
+
+
+def record_mode_verdict():
+    """(v3.8 F1/F4) Recompute + store the LIVE mode verdict from the current
+    Steam focus + running-game proc set and return (mode, detail):
+      * focused AppID is a real game window   -> ('game', ...)
+      * focused AppID is 769 / 413080 / OTHER -> ('desktop', ...)  — even when
+        game/Proton procs are still alive (F4: game = the ACTIVE Steam-Input
+        window, not mere process presence)
+      * no focus event yet, but game procs run -> ('game', ...)  [startup]
+      * no focus and no procs (Steam scanned)  -> ('desktop', ...)
+      * Steam context entirely unavailable     -> (None, ...)   [transport
+        fallback in the caller]
+    Also refreshes S.STEAM_FOCUS_APPID/KIND + S.GAME_FOCUSED + S.MODE_CTX/
+    S.MODE_CTX_DETAIL so every tag source reads the same live verdict."""
+    appid, kind = _focus_appid_kind(S.STEAM_UI_FOCUS)
+    summary = S.STEAM_APP_SUMMARY
+    procs = bool(summary and summary != "(none)")
+    if kind == "GAME":
+        mode, game, det = ("game", True,
+                           f"focus AppID {appid} (active Steam-Input game window)")
+    elif kind in ("769", "413080", "OTHER"):
+        mode, game, det = ("desktop", False,
+                           f"focus AppID {appid} (Steam UI / desktop shell)")
+    elif procs:
+        mode, game, det = ("game", True,
+                           f"running-game procs {summary} (no focus event yet)")
+    elif summary is not None:
+        mode, game, det = ("desktop", False, "no running Steam game procs")
+    else:
+        mode, game, det = (None, False,
+                           "no Steam focus and no proc data (context unavailable)")
+    S.STEAM_FOCUS_APPID = appid
+    S.STEAM_FOCUS_KIND = kind
+    S.MODE_CTX = mode
+    S.MODE_CTX_DETAIL = det
+    S.GAME_FOCUSED = game
+    return mode, det
+
+
+def steam_refresh(now):
+    """(v3.8 F3) FORCE a fresh Steam poll NOW (registry + controller_ui tail +
+    running procs) instead of waiting for the next periodic STEAM_SCAN_INTERVAL
+    tick, then recompute the live mode verdict. Called at every physical
+    [DETACH]/[DOCK] so the mode= tag uses LIVE focus, never a stale periodic
+    [STEAM-STATE]. Returns the (mode, detail) verdict."""
+    steam_scan(now)
+    return record_mode_verdict()[:2]
+
+
 def _steam_ui_focus_from_text(lines):
     """Most recent OnFocusWindowChanged event in `lines` -> label or None."""
     last = None
@@ -247,7 +333,7 @@ def _steam_controller_ui_log(path):
             f"(tail-only from now): {path}")
         focus = _steam_ui_focus_from_tail(path, size)
         if focus:
-            S.STEAM_UI_FOCUS = focus
+            _set_focus(focus)
             log("STEAM UI FOCUS: baseline " + focus)
         return
     pos = cur.get("ui_pos", 0)
@@ -271,7 +357,7 @@ def _steam_controller_ui_log(path):
     # -- compact focus transition (only when the focused AppID actually changed)
     focus = _steam_ui_focus_from_text(newlines)
     if focus and focus != S.STEAM_UI_FOCUS:
-        S.STEAM_UI_FOCUS = focus
+        _set_focus(focus)
         log("STEAM UI FOCUS: " + focus)
         _steam_config_marker(focus)   # (Слой 2) unified [STEAM-CONFIG] active
     # -- raw filtered evidence lines (bounded, noise excluded) ----------------
@@ -518,7 +604,7 @@ def steam_state_verdict():
     win = _window_title()
     log(f"[STEAM-STATE] focus={S.STEAM_UI_FOCUS or 'none'} "
         f"procs={S.STEAM_APP_SUMMARY or '(none)'} "
-        f"game={'yes' if S.GAME_RECORD else 'no'} "
+        f"game={'yes' if S.GAME_FOCUSED else 'no'} "
         f"deck_keepalive={'yes' if S.DECK_KEEPALIVE else 'no'} "
         f"window={win or '-'} "
         f"proc_detail=[{_proc_detail()}]")

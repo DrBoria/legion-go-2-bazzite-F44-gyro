@@ -80,16 +80,6 @@ def _full_mode_active():
     return S.GAME_RECORD or time.monotonic() < S.FULL_RECORD_UNTIL
 
 
-def _mode_tag():
-    """'game'|'desktop'|'none' from the deck-output currently open (G2 mode tag
-    appended to [DETACH]/[DOCK])."""
-    for e in S.HID_DEVICES.values():
-        m = D.deck_mode_of(e)
-        if m:
-            return m
-    return "none"
-
-
 def _drop_hid(node):
     try:
         os.close(S.HID_DEVICES[node]["fd"])
@@ -177,23 +167,26 @@ def scan_hidraw():
     phys_now = any(e["role"] == D.ROLE_PHYSICAL
                    for e in S.HID_DEVICES.values())
     if S.PHYS_STATE is None:
+        # (v3.8 F2) first baseline: detach-tracking is live from this scan on.
         S.PHYS_STATE = phys_now
+        S.STARTUP_BASELINE_TS = time.monotonic()
     elif S.PHYS_STATE and not phys_now:
         S.PHYS_STATE = False
-        # G2: mode=desktop|game + config-owner tag on the [DETACH] line
-        log(f"[DETACH] physical source GONE "
-            f"(0 physical-source nodes open) mode={_mode_tag()} "
-            f"owner=physical-source — controller detached / off / "
-            f"mode switch ([UDEV] shows the USB detail)")
+        # G2 owner tag + (v3.8 F1/F3) mode=desktop|game from a FORCED fresh
+        # Steam poll (live focus AppID / active Steam-Input window + proc set,
+        # transport only as fallback), so a desktop detach tags desktop even
+        # when only the UHID GAMING deck exists. obs._detach_marker keeps the
+        # line byte-compatible.
+        mode_tag = O._live_mode_tag(force=True)
+        log(O._detach_marker(mode_tag))
         O._mark_detach(now)
     elif not S.PHYS_STATE and phys_now:
         S.PHYS_STATE = True
         phys_n = sum(1 for e in S.HID_DEVICES.values()
                      if e["role"] == D.ROLE_PHYSICAL)
-        # G2: mode=desktop|game + config-owner tag on the [DOCK] line
-        log(f"[DOCK] physical source BACK "
-            f"({phys_n} physical-source nodes open) mode={_mode_tag()} "
-            f"owner=physical-source — controller docked / re-attached")
+        # G2 owner tag + (v3.8 F1/F3) fresh Steam context (see [DETACH] above).
+        mode_tag = O._live_mode_tag(force=True)
+        log(O._dock_marker(mode_tag, phys_n))
         O._mark_dock(now)
     return found
 

@@ -14,9 +14,11 @@ ids. G2 (todo 52b) adds a mode=desktop|game + owner tag to [DETACH]/[DOCK]/
 
 Steam-layer markers ([STEAM-STATE]/[STEAM-CONFIG]/[STEAM-GRAB/RELEASE/REGRAB])
 live in ipgyro.steam, which imports _enter_full/snapshot_state/_game_boundary
-from here — obs never imports steam, so there is no import cycle. obs DOES
-import _hid_label from ipgyro.hidraw (hidraw only lazily imports obs inside
-scan_hidraw(), keeping module load order cycle-free).
+from here. v3.8 (todo 52e): obs imports steam only LAZILY inside the
+_live_mode_tag()/startup_reconcile() bodies (steam.py imports obs at module
+level), so module-load order stays cycle-free. obs DOES import _hid_label from
+ipgyro.hidraw (hidraw only lazily imports obs inside scan_hidraw(), keeping
+module load order cycle-free).
 
 Shared mutable state is ALWAYS accessed as S.<name> (see ipgyro.state).
 """
@@ -50,14 +52,48 @@ def _deck_mode(found_hid):
     return "NO-DECK"
 
 
-def _current_mode_tag():
-    """'game'|'desktop'|'none' from the deck-output currently open (G2 mode tag
-    for [DETACH]/[DOCK]/[RECONNECT-DT])."""
+def _live_mode_tag(force=False):
+    """(v3.8 F1/F3) 'game'|'desktop'|'none' for the [DETACH]/[DOCK]/
+    [RECONNECT-DT] mode= tag. The LIVE Steam context is authoritative: the
+    focused AppID / active Steam-Input window (a real game AppID = game; the
+    desktop shell 413080 / Steam client 769 / none = desktop) PLUS the
+    running-game proc set (fallback only when focus is unknown). force=True
+    runs a fresh Steam poll NOW (F3) so the tag is never a stale periodic
+    [STEAM-STATE]. The transport-based deck_mode_of is used ONLY when the Steam
+    context is unavailable (verdict None)."""
+    from . import steam as ST   # lazy: steam.py imports obs at module level
+    try:
+        if force:
+            ST.steam_refresh(time.monotonic())
+        else:
+            ST.record_mode_verdict()
+    except Exception:
+        pass
+    if S.MODE_CTX is not None:
+        return S.MODE_CTX
+    # Steam context unavailable -> transport fallback (deck_output kind)
     for e in S.HID_DEVICES.values():
         m = D.deck_mode_of(e)
         if m:
             return m
     return "none"
+
+
+def _detach_marker(mode):
+    """Byte-compatible [DETACH] line text (shared by capture.scan_hidraw and the
+    startup-window synthesis so both always emit the identical format)."""
+    return (f"[DETACH] physical source GONE "
+            f"(0 physical-source nodes open) mode={mode} "
+            f"owner=physical-source — controller detached / off / "
+            f"mode switch ([UDEV] shows the USB detail)")
+
+
+def _dock_marker(mode, phys_n):
+    """Byte-compatible [DOCK] line text (shared by capture.scan_hidraw and the
+    startup-window synthesis so both always emit the identical format)."""
+    return (f"[DOCK] physical source BACK "
+            f"({phys_n} physical-source nodes open) mode={mode} "
+            f"owner=physical-source — controller docked / re-attached")
 
 
 def _fmt_state(st):
@@ -145,7 +181,7 @@ def snapshot_state(reason):
         f"gyro_src={S.GYRO_SRC or 'unknown'} "
         f"steam_focus={S.STEAM_UI_FOCUS or 'none'} "
         f"steam_procs={S.STEAM_APP_SUMMARY or '(none)'} "
-        f"game={'yes' if S.GAME_RECORD else 'no'} "
+        f"game={'yes' if S.GAME_FOCUSED else 'no'} "
         f"deck_keepalive={'yes' if S.DECK_KEEPALIVE else 'no'}")
 
 
@@ -167,7 +203,7 @@ def _mark_dock(now):
     if S.DETACH_AT is not None:
         dt = now - S.DETACH_AT
         log(f"[RECONNECT-DT] detach->dock took {dt:.1f}s "
-            f"mode={_current_mode_tag()} owner=physical-source "
+            f"mode={_live_mode_tag()} owner=physical-source "
             f"(controller re-attached; Steam re-grab to be confirmed by "
             f"[STEAM-REGRAB]/[DECK-ALIVE])")
         S.DETACH_AT = None
@@ -270,3 +306,71 @@ def pm_probe():
                 log("PM: [SLEEP-WAKE] " + line.strip())
                 _enter_full("sleep-wake", hold=FULL_MODE_WAKE)
                 snapshot_state("sleep-wake")
+
+
+# ---------------------------------------------------------------------------
+# v3.8 (todo 52e F2) — closing the STARTUP BLIND WINDOW.
+# ---------------------------------------------------------------------------
+
+def startup_reconcile(now):
+    """(v3.8 F2) Close the STARTUP BLIND WINDOW. Physical-source churn that
+    happened after the logger's first scan baseline (S.PHYS_STATE set by the
+    startup scan_hidraw) but BEFORE the main loop went live only appeared as
+    raw [UDEV] remove/add lines — the aggregate [DETACH]/[DOCK] diff never ran
+    in that gap (startup keeps the main thread busy with codec-sniff banners /
+    journal backlogs), so a detach+re-dock fully inside the window was silently
+    lost. We replay the churn the udev thread recorded (S.STARTUP_CHURN) and
+    SYNTHESIZE the missing [DETACH]/[DOCK] markers (with the live mode tag, F1)
+    so real events are captured; when synthesis is not possible we still emit an
+    explicit [STARTUP-WINDOW] marker so a pre-baseline detach is never silently
+    lost. Runs ONCE after startup init, before the cadence loop (sets
+    S.TRACK_LIVE so the udev recorder stops buffering)."""
+    if S.TRACK_LIVE:
+        return
+    S.TRACK_LIVE = True
+    churn = list(S.STARTUP_CHURN)
+    S.STARTUP_CHURN = []
+    baseline = S.STARTUP_BASELINE_TS
+    # events before the first baseline are "baked into" that baseline (nothing
+    # to diff); only events at/after the baseline could have been missed.
+    pre = [e for e in churn if baseline is None or e["ts"] < baseline]
+    late = [e for e in churn if baseline is not None and e["ts"] >= baseline]
+
+    # (F1/F3) one forced fresh Steam poll -> the live mode for every marker
+    # (a real game AppID = game; desktop shell 413080 / Steam UI 769 = desktop).
+    mode = _live_mode_tag(force=True) if late else _live_mode_tag(force=False)
+
+    syn = 0
+    state = S.PHYS_STATE
+    for e in late:
+        if e["kind"] == "detach" and state:
+            state = False
+            S.PHYS_STATE = False
+            log(_detach_marker(mode))
+            _mark_detach(e["ts"])        # anchors DETACH_AT to the real instant
+            syn += 1
+        elif e["kind"] == "dock" and state is False:
+            state = True
+            S.PHYS_STATE = True
+            phys_n = sum(1 for x in S.HID_DEVICES.values()
+                         if x.get("role") == D.ROLE_PHYSICAL)
+            log(_dock_marker(mode, phys_n or 1))
+            _mark_dock(e["ts"])          # dt measured against the real detach
+            syn += 1
+    S.PHYS_STATE = state
+
+    b = max(0.0, (baseline or now) - S.BOOT_T0)
+    if syn:
+        pre_n = (f"; {len(pre)} churn event(s) before the +{b:.0f}s baseline "
+                 f"not diffable") if pre else ""
+        log(f"[STARTUP-WINDOW] {syn} [DETACH]/[DOCK] marker(s) SYNTHESIZED from "
+            f"{len(late)} pre-loop physical churn event(s) recorded by udev "
+            f"(tracking went live at +{b:.0f}s; the init gap would have lost "
+            f"them){pre_n}")
+    elif churn:
+        log(f"[STARTUP-WINDOW] {len(churn)} pre-loop physical churn event(s) "
+            f"recorded but no state change to synthesize (tracking live at "
+            f"+{b:.0f}s baseline)")
+    else:
+        log(f"[STARTUP-WINDOW] detach tracking live at +{b:.0f}s baseline; "
+            f"no pre-live physical churn recorded")
