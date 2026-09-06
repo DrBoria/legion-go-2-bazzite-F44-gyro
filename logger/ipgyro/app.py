@@ -223,6 +223,11 @@ def main():
         "replay/synthesis of pre-loop physical churn, F2); fresh Steam poll "
         "forced at every [DETACH]/[DOCK] (F3); game=yes = active Steam-Input "
         "window, not lingering ESO/Proton procs (F4)")
+    log("LOGGER: v3.9 todo-52f clear-naming + real-sleep active — human labels "
+        "(controller / steam-deck / steam-deck-old / steam-controller), mode "
+        "words gaming-mode|desktop, steady-state wording, controller=/virtual= "
+        "snapshot fields; [SLEEP-ENTER]/[SLEEP-WAKE] only on journal-confirmed "
+        "suspend/resume (no false wakes on main-loop stalls)")
 
     # (v3.8 F2) close the startup blind window ONCE, before the cadence loop:
     # replay the physical-source churn the udev thread recorded during init and

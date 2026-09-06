@@ -12,9 +12,9 @@ Roles are semantic slots, not device ids:
                    (byte0 = 0x04 XInputData). This is the InputPlumber input.
   deck-output      a virtual Steam controller the logger mirrors the OUTPUT of.
                    Sub-kind by TRANSPORT (replaces the 12F0 vs 1205 pid branch):
-                     game     = UHID virtual deck (gaming)    -> DECK-GAME
-                     stale    = UHID virtual deck, stale form -> DECK-12FB
-                     desktop  = vhci-hcd Steam Controller     -> DECK-DESK
+                     game     = UHID virtual deck (gaming)    -> steam-deck
+                     stale    = UHID virtual deck, stale form -> steam-deck-old
+                     desktop  = vhci-hcd Steam Controller     -> steam-controller
   iio-imu          gyro/accel iio device (kept for the center-IMU identity).
 
 The authoritative capability signal is the CODEC FRAME SIGNATURE (see
@@ -56,11 +56,16 @@ DECK_STALE = "stale"                  # uhid stale deck   (legacy pid 12FB)
 DECK_DESK = "desktop"                 # vhci desktop deck (legacy pid 1205)
 
 # label_key -> (default display label). Config [labels] overrides these.
+# v3.9 (todo 52f FIX-1 CLEAR NAMING): human device labels — a user reads
+# "controller" (the real built-in gamepad feeding InputPlumber), "steam-deck"
+# (the virtual Steam Deck Steam binds in GAMING mode) and "steam-controller"
+# (the virtual Steam Controller for the DESKTOP shell). Marker TOKENS
+# ([DECK-DEAD]/[LEGION-DEAD]/...) stay byte-compatible; only these labels changed.
 DEFAULT_LABELS = {
-    "role_physical": "LEGION-SRC",
-    "role_deck_game": "DECK-GAME",
-    "role_deck_stale": "DECK-12FB",
-    "role_deck_desk": "DECK-DESK",
+    "role_physical": "controller",
+    "role_deck_game": "steam-deck",
+    "role_deck_stale": "steam-deck-old",
+    "role_deck_desk": "steam-controller",
 }
 
 # codec hint per role (the actual codec is BOUND by frame-sniff; this is only
@@ -76,7 +81,7 @@ _VIDPID_RE = re.compile(r"(?:0003|0005):([0-9A-Fa-f]{4}):([0-9A-Fa-f]{4})")
 # USB interface segment inside the sysfs path, e.g. "3-1:1.2/" -> iface 2
 _USBIFACE_RE = re.compile(r":1\.([0-9]+)/")
 # stale-deck legacy pid (observable identity, NOT a selector; refines the
-# DECK-GAME label to DECK-12FB so forensics stay comparable)
+# steam-deck label to the stale 'steam-deck-old' form so forensics stay clear)
 _STALE_DECK_PIDS = (0x12FB,)
 
 # how long to wait for a first frame when sniffing a candidate (seconds)
@@ -198,7 +203,7 @@ def _deck_kind_of(info):
 
 def _label_for(role, deck_kind, labels):
     """Resolve the display label for a role from the [labels] config (defaults
-    = the v3.6 strings, so markers stay byte-comparable with no config)."""
+    = the human v3.9 strings above, so the log stays readable with no config)."""
     if role == ROLE_PHYSICAL:
         return labels.get("role_physical") or DEFAULT_LABELS["role_physical"]
     if role == ROLE_DECK:

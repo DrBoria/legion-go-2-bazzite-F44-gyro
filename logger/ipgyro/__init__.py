@@ -38,6 +38,17 @@ startup blind window is closed (udev-recorded physical churn is replayed and
 forced at every physical change; F4 game=yes means the ACTIVE Steam-Input
 window is a game (focused AppID), so lingering ESO/Proton/launcher procs no
 longer keep game=yes after the user is back on the desktop shell.
+
+v3.9 (todo 52f) — two user-driven clarity fixes:
+ FIX-1 CLEAR NAMING: the cryptic output/config vocabulary (DECK-GAME /
+ LEGION-SRC / DECK-DESK labels, mode=GAMING, "baseline", legion=/deck= fields)
+ is replaced with human words (labels controller / steam-deck /
+ steam-deck-old / steam-controller, mode=gaming-mode|desktop, "steady-state",
+ controller=/virtual= fields). Marker TOKENS stay byte-compatible.
+ FIX-2 REAL SLEEP: [SLEEP-ENTER]/[SLEEP-WAKE] now fire ONLY on a journal-
+ confirmed suspend/resume (systemd-suspend phrases "Performing sleep
+ operation ..." / "System returned from sleep operation ...") instead of the
+ false mono-gap [SLEEP-WAKE] that fired every ~24-33 s main-loop stall.
 """
 
-__version__ = "v3.8"
+__version__ = "v3.9"

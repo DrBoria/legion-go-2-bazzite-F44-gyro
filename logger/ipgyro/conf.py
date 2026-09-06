@@ -153,7 +153,26 @@ DECK_DRAIN_MAX = 16         # max frames coalesced from one deck burst drain
 #  2026-09-05 on user request; the full contract now lives in Agent.md,
 #  section "2026-09-05 ~22:3x — V22 ДИЗАЙН-ДОКУМЕНТ ...".)
 # ---------------------------------------------------------------------------
-LOG_VERSION = "v3.8"
+LOG_VERSION = "v3.9"
+
+# v3.9 (todo 52f FIX-1 CLEAR NAMING): the HUMAN vocabulary every log/config
+# shows. Internal role/deck_kind keys (discover.py), mode internals and marker
+# TOKENS ([DETACH]/[DOCK]/[SLEEP-*]/...) are untouched — these tables translate
+# ONLY the user-facing words, so the log reads plainly ("mode=gaming-mode",
+# "controller=[...]", "steady-state") instead of internal codes ("mode=GAMING",
+# "legion=[LEGION-SRC...]", "baseline"). Config [labels] carries the same
+# human device names (see config.py defaults + logger/config.ipgyro.toml).
+DECK_MODE_WORDS = {          # obs._deck_mode() internal -> human word
+    "GAMING": "gaming-mode",
+    "DESKTOP": "desktop",
+    "TRANSITION-GAMING+DESKTOP": "gaming-mode + desktop (transition)",
+    "NO-DECK": "no-deck",
+}
+MODE_TAG_WORDS = {           # obs._live_mode_tag() 'game'|'desktop'|'none'
+    "game": "gaming-mode",
+    "desktop": "desktop",
+    "none": "none",
+}
 
 # (c) internal size rotation — never trust logrotate alone again (968MB file)
 LOGGER_MAX_BYTES = 300 * 1024 * 1024

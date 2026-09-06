@@ -66,7 +66,7 @@ def _labels():
 
 def _hid_label(e):
     """Display label for a device entry: its role label + '@1.<iface>' when the
-    node is one interface of a composite (keeps the legacy LEGION-SRC@1.2 form)."""
+    node is one interface of a composite (e.g. controller@1.2, v3.9 human)."""
     lbl = e.get("label") or e.get("role") or "?"
     if e.get("iface") is not None:
         lbl += f"@1.{e['iface']}"
@@ -329,7 +329,7 @@ def _handle_lego_reports(e, chunk, t2):
     XInput frames are 64 bytes (report id 0x04 at byte 0); a read may hold
     several back-to-back frames. Decodes EVERY field of each 64-byte frame into
     named values (see codecs.decode_lego_report) and emits:
-      * "LEGION-SRC ... raw=..." full raw hex every LEGO_RAW_HB (5 s);
+      * "<controller> ... raw=..." full raw hex every LEGO_RAW_HB (5 s);
       * a full "DECODE ... XFULL ..." line whenever ANY field changes (motion
         throttled to LEGO_MOTION_LOG_MIN ~10 lines/s; the first frame of a
         fresh quiet->active edge logs immediately), plus one decoded keepalive
@@ -363,7 +363,7 @@ def _handle_lego_reports(e, chunk, t2):
         # -- full raw hex + decoded keepalive every LEGO_RAW_HB ---------------
         if t2 - e["lego_hex_log"] >= LEGO_RAW_HB:
             e["lego_hex_log"] = t2
-            log(f"LEGION-SRC {label} raw={raw.hex(' ')}")
+            log(f"{label} raw={raw.hex(' ')}")
             log(CODECS.lego_fmt(label, dec, raw, "KEEP"))
         # -- ANY field changed -> full decoded all-fields line -----------------
         # (motion throttled to LEGO_MOTION_LOG_MIN; a fresh quiet->active edge

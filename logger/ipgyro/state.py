@@ -114,6 +114,16 @@ DEV_INV_SIG = None          # md5 of the last [DEV-INV] inventory (change-only)
 # (R6) PM journal follower state (reliable [SLEEP-ENTER]/[SLEEP-WAKE]).
 PM_FOLLOW_LAST = 0.0        # last [PM-LIVE] heartbeat (monotonic)
 
+# v3.9 (todo 52f FIX-2 real sleep): the pm journal follower sets SLEEP_WAKE_TS
+# the instant it logs a journal-confirmed [SLEEP-WAKE]; the MAIN thread applies
+# the wake consequences (snapshot + full capture) exactly once via
+# pm_wake_check() reading SLEEP_WAKE_TS vs WAKE_HANDLED_TS. This keeps pm.py a
+# pure marker/state notifier (it cannot import obs) while the orchestrator
+# (obs) still owns snapshot/full-capture, and prevents a false [SLEEP-WAKE]
+# from a mere main-loop stall (stalls never set SLEEP_PENDING).
+SLEEP_WAKE_TS = None        # monotonic of the last journal-confirmed wake
+WAKE_HANDLED_TS = 0.0       # last wake consequences applied (monotonic)
+
 # (R2) full-mode per-frame capture: last per-frame log time per hidraw node
 # (anti-spam floor so a pathological 240 frame/s deck cannot flood forever).
 FRAME_LOG_LAST = {}         # hidraw node -> monotonic last [FRAME] log time

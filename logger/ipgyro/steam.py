@@ -334,7 +334,7 @@ def _steam_controller_ui_log(path):
         focus = _steam_ui_focus_from_tail(path, size)
         if focus:
             _set_focus(focus)
-            log("STEAM UI FOCUS: baseline " + focus)
+            log("STEAM UI FOCUS: initial " + focus)
         return
     pos = cur.get("ui_pos", 0)
     if size < pos:             # rewritten/rotated -> start from scratch

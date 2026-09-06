@@ -27,7 +27,8 @@ import time
 
 from . import state as S
 from . import discover as D
-from .conf import FULL_MODE_GAME, FULL_MODE_POST, FULL_MODE_WAKE, SESS_INTERVAL
+from .conf import (DECK_MODE_WORDS, FULL_MODE_GAME, FULL_MODE_POST,
+                   FULL_MODE_WAKE, MODE_TAG_WORDS, SESS_INTERVAL)
 from .hidraw import _hid_label
 from .logcore import log, run_cmd
 
@@ -81,24 +82,46 @@ def _live_mode_tag(force=False):
 
 def _detach_marker(mode):
     """Byte-compatible [DETACH] line text (shared by capture.scan_hidraw and the
-    startup-window synthesis so both always emit the identical format)."""
-    return (f"[DETACH] physical source GONE "
-            f"(0 physical-source nodes open) mode={mode} "
-            f"owner=physical-source — controller detached / off / "
+    startup-window synthesis so both always emit the identical format). The
+    mode=/owner= payload is the v3.9 human vocabulary (FIX-1)."""
+    return (f"[DETACH] controller input GONE "
+            f"(0 controller nodes open) mode={_human_mode_tag(mode)} "
+            f"owner=controller — controller detached / off / "
             f"mode switch ([UDEV] shows the USB detail)")
 
 
 def _dock_marker(mode, phys_n):
     """Byte-compatible [DOCK] line text (shared by capture.scan_hidraw and the
     startup-window synthesis so both always emit the identical format)."""
-    return (f"[DOCK] physical source BACK "
-            f"({phys_n} physical-source nodes open) mode={mode} "
-            f"owner=physical-source — controller docked / re-attached")
+    return (f"[DOCK] controller input BACK "
+            f"({phys_n} controller nodes open) mode={_human_mode_tag(mode)} "
+            f"owner=controller — controller docked / re-attached")
+
+
+def _human_deck_mode(m):
+    """'GAMING' -> 'gaming-mode' etc. — the deck_mode() internal codes are only
+    ever compared/diffed internally; what a user reads is always translated
+    (v3.9 FIX-1 clear naming)."""
+    return DECK_MODE_WORDS.get(m, m)
+
+
+def _human_mode_tag(m):
+    """'game' -> 'gaming-mode' / 'desktop' -> 'desktop' for the mode= tag on
+    [DETACH]/[DOCK]/[RECONNECT-DT] (v3.9 FIX-1 human vocabulary)."""
+    return MODE_TAG_WORDS.get(m, m)
+
+
+def _group_labels(role):
+    """Sorted _hid_label() of every LIVE hidraw entry with `role`. Role-based,
+    never label-prefix-based — labels are now human config words (FIX-1)."""
+    return sorted(_hid_label(h) for h in S.HID_DEVICES.values()
+                  if h.get("role") == role)
 
 
 def _fmt_state(st):
-    return ("mode={} legion_hid=[{}] xpad=[{}] iio={}".format(
-        st["mode"], ",".join(st["legion_hid"]) or "-",
+    return ("mode={} controller=[{}] xbox-pad=[{}] iio={}".format(
+        _human_deck_mode(st["mode"]),
+        ",".join(st["legion_hid"]) or "-",
         ",".join(st["xpad"]) or "-", st["iio"]))
 
 
@@ -113,15 +136,17 @@ def state_tracker(devices, found_hid):
     st = {"mode": mode, "legion_hid": legion_hid, "xpad": xpad,
           "iio": len(S.IIO_DEVICES)}
     if S.LAST_STATE is None:
-        log("STATE: baseline " + _fmt_state(st))
+        log("STATE: steady-state " + _fmt_state(st))
         S.LAST_STATE = st
         return
     if st == S.LAST_STATE:
         return
     changes = []
     if st["mode"] != S.LAST_STATE["mode"]:
-        changes.append(f"mode {S.LAST_STATE['mode']} -> {st['mode']}")
-    for key, noun in (("legion_hid", "physical-source hidraw"),
+        changes.append("mode {} -> {}".format(
+            _human_deck_mode(S.LAST_STATE["mode"]),
+            _human_deck_mode(st["mode"])))
+    for key, noun in (("legion_hid", "controller hidraw"),
                       ("xpad", "kernel X-Box pad(evdev)")):
         old = set(S.LAST_STATE[key])
         new = set(st[key])
@@ -167,16 +192,17 @@ def _enter_full(reason, hold=None):
 def snapshot_state(reason):
     """(d) One loud [SNAPSHOT reason=...] line capturing every observable layer
     NOW, so any before/after transition diff shows exactly what changed.
-    (R1/R9) also states the center IMU identity + active gyro source."""
-    srcs = sorted(_hid_label(e) for e in S.HID_DEVICES.values())
-    mode = _deck_mode(S.HID_DEVICES)
+    (R1/R9) also states the center IMU identity + active gyro source. v3.9
+    (FIX-1): human mode word + role-based grouping under human field names
+    controller=[...] (physical input) and virtual=[...] (Steam-facing output)."""
+    mode = _human_deck_mode(_deck_mode(S.HID_DEVICES))
     cen = S.CEN_IMU
     cen_s = f"{cen['entry']}({cen['name']})" if cen else "none"
-    phys = [l for l in srcs if l.startswith("LEGION")]
-    deck = [l for l in srcs if l.startswith("DECK")]
+    controller = _group_labels(D.ROLE_PHYSICAL)
+    virtual = _group_labels(D.ROLE_DECK)
     log(f"[SNAPSHOT] reason={reason} mode={mode} "
-        f"legion=[{','.join(phys) or '-'}] "
-        f"deck=[{','.join(deck) or '-'}] "
+        f"controller=[{','.join(controller) or '-'}] "
+        f"virtual=[{','.join(virtual) or '-'}] "
         f"iio={len(S.IIO_DEVICES)} cen_imu={cen_s} "
         f"gyro_src={S.GYRO_SRC or 'unknown'} "
         f"steam_focus={S.STEAM_UI_FOCUS or 'none'} "
@@ -203,7 +229,7 @@ def _mark_dock(now):
     if S.DETACH_AT is not None:
         dt = now - S.DETACH_AT
         log(f"[RECONNECT-DT] detach->dock took {dt:.1f}s "
-            f"mode={_live_mode_tag()} owner=physical-source "
+            f"mode={_human_mode_tag(_live_mode_tag())} owner=controller "
             f"(controller re-attached; Steam re-grab to be confirmed by "
             f"[STEAM-REGRAB]/[DECK-ALIVE])")
         S.DETACH_AT = None
@@ -231,9 +257,8 @@ def _game_had_payload():
     """(R7) What the game HAD at the boundary: the bound controller (deck /
     physical-source hidraw labels) + the working gyro source (center IIO vs
     physical XInput)."""
-    srcs = sorted(_hid_label(e) for e in S.HID_DEVICES.values())
-    deck = [l for l in srcs if l.startswith("DECK")]
-    phys = [l for l in srcs if l.startswith("LEGION")]
+    deck = _group_labels(D.ROLE_DECK)      # what the game BOUND (Steam output)
+    phys = _group_labels(D.ROLE_PHYSICAL)  # the controller feeding it
     cen = S.CEN_IMU
     gyro = f"center-iio:{cen['entry']}" if cen else "none"
     if not cen:
@@ -241,8 +266,8 @@ def _game_had_payload():
         if any(e.get("role") == D.ROLE_PHYSICAL
                for e in S.HID_DEVICES.values()):
             gyro = "physical-xinput"
-    return (f"bound_controller=[{','.join(deck) or '-'}] "
-            f"source=[{','.join(phys) or '-'}] gyro={gyro} "
+    return (f"output=[{','.join(deck) or '-'}] "
+            f"controller=[{','.join(phys) or '-'}] gyro={gyro} "
             f"steam_focus={S.STEAM_UI_FOCUS or 'none'}")
 
 
@@ -270,42 +295,60 @@ def _game_boundary(summary, start):
 
 
 def pm_wake_check(now):
-    """(PM) The logger process is frozen during suspend, so a monotonic gap
-    > 5s between main-loop ticks means we just woke up: emit [SLEEP-WAKE] with
-    the duration, snapshot and re-arm full capture."""
-    if S.LAST_TICK and now - S.LAST_TICK > 5.0:
-        dur = now - S.LAST_TICK
-        log(f"PM: [SLEEP-WAKE] monotonic gap {dur:.1f}s — resumed from suspend")
+    """(PM, v3.9 FIX-2) The mono-gap backstop now fires ONLY for a GENUINE
+    suspend: S.SLEEP_PENDING is True only after the systemd-suspend journal
+    follower (pm.py) confirmed a real [SLEEP-ENTER], so a plain main-loop stall
+    (~24-33 s periodic IIO/HIDFLOW stalls while the daemon threads stay alive)
+    can NEVER emit a false [SLEEP-WAKE]. During a real suspend the whole
+    process freezes, so the first tick here after resume shows a big monotonic
+    gap WHILE SLEEP_PENDING is still True — that is the genuine-gap backstop.
+    If the follower already consumed the resume line first (it clears
+    SLEEP_PENDING and stamps S.SLEEP_WAKE_TS), we apply the wake consequences
+    (snapshot + full capture) exactly once via SLEEP_WAKE_TS/WAKE_HANDLED_TS."""
+    if S.SLEEP_PENDING and S.LAST_TICK and (now - S.LAST_TICK) > 5.0:
+        # genuine resume: journal-confirmed enter + whole-process freeze. The
+        # follower had not yet consumed the journal wake line before our tick.
+        S.SLEEP_PENDING = False
+        S.SLEEP_WAKE_TS = now
+        S.WAKE_HANDLED_TS = now
+        log(f"PM: [SLEEP-WAKE] real resume — monotonic gap "
+            f"{now - S.LAST_TICK:.1f}s (systemd-suspend journal enter was "
+            f"seen before the freeze; wake confirmed by the gap)")
+        _enter_full("sleep-wake", hold=FULL_MODE_WAKE)
+        snapshot_state("sleep-wake")
+    elif S.SLEEP_WAKE_TS is not None and S.SLEEP_WAKE_TS > S.WAKE_HANDLED_TS:
+        # the journal follower logged the real [SLEEP-WAKE] line; apply the
+        # wake consequences here (once) so full capture re-arms after resume.
+        S.WAKE_HANDLED_TS = S.SLEEP_WAKE_TS
         _enter_full("sleep-wake", hold=FULL_MODE_WAKE)
         snapshot_state("sleep-wake")
     S.LAST_TICK = now
 
 
 def pm_probe():
-    """(PM, Слой 0) Throttled one-shot journal probe for systemd sleep
-    enter/wake lines, surfaced as [PM] [SLEEP-ENTER]/[SLEEP-WAKE] (the enter
-    side cannot be logged from the frozen process itself)."""
+    """(PM, Слой 0, v3.9 FIX-2) RECOVERY-ONLY poller: does nothing unless a
+    journal-confirmed enter is pending (S.SLEEP_PENDING) — i.e. the pre-freeze
+    follower armed a real sleep but its resume line was not consumed (follower
+    restart / journald hiccup). It then scans the recent systemd-suspend
+    journal for the WAKE that resolves it. It can NEVER emit a spurious
+    [SLEEP-ENTER] (enter detection belongs to the pre-freeze follower) and
+    never duplicates (once resolved pending is False, later polls are no-ops),
+    so steady-state stalls produce nothing."""
     now = time.monotonic()
     if now - S.LAST_PM_PROBE < SESS_INTERVAL:
         return
     S.LAST_PM_PROBE = now
-    out = run_cmd(["journalctl", "-n", "25", "--no-pager", "-o", "short-iso",
-                   "--since=-45s"], timeout=5)
+    if not S.SLEEP_PENDING:
+        return                       # no journal-confirmed sleep to resolve
+    from . import pm as PM   # lazy: keep module-load order cycle-free
+    out = run_cmd(["journalctl", "-u", PM.PM_JOURNAL_UNIT, "-n", "30",
+                   "--no-pager", "-o", "short-iso", "--since=-60s"], timeout=5)
     if not out:
         return
     for line in out.splitlines():
-        low = line.lower()
-        if "entering sleep state" in low or "suspending system" in low:
-            if not S.SLEEP_PENDING:
-                S.SLEEP_PENDING = True
-                log("PM: [SLEEP-ENTER] " + line.strip())
-        elif "system resumed" in low or ("restored" in low
-                                         and "sleep" in low):
-            if S.SLEEP_PENDING:
-                S.SLEEP_PENDING = False
-                log("PM: [SLEEP-WAKE] " + line.strip())
-                _enter_full("sleep-wake", hold=FULL_MODE_WAKE)
-                snapshot_state("sleep-wake")
+        if PM._classify(line) == "wake":
+            PM._pm_emit(line)        # clears pending + stamps S.SLEEP_WAKE_TS
+            return
 
 
 # ---------------------------------------------------------------------------

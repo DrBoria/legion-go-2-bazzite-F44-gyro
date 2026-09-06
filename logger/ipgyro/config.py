@@ -17,8 +17,10 @@ Design contract (Agent.md todo 52a, A1):
                      "LOGGER: config not found/invalid, using defaults" line.
   * Never crash: load() cannot raise.
 
-The [labels] defaults are EXACTLY the pre-52b marker strings so, with the stock
-config, output stays byte-comparable on this machine (P1-P10 contract intact).
+The [labels] defaults are the HUMAN v3.9 names (todo 52f FIX-1: controller /
+steam-deck / steam-deck-old / steam-controller) so, even with the stock config,
+a user reads clear device words instead of the cryptic legacy codes. Marker
+TOKENS ([DETACH]/[DOCK]/[SLEEP-*]/[DECK-DEAD]/...) remain byte-comparable.
 
 Shared mutable state is NOT kept here: app.main() calls load() once and stores
 the resulting Cfg on S.CFG (and applies conf-attribute overrides for the tunable
@@ -63,10 +65,12 @@ DEFAULTS = {
         "suspend_unit": "systemd-suspend",
     },
     "labels": {
-        "role_physical": "LEGION-SRC",
-        "role_deck_game": "DECK-GAME",
-        "role_deck_stale": "DECK-12FB",
-        "role_deck_desk": "DECK-DESK",
+        # v3.9 human device labels (todo 52f FIX-1) — the physical built-in
+        # controller + the virtual Steam Deck / Steam Controller Steam binds.
+        "role_physical": "controller",
+        "role_deck_game": "steam-deck",
+        "role_deck_stale": "steam-deck-old",
+        "role_deck_desk": "steam-controller",
         "cen_imu_name_hints": ["gyro", "imu", "gyro_3d"],
     },
 }

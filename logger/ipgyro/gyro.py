@@ -16,12 +16,12 @@ with the InputPlumber [gyro-center]/[CEN-GYRO] journal markers.
 R9 — gyro input-source switching (which source became active + WHY)
 -------------------------------------------------------------------
 The logger only ever SEES the effect of a gyro source switch (IIO lines vs
-LEGION-SRC XInput gyro bytes). gyro_src_scan() reads a recent window of the
+controller XInput gyro bytes). gyro_src_scan() reads a recent window of the
 InputPlumber journal and mirrors the lines that DECLARE the switch
 (gyro_center arbiter / gyro-handle / force_iio / iio center binding) as a
 [GYRO-SRC] marker, so the timeline shows WHICH source became active and WHY.
 It also emits a periodic [GYRO-SRC] verdict derived from the live observed
-state (center IIO present+active vs LEGION-SRC XInput gyro present) so the
+state (center IIO present+active vs controller XInput gyro present) so the
 active source is always stated even when InputPlumber logs nothing.
 
 Shared mutable state (S.IIO_DEVICES/S.CEN_IMU/S.GYRO_SRC/S.GYRO_SRC_LAST/

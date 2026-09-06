@@ -71,11 +71,14 @@ inputplumber_unit = "inputplumber"
 suspend_unit = "systemd-suspend"
 
 [labels]
-# Role -> display label (defaults == pre-52b strings so markers stay comparable).
-role_physical = "LEGION-SRC"
-role_deck_game = "DECK-GAME"
-role_deck_stale = "DECK-12FB"
-role_deck_desk = "DECK-DESK"
+# Role -> display label. v3.9 (todo 52f FIX-1): HUMAN names — the real
+# built-in controller + the virtual Steam Deck / Steam Controller Steam binds.
+# Marker TOKENS ([DETACH]/[DOCK]/[DECK-DEAD]/[SLEEP-*]/...) are NOT affected;
+# only these display labels changed.
+role_physical = "controller"
+role_deck_game = "steam-deck"
+role_deck_stale = "steam-deck-old"
+role_deck_desk = "steam-controller"
 # iio device name hints used to identify the attached CENTER body IMU (the
 # center / right_gyro slot source). Generic (no product), capability-based.
 cen_imu_name_hints = ["gyro", "imu", "gyro_3d"]

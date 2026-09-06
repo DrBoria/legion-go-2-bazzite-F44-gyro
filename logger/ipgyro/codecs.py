@@ -360,7 +360,7 @@ CODECS = (
     {
         "name": "steamdeck64",
         "kind": "deck-output",          # semantic family (see discover roles)
-        "label": "DECK-GAME",           # legacy default display label
+        "label": "steam-deck",          # v3.9 default display label (human)
         "header": DECK_HEADER_BYTES,
         "probe": probe_steamdeck64,
         "decode": decode_deck_report,
@@ -372,7 +372,7 @@ CODECS = (
     {
         "name": "xinput64",
         "kind": "physical-source",      # semantic family (see discover roles)
-        "label": "LEGION-SRC",          # legacy default display label
+        "label": "controller",          # v3.9 default display label (human)
         "header": LEGO_HEADER_BYTES,
         "probe": probe_xinput64,
         "decode": decode_lego_report,
