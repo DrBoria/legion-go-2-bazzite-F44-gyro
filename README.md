@@ -24,6 +24,86 @@ See the screenshot below:
 3. At the very top where it says **GENERAL** there will be **"choose gyro button(s)"**; click it and set it to **None (Gyro Always On)**.
 4. **Reason:** by default the gyro is only enabled while a specific button is held (like Push-to-Talk), so without this change the gyro appears dead.
 
+## What's new in v12
+
+**v12** is a **documentation + reference-data** release on top of the logger-only work
+(`v3.7` → `v3.16`, commits `bbf3c88` → `d379846`). The InputPlumber binary is **unchanged** —
+still the same build shipped with v11. v12 adds two things:
+
+### 1. Reference log `ip-gyro-logger.log` — committed as-is, do NOT open it
+
+[`ip-gyro-logger.log`](ip-gyro-logger.log) is a **reference log** committed to this repository
+**as-is** — byte-for-byte, never opened or altered (~30 MB). It is exactly the session recorded
+in the accompanying video: the same detach/dock, sleep/wake and in-game runs that the video
+shows. Treat it as raw reference data only:
+
+- **do not open / read / tail it manually** — it exists solely as a git-stored reference
+  artifact so the recorded session stays available verbatim in the repository;
+- it is the ground truth that the video and the hop-tracking explanation below refer to.
+
+### 2. The logger's hop-based tracking (H0 → H1 → H2 → H3) — how to read it
+
+Since `v3.13` the logger no longer reports «not provable» when a game is running and detectable:
+it **proves WHERE in the chain each data type stops being delivered to the game**, hop by hop,
+with quoted evidence on every line. Delivery is tracked **per data type** — buttons,
+sticks/triggers, and gyro (whose physical source at H0 is split between the **center** body IMU
+and the **right-handle** device) — as a yes/no per stage, and the **first hop that stops
+delivering** is reported as `lost at Hn: <evidence>` (forensics tables use the per-type columns
+buttons / sticks / gyro-center / gyro-right). The four hops:
+
+- **H0 — physical source.** Gyro: while the controllers are attached, the center body IMU
+  travels in the XInput `right_gyro` slot (bytes 54–59, non-zero when moving; `left_gyro` is
+  dead); when the right handle detaches, the gyro is its own `17ef:61ed` device
+  (`gyro_carrier=right-handle`). Buttons/sticks: the physical controller source is present.
+- **H1 — deck → Steam.** The virtual Steam Deck (`deck-uhid`, `28de:12f0`) carries the
+  motion/actions into Steam. Proven by the deck counters — IMU `mot/s` > 0 while physically
+  moving means the deck is emitting gyro to Steam (in gaming mode there is no `deck-uhid`
+  channel, so H1 is treated as not applicable there and delivery is proven on the pad instead).
+- **H2 — Steam routing / active config.** Which Steam Input config Steam applies to the deck:
+  `[STEAM-CONFIG]` active appid = `GAME:<appid>` (e.g. ESO `306130`) vs the desktop `413080`.
+  Key logic: if a game process is running (detectable via `SteamAppId` in `/proc`) but Steam's
+  active config / focus is not that game's appid, Steam is **not** routing the deck through the
+  game's config → input (incl. gyro) does not reach the game. That is a proven loss
+  (`[STEAM-FOCUS-LOST-GAME]`), never «not provable».
+- **H3 — Steam virtual pad → game.** Steam writes the config-processed result to its **own**
+  virtual pad `28de:11ff`. Gyro is provable there only as gyro-axis `ABS_RX`/`ABS_RY` pad events
+  while the real game holds the pad fd (`[GYRO→PAD-AXIS]`); buttons/sticks as `pad_key/s` +
+  `pad_abs/s` (`[PAD→GAME]`). If the game config is active but the pad carries no gyro-axis while
+  the deck moves, the gyro is lost at H3.
+
+Per-second compact chains look like
+`[FLOW] gyro:H0ok,H1ok,H2game,H3ok|btns:...|stx:...`, and the full verdicts with quoted evidence
+are emitted as `[GYRO-FLOW]` / `[BTNS-FLOW]` / `[STX-FLOW]` (the SNAPSHOT lines also carry a
+`flow=` chain). Every «yes» or «no» is traced back to a real counter — nothing is guessed.
+
+**Gyro output is binding-aware** (`v3.16`). The gyro verdict is decoupled from buttons/sticks,
+because the gyro's OUTPUT is decided by the ACTIVE Steam config's gyro binding (parsed from the
+active controller vdf, `[GYRO-BINDING]`):
+
+- `pad-axes` → gyro is proven via pad `ABS_RX`/`ABS_RY` (`[GYRO→PAD-AXIS]`) — this is what the
+  configs on this host bind (game `306130` group 30 and desktop `413080` group 19, both
+  `gyro_to_joystick`);
+- `mouse` → gyro is proven via mouse-injection motion (`[GYRO→MOUSE]`); a `0` pad-gyro-axis is
+  **never** reported as a loss in this case, because the gyro is simply not on the pad;
+- `disabled` → verdict `none` — gyro is off by config (a config fact, not a transport loss).
+
+If Steam's focus falls to the desktop config (`413080`) while the game runs: with a **mouse**
+binding that is a gyro *re-domain* to the desktop pointer (not a transport loss), but with any
+other binding (`pad-axes` / `disabled`) it is reported honestly as a routing loss at H2 — that
+data type stops reaching the game like every other. Nothing is labelled «re-domain» unless the
+active config genuinely binds gyro to mouse.
+
+**Markers and event numbering used in forensics.** Mode is tracked as desktop | gaming
+(`[MODE]` / `SESSION` / `STATE` markers). Sleep and wake are bracketed by
+`[SLEEP-ENTER]` / `[SLEEP-WAKE]`; detach and dock by `[DETACH]` / `[DOCK]`. In the per-stage
+forensics tables every physical event is **numbered sequentially** — `detach#N` / `dock#N` /
+`sleep#N` — and `[DETACH-SUPPRESSED]` is clearly marked as a wake-boundary re-enumeration, NOT a
+detach. After wake, `[STEAM-CONFIG]` + `[STEAM-FOCUS-DROP-AFTER-WAKE]` and the per-wake
+classification `[WAKE-GYRO-STATE]` (routing-lost@wake / routing-re-domain / as-mouse /
+config-disabled / regained / …) let every yes/no cell be traced to a concrete log line, a
+monotonic timestamp and the boot. The whole goal of the tracking: **locate the FIRST hop where
+each data type stops being delivered to the game** — that is exactly where the chain is broken.
+
 ## What's new in v11
 
 **v11** is the current release — the **first InputPlumber binary change since v9** (v9/v10/v10.1 all shipped the same `c9a4bfa8` build). New prebuilt binary sha256:
