@@ -91,17 +91,19 @@ INSTALLED_BINARY="$INSTALL_DIR/inputplumber-legiongo2"
 # [single-path] marker.
 # Instrumentation: [reconcile] / [mgr-rm] / [mgr-add] / [single-path] markers in
 # journalctl. Verified after install — a mismatch only warns, never aborts.
-EXPECTED_SHA256="7599c9c7786265f9b1ca1bad0e3e566377dba4b296070549cfe83825d611ee81"
+# 2026-09-07 (todo 53a impl): FIX-1/FIX-2 deck-feed re-arm after source re-add/dock
+# (steam_deck_uhid.rs poll Empty-branch + always-close config handshake; mod.rs
+# on_source_device_added feed-rearm marker + targets.rs rearm_deck_feed helper).
+# Rollback = 7599c9c7... (V21 single-path).
+EXPECTED_SHA256="b75def45f072690f4d2151213379c4d067f2cf2e84591e2e83173ae8fee05b92"
 
 # Resolve which source binary to install, in priority order:
-#   1) the fix binary shipped next to install.sh (once added to the repo/tarball)
+#   1) the fix binary shipped next to install.sh (the repo/tarball payload)
 #   2) the current fix build in the InputPlumber workspace (used while testing)
-#   3) the legacy repo binary (kept as a last-resort fallback; sha is verified)
 SOURCE_BINARY=""
 for cand in \
     "$BASE_DIR/inputplumber-legiongo2" \
-    "/home/legion/ip-build/InputPlumber/inputplumber-legiongo2" \
-    "$BASE_DIR/inputplumber-legiongo2-gyro"
+    "/home/legion/ip-build/InputPlumber/inputplumber-legiongo2"
 do
     if [[ -x "$cand" ]]; then
         SOURCE_BINARY="$cand"

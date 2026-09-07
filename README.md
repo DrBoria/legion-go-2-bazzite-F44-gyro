@@ -26,9 +26,15 @@ See the screenshot below:
 
 ## What's new in v12
 
-**v12** is a **documentation + reference-data** release on top of the logger-only work
-(`v3.7` → `v3.16`, commits `bbf3c88` → `d379846`). The InputPlumber binary is **unchanged** —
-still the same build shipped with v11. v12 adds two things:
+**v12** is the current release. On top of the logger-only work
+(`v3.7` → `v3.16`, commits `bbf3c88` → `d379846`) it ships the **updated prebuilt binary** with the
+**FIX-1/FIX-2 deck-feed re-arm** (todo 53a/53b): after a source detach/dock the deck-uhid write path
+is re-armed so InputPlumber resumes feeding frames instead of stalling until the next re-attach.
+The binary is **not committed in this repository** — it is provided only as the
+`inputplumber-legiongo2-gyro-v12.tar.gz` **release asset** (sha256
+`b75def45f072690f4d2151213379c4d067f2cf2e84591e2e83173ae8fee05b92`). The repo keeps sources,
+install tooling, the diagnostic logger and the reference log only.
+It also adds two documentation/reference items:
 
 ### 1. Reference log `ip-gyro-logger.log` — committed as-is, do NOT open it
 
@@ -302,12 +308,12 @@ single file (`cat /var/log/ip-gyro-logger.log`) — see the
 
 ## Install (prebuilt binary)
 
-Download **`inputplumber-legiongo2-gyro-v10.1.tar.gz`** from the **Releases** page, extract it and run:
+Download **`inputplumber-legiongo2-gyro-v12.tar.gz`** from the **Releases** page, extract it and run:
 
 ```bash
-tar xzf inputplumber-legiongo2-gyro-v10.1.tar.gz
+tar xzf inputplumber-legiongo2-gyro-v12.tar.gz
 ./install.sh        # plain install — binary + profile + power fixes + auto gyro-reset unit, restarts inputplumber, ensures the logger is OFF
-./install.sh --log  # ONE command: same as above PLUS installs & enables the v3.3 diagnostic logger, which captures EVERYTHING into /var/log/ip-gyro-logger.log
+./install.sh --log  # ONE command: same as above PLUS installs & enables the v3.16 diagnostic logger, which captures EVERYTHING into /var/log/ip-gyro-logger.log
 ```
 
 > Run `install.sh` as your regular (non-root) user — it uses `sudo` internally and refuses
@@ -448,11 +454,10 @@ To fine-tune or reproduce the debugging, see [Agent.md](Agent.md) — it documen
 ## Repository contents
 
 - `patches/inputplumber-legion-go-2-bazzite.patch` — the complete source patch (all changes vs upstream base)
-- `inputplumber-legiongo2` — prebuilt current fix binary (**V21**, single-path); sha256 `7599c9c7786265f9b1ca1bad0e3e566377dba4b296070549cfe83825d611ee81` (canonical clean name; the stale `-v4.resume-gamefix` fork-label was dropped)
-- `inputplumber-legiongo2-gyro` — legacy prebuilt binary (v8.1-era, sha256 `0618564a6194f89ca8039f4db56996ac43e05c05a23f2f80d03bbea2022689ca`), kept as the `install.sh` last-resort fallback (no FIX A)
+- **no prebuilt binary is committed in this repo** — the current fix build (**V21 single-path + FIX-1/FIX-2 deck-feed re-arm**, 53a/53b; sha256 `b75def45f072690f4d2151213379c4d067f2cf2e84591e2e83173ae8fee05b92`) ships only as the `inputplumber-legiongo2-gyro-v12.tar.gz` [release asset](https://github.com/DrBoria/legion-go-2-bazzite-F44-gyro/releases)
 - `50-legion_go_2.yaml` — composite device profile (routes the device to the `deck` target so it is seen as a Steam Deck with gyro)
 - `install.sh` — install / update script with two modes (plain vs `--log`) for the optional diagnostic logger (binary + profile + gain override + suspend/resume power fixes + boot-time Steam gyro auto-reset unit)
-- `logger/` — passive diagnostic logger (**v3.6**: thin launcher `ip-gyro-logger.py` + `ipgyro/` package), installed by `./install.sh --log` (see [Diagnostic logger](#diagnostic-logger-v33-optional))
+- `logger/` — passive diagnostic logger (**v3.16**: thin launcher `ip-gyro-logger.py` + `ipgyro/` package), installed by `./install.sh --log` (see [Diagnostic logger](#diagnostic-logger-v33-optional))
 - `steam-deck-uhid-gyro-reset.service` — oneshot unit that clears Steam's virtual gamepad registry at boot (installed & enabled by install.sh) so the deck controller re-registers with IMU/gyro initialized after Bazzite updates
 - `Agent.md` — full debugging log: hypotheses, measurements, reproduction steps
 - `steam-input-ref.png` — Steam Input reference screenshot
