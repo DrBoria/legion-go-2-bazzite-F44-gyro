@@ -2,6 +2,8 @@
 
 Gyro fix for the **Lenovo Legion Go 2** on **Bazzite (Fedora 44)**, based on a modified [InputPlumber](https://github.com/ShadowBlip/InputPlumber) build from source.
 
+**v13** rebases the fix onto upstream **InputPlumber v0.79.1** (previous releases were based on v0.77.4). Upstream's Go1/Go2 driver split, its own Legion Go 2 suspend handling and the Steam Deck debounce removal are adopted; our gyro calibration, live attach/detach, source arbiter and suspend/deck-feed hardening are kept on top.
+
 ## What it fixes
 
 - Controllers **attached** → the **central** gyro is active.
@@ -17,10 +19,10 @@ Open the Steam overlay → **Gyro Behavior** → gear icon → **General / choos
 
 ## Install
 
-Download **`inputplumber-legiongo2-gyro-v12.tar.gz`** from the [Releases](https://github.com/DrBoria/legion-go-2-bazzite-F44-gyro/releases) page, extract it and run as your regular user (sudo is used internally):
+Download **`inputplumber-legiongo2-gyro-v13.tar.gz`** from the [Releases](https://github.com/DrBoria/legion-go-2-bazzite-F44-gyro/releases) page, extract it and run as your regular user (sudo is used internally):
 
 ```bash
-tar xzf inputplumber-legiongo2-gyro-v12.tar.gz
+tar xzf inputplumber-legiongo2-gyro-v13.tar.gz
 ./install.sh        # binary + profile + gains + suspend/resume fixes + gyro auto-reset
 ./install.sh --log  # same, plus installs & enables the diagnostic logger
 ```
@@ -46,9 +48,12 @@ The optional logger is one command: `./install.sh --log` captures everything int
 
 ## Build from source
 
+The patch applies on top of upstream **InputPlumber v0.79.1** (see `SOURCE_BASE_COMMIT`):
+
 ```bash
 git clone https://github.com/ShadowBlip/InputPlumber
 cd InputPlumber
+git checkout 0ca9869   # v0.79.1
 git apply ../legion-go-2-bazzite-F44-gyro/patches/inputplumber-legion-go-2-bazzite.patch
 cargo build --release
 # result: target/release/inputplumber

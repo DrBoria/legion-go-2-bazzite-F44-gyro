@@ -63,12 +63,18 @@ INSTALL_DIR="/opt/inputplumber-legiongo2-runtime"
 # suffixes were removed — they carried no meaning and confused.
 INSTALLED_BINARY="$INSTALL_DIR/inputplumber-legiongo2"
 
-# Expected sha256 of the CURRENT fix binary — V21 (single-path).
+# Expected sha256 of the CURRENT fix binary — v13 (rebase onto InputPlumber v0.79.1).
 #
-# V21 = the single-path build: the legacy dual-path architecture (orchestrator /
-# HealthChecker / event-bus, selected by IP_ORCHESTRATOR) has been REMOVED from
-# the source. There is exactly ONE lifecycle path now: the always-on
-# manager/composite layer.
+# v13 = our custom Legion Go 2 gyro work REBASED (merged) onto upstream
+# InputPlumber v0.79.1 (previous releases were based on v0.77.4). Upstream's
+# go1/go2 driver split (913f12c), its own Legion Go 2 suspend fix (88c547a) and
+# the steam-deck debounce removal (50263d3) are adopted; our unique logic is
+# kept: gyro calibration (RIGHT_GYRO_SCALE/CENTER_GYRO_SCALE, center from right
+# slot), live attach/detach via legion_state, gyro_center IIO<->XInput arbiter,
+# composite keep-alive/reconcile + deck-feed re-arm (FIX-1/FIX-2), deck-uhid
+# survives suspend, monotonic frame counter, publish-settle, LG2 -> Generic
+# 0x12f0 override. Binary sha 31284eb5...
+EXPECTED_SHA256="31284eb54fbcf1bd1f5b11b2183aa706f9363122608f09545a55422171876bf8"
 #
 # Behaviour preserved from V20 (6b578eb2), which self-healed a physical detach
 # on the desktop in <=2s without touching the deck-uhid:
@@ -94,8 +100,9 @@ INSTALLED_BINARY="$INSTALL_DIR/inputplumber-legiongo2"
 # 2026-09-07 (todo 53a impl): FIX-1/FIX-2 deck-feed re-arm after source re-add/dock
 # (steam_deck_uhid.rs poll Empty-branch + always-close config handshake; mod.rs
 # on_source_device_added feed-rearm marker + targets.rs rearm_deck_feed helper).
-# Rollback = 7599c9c7... (V21 single-path).
-EXPECTED_SHA256="b75def45f072690f4d2151213379c4d067f2cf2e84591e2e83173ae8fee05b92"
+# Rollback: previous release (v12) binary is kept as
+# inputplumber-legiongo2.bak-v12 in the runtime dir — copy it back over the
+# installed binary and `systemctl restart inputplumber` to roll back.
 
 # Resolve which source binary to install, in priority order:
 #   1) the fix binary shipped next to install.sh (the repo/tarball payload)
@@ -168,7 +175,7 @@ source_sha="$(sha256sum "$SOURCE_BINARY" | awk '{print $1}')"
 if [[ "$source_sha" == "$EXPECTED_SHA256" ]]; then
     echo "Source binary sha256 OK ($source_sha)"
 else
-    echo "WARNING: source binary sha256 mismatch — this is NOT the current V21 (single-path) build:"
+    echo "WARNING: source binary sha256 mismatch — this is NOT the current v13 (0.79.1-based) build:"
     echo "  expected: $EXPECTED_SHA256"
     echo "  actual:   $source_sha"
 fi
