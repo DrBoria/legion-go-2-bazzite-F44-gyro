@@ -17,7 +17,7 @@ index e32d2f3..85a04e0 100644
  [Install]
  WantedBy=sleep.target
 diff --git a/src/config/mod.rs b/src/config/mod.rs
-index f62a9eb..b96aaf2 100644
+index 4a8477d..1992e6c 100644
 --- a/src/config/mod.rs
 +++ b/src/config/mod.rs
 @@ -185,8 +185,47 @@ pub struct CompositeDeviceConfigOptions {
@@ -68,7 +68,7 @@ index f62a9eb..b96aaf2 100644
  }
  
  /// Defines a platform match for loading a [CompositeDeviceConfig]
-@@ -496,6 +535,25 @@ impl CompositeDeviceConfig {
+@@ -513,6 +552,25 @@ impl CompositeDeviceConfig {
          Self::from_yaml(content)
      }
  
@@ -383,30 +383,19 @@ index 0000000..ec194be
 +}
 +
 diff --git a/src/drivers/iio_imu/driver.rs b/src/drivers/iio_imu/driver.rs
-index 9e23672..5ca137a 100644
+index b7231d9..9cdf1bc 100644
 --- a/src/drivers/iio_imu/driver.rs
 +++ b/src/drivers/iio_imu/driver.rs
-@@ -1,8 +1,6 @@
+@@ -1,7 +1,7 @@
  use std::{
-     collections::{HashMap, HashSet},
+     collections::HashSet,
      error::Error,
--    fs::File,
--    io::{self, BufRead, BufReader},
- };
- 
- use industrial_io::{Channel, ChannelType, Device, Direction};
-@@ -96,9 +94,7 @@ impl Driver {
-             if channels.is_empty() {
-                 continue;
-             }
--            if let Err(err) =
--                set_sample_rate_or_default(&device, channels, ch_type, sample_rate)
--            {
-+            if let Err(err) = set_sample_rate_or_default(&device, channels, ch_type, sample_rate) {
-                 log::warn!("Failed to set sample rate: {err}, falling back to max available");
-                 set_sample_rate_max(&device, channels, ch_type);
-             }
-@@ -123,43 +119,81 @@ impl Driver {
+-    fmt, fs,
++    fmt,
+     path::PathBuf,
+     thread,
+     time::{Duration, Instant},
+@@ -123,35 +123,81 @@ impl Driver {
          self.filtered_events = events;
      }
  
@@ -440,23 +429,8 @@ index 9e23672..5ca137a 100644
      pub fn get_default_event_filter(
          &self,
      ) -> Result<HashSet<Capability>, Box<dyn Error + Send + Sync>> {
--        let filtered_events = match is_driver_loaded("hid_lenovo_go") {
--            Ok(true) => {
--                log::debug!("Found hid-lenovo-go driver. Disabling internal gyroscope.");
--                HashSet::from([
--                    Capability::Accelerometer(Source::Center),
--                    Capability::Gyroscope(Source::Center),
--                ])
--            }
--            Ok(false) => {
--                log::debug!("Did not find hid-lenovo-go driver. Enabling internal gyroscope.");
--                HashSet::new()
--            }
--            Err(e) => {
--                return Err(format!("Failed to read '/proc/modules': {e:?}").into());
--            }
--        };
--        Ok(filtered_events)
+-        match fs::read_to_string("/proc/modules") {
+-            Ok(modules) if modules.contains("hid_lenovo_go") => Ok(HashSet::from([
 +        // fix (b): NOT ROUND 6's unconditional center filter — the decision now
 +        // lives in the gyro_center proxy (use_iio_for_center).
 +        Ok(Self::desired_center_filter())
@@ -470,182 +444,67 @@ index 9e23672..5ca137a 100644
 +            HashSet::new()
 +        } else {
 +            HashSet::from([
-+                Capability::Accelerometer(Source::Center),
-+                Capability::Gyroscope(Source::Center),
+                 Capability::Accelerometer(Source::Center),
+                 Capability::Gyroscope(Source::Center),
+-            ])),
+-            Ok(_) => Ok(HashSet::new()),
+-            Err(e) => Err(format!("Failed to read '/proc/modules': {e:?}").into()),
 +            ])
-+        }
+         }
      }
  
--    /// Poll the device for data
+-    /// Skips a group's event if unchanged since the last poll; paces total call time to poll_interval.
 +    /// Poll the device for data.
 +    ///
 +    /// fix (b): also runs the gyro_center arbitration (evaluate) and ALWAYS
 +    /// reads the accelerometer to feed `report_iio_accel` — gravity in the IIO
 +    /// accel proves the device is alive. The accel is only EMITTED when not
 +    /// filtered; the gyro (no health value) is read only when not filtered.
-     pub fn poll(&self) -> Result<Vec<Event>, Box<dyn Error + Send + Sync>> {
+     pub fn poll(&mut self) -> Result<Vec<Event>, Box<dyn Error + Send + Sync>> {
 +        crate::drivers::gyro_center::evaluate();
 +
-         let mut events = vec![];
+         let start = Instant::now();
  
--        // Read from the accelerometer
--        if !self
--            .filtered_events
--            .contains(&Capability::Accelerometer(Source::Center))
+         self.source.read_one(&mut self.record_buf)?;
+ 
+         let mut events = Vec::new();
+ 
+-        if !self.layout.accel.is_empty()
+-            && !self
+-                .filtered_events
+-                .contains(&Capability::Accelerometer(Source::Center))
 -        {
--            if let Some(event) = self.poll_accel()? {
 +        // Accelerometer: always polled for the [gyro-center] health feed, but
 +        // emitted only when the center accel is not filtered.
-+        if let Some(event) = self.poll_accel()? {
-+            if let Event::Accelerometer(accel) = &event {
-+                crate::drivers::gyro_center::report_iio_accel(accel.roll, accel.pitch, accel.yaw);
-+            }
-+            if !self
-+                .filtered_events
-+                .contains(&Capability::Accelerometer(Source::Center))
++        if !self.layout.accel.is_empty() {
+             let mut data = decode_group(&self.layout.accel, self.accel_scale, &self.record_buf);
+             self.rotate_value(&mut data);
+-            if self.accel_state.as_ref() != Some(&data) {
++            crate::drivers::gyro_center::report_iio_accel(data.roll, data.pitch, data.yaw);
++            if self.accel_state.as_ref() != Some(&data)
++                && !self
++                    .filtered_events
++                    .contains(&Capability::Accelerometer(Source::Center))
 +            {
-                 events.push(event);
+                 self.accel_state = Some(data.clone());
+                 events.push(Event::Accelerometer(data));
              }
-         }
- 
--        // Read from the gyro
-+        // Gyro: no health value, so only poll (and emit) when not filtered.
-         if !self
-             .filtered_events
-             .contains(&Capability::Gyroscope(Source::Center))
-@@ -354,19 +388,6 @@ fn get_channels_with_type(
-     (channels, channel_info)
- }
- 
--fn is_driver_loaded(driver_name: &str) -> io::Result<bool> {
--    let file = File::open("/proc/modules")?;
--    let reader = BufReader::new(file);
--
--    for line in reader.lines() {
--        let line = line?;
--        if line.starts_with(driver_name) {
--            return Ok(true);
--        }
--    }
--    Ok(false)
--}
--
- /// Try to set a specific or default sampling rate. Returns Err if the
- /// requested rate is not in the hardware's available list.
- fn set_sample_rate_or_default(
-@@ -379,10 +400,7 @@ fn set_sample_rate_or_default(
-     let avail = read_sample_rates_available(device, channels, &channel_type);
- 
-     if !avail.is_empty() && !avail.contains(&rate) {
--        return Err(format!(
--            "Requested {rate} Hz not in available rates: {avail:?}"
--        )
--        .into());
-+        return Err(format!("Requested {rate} Hz not in available rates: {avail:?}").into());
-     }
- 
-     write_sample_rate(device, channels, channel_type, rate)
-@@ -397,9 +415,7 @@ fn set_sample_rate_max(
- ) {
-     let avail = read_sample_rates_available(device, channels, &channel_type);
-     let rate = if avail.is_empty() {
--        log::warn!(
--            "No available sample rates reported, using default {DEFAULT_SAMPLE_RATE} Hz"
--        );
-+        log::warn!("No available sample rates reported, using default {DEFAULT_SAMPLE_RATE} Hz");
-         DEFAULT_SAMPLE_RATE
-     } else {
-         let max = avail.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-@@ -434,9 +450,7 @@ fn write_sample_rate(
-                 return Ok(());
-             }
-             Err(err) => {
--                log::warn!(
--                    "Per-channel sampling_frequency write failed for {id}: {err}"
--                );
-+                log::warn!("Per-channel sampling_frequency write failed for {id}: {err}");
-             }
-         }
-     }
-@@ -450,9 +464,7 @@ fn write_sample_rate(
-     device.attr_write_float(attr, rate)?;
-     match device.attr_read_float(attr) {
-         Ok(actual) => log::info!("Set device-level {attr} to {actual} Hz"),
--        Err(err) => log::warn!(
--            "Set {attr} but read-back failed: {err}, assuming {rate} Hz"
--        ),
-+        Err(err) => log::warn!("Set {attr} but read-back failed: {err}, assuming {rate} Hz"),
-     }
-     Ok(())
- }
-diff --git a/src/drivers/legion_state.rs b/src/drivers/legion_state.rs
-new file mode 100644
-index 0000000..867c2ca
---- /dev/null
-+++ b/src/drivers/legion_state.rs
-@@ -0,0 +1,47 @@
-+//! Shared attach/detach state for Legion Go 2 controllers.
-+//!
-+//! The lego driver publishes the current docked/detached state here (derived
-+//! from XInput report bytes 12-13, `l_con_state`/`r_con_state`). Other drivers
-+//! in the same process (e.g. iio_imu) read it to decide which gyro source is
-+//! active — WITHOUT any blocking USB/sysfs reads that could wedge the hub.
-+
-+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-+
-+/// Default assumption: controllers are DOCKED (attached). This matches the most
-+/// common boot scenario (console in dock with ESO running). If the user boots
-+/// detached, the first XInput report (~10 ms) will correct this.
-+static ATTACHED: AtomicBool = AtomicBool::new(true);
-+
-+/// 0 = state has never been published yet; 1+ = at least one publish happened.
-+static STATE_SET: AtomicU8 = AtomicU8::new(0);
-+
-+/// Publish the current attach state. Called by the lego driver whenever it sees
-+/// a change in `l_con_state` (or on its very first report).
-+pub fn set_attached(attached: bool) {
-+    let _ = ATTACHED.swap(attached, Ordering::Relaxed);
-+    STATE_SET.store(1, Ordering::Release);
-+    // The atomics above remain the single source of truth for the
-+    // gyro-source arbiter (iio_imu reads them via is_attached() /
-+    // is_attached_or_default()). There is no orchestrator event bus to
-+    // notify in the single-path build.
-+}
-+
-+/// Returns the published attach state.
-+/// - `None`: no XInput report has been received yet (driver just started).
-+/// - `Some(true)`: controllers are docked/attached.
-+/// - `Some(false)`: controllers are detached/wireless.
-+pub fn is_attached() -> Option<bool> {
-+    if STATE_SET.load(Ordering::Acquire) == 0 {
-+        return None;
-+    }
-+    Some(ATTACHED.load(Ordering::Relaxed))
-+}
-+
-+/// Convenience: returns the attach state, defaulting to `true` (docked) if no
-+/// report has been received yet. Useful for initial filter setup.
-+pub fn is_attached_or_default() -> bool {
-+    match is_attached() {
-+        Some(v) => v,
-+        None => true,
-+    }
-+}
-diff --git a/src/drivers/lego/go2_driver.rs b/src/drivers/lego/go2_driver.rs
-index fddb1a7..a4bd0c1 100644
---- a/src/drivers/lego/go2_driver.rs
-+++ b/src/drivers/lego/go2_driver.rs
-@@ -13,16 +13,79 @@ use super::{
+diff --git a/src/drivers/legion_go/go2_driver.rs b/src/drivers/legion_go/go2_driver.rs
+index 2ba7d77..10ca04c 100644
+--- a/src/drivers/legion_go/go2_driver.rs
++++ b/src/drivers/legion_go/go2_driver.rs
+@@ -13,7 +13,7 @@ use super::{
          AxisEvent, BinaryInput, Event, GamepadButtonEvent, ImuAxisInput, JoyAxisInput,
-         MouseWheelInput, TouchAxisInput, TouchButtonEvent, TriggerEvent, TriggerInput,
+         MouseWheelInput, TriggerEvent, TriggerInput,
      },
 -    hid_report::{GamepadMode, XInputDataReport},
--    CLICK_DELAY, DEFAULT_EVENT_FILTER, GO2_PIDS, GP_IID, HID_TIMEOUT, PAD_FORCE_NORMAL,
--    RELEASE_DELAY, VID, XINPUT_COMMAND_ID, XINPUT_DATA, XINPUT_PACKET_SIZE,
 +    hid_report::{ConnectedState, GamepadMode, XInputDataReport},
-+    CLICK_DELAY, GO2_PIDS, GP_IID, HID_TIMEOUT, PAD_FORCE_NORMAL, RELEASE_DELAY, VID,
-+    XINPUT_COMMAND_ID, XINPUT_DATA, XINPUT_PACKET_SIZE,
+     DEFAULT_EVENT_FILTER, GAMEPAD_TIMEOUT, GO2_PIDS, GP_IID, VID, XINPUT_COMMAND_ID, XINPUT_DATA,
+     XINPUT_PACKET_SIZE,
  };
+@@ -40,6 +40,71 @@ pub fn get_legion_go_gen() -> Result<LegionGoGen, Box<dyn Error + Send + Sync>>
+     }
+ }
  
 +// [v4.1] RightGyro (detached right handle) output scale. The handle DOES go
 +// through steam_deck's IP_GYRO_GAIN_HANDLE (merged Gamepad::Gyro path), so the
@@ -715,21 +574,8 @@ index fddb1a7..a4bd0c1 100644
  pub struct Driver {
      /// HIDRAW device instance
      hid_device: HidDevice,
--    /// Udev device instance
--    udev_device: UdevDevice,
-     /// List of events that should not be generated
-     filtered_events: HashSet<Capability>,
-     /// Timestamp of the first touch event.
-@@ -55,7 +118,6 @@ impl Driver {
-         }
- 
-         Ok(Self {
--            udev_device,
-             hid_device,
-             filtered_events: Default::default(),
-             first_touch: Instant::now(),
-@@ -75,34 +137,92 @@ impl Driver {
-         self.filtered_events = events;
+@@ -89,28 +154,92 @@ impl Driver {
+         self.gen
      }
  
 -    pub fn get_default_event_filter(
@@ -764,7 +610,11 @@ index fddb1a7..a4bd0c1 100644
 +            );
 +            crate::drivers::legion_state::set_attached(attached);
 +        }
-+
+ 
+-        let filtered_events = match driver {
+-            "hid-lenovo-go" => HashSet::from(HID_LENOVO_GO_FILTER),
+-            _ => HashSet::from(DEFAULT_EVENT_FILTER),
+-        };
 +        // Rebuild the desired filter every iteration: it depends on the shared
 +        // attach state AND on the gyro_center proxy's live source decision
 +        // (which can change without any attach change). Return it only when it
@@ -792,8 +642,7 @@ index fddb1a7..a4bd0c1 100644
 +        }
 +    }
  
--        let filtered_events = match driver {
--            "hid-lenovo-go" => HashSet::from([
+-        Ok(filtered_events)
 +    pub fn get_default_event_filter(
 +        &self,
 +    ) -> Result<HashSet<Capability>, Box<dyn Error + Send + Sync>> {
@@ -813,16 +662,10 @@ index fddb1a7..a4bd0c1 100644
 +            //  - IIO selected (fallback/override): FILTER the center here so the
 +            //    IIO accel_3d/gyro_3d become the sole center IMU source.
 +            let mut filter = HashSet::from([
-                 Capability::Accelerometer(Source::Left),
-                 Capability::Accelerometer(Source::Right),
-                 Capability::Gyroscope(Source::Left),
-                 Capability::Gyroscope(Source::Right),
--            ]),
--
--            _ => HashSet::from(DEFAULT_EVENT_FILTER),
--        };
--
--        Ok(filtered_events)
++                Capability::Accelerometer(Source::Left),
++                Capability::Accelerometer(Source::Right),
++                Capability::Gyroscope(Source::Left),
++                Capability::Gyroscope(Source::Right),
 +            ]);
 +            if crate::drivers::gyro_center::use_iio_for_center() {
 +                filter.insert(Capability::Accelerometer(Source::Center));
@@ -841,7 +684,7 @@ index fddb1a7..a4bd0c1 100644
      }
  
      /// Poll the device and read input reports
-@@ -185,6 +305,16 @@ impl Driver {
+@@ -195,6 +324,16 @@ impl Driver {
              return events;
          };
  
@@ -858,19 +701,18 @@ index fddb1a7..a4bd0c1 100644
          // Translate state changes into events if they have changed
          if let Some(old_state) = old_state {
              if state.gamepad_mode != old_state.gamepad_mode {
-@@ -486,11 +616,17 @@ impl Driver {
+@@ -503,11 +642,16 @@ impl Driver {
                      || state.right_gyro_y != old_state.right_gyro_y
                      || state.right_gyro_z != old_state.right_gyro_z)
              {
 -                events.push(Event::Axis(AxisEvent::RightGyro(ImuAxisInput {
 -                    pitch: -state.right_gyro_x,
--                    roll: state.right_gyro_y,
--                    yaw: state.right_gyro_z,
+-                    roll: -state.right_gyro_y,
+-                    yaw: -state.right_gyro_z,
 -                })))
-+                // [v4.1] Handle (RightGyro, detached): same SHARED mapping as the
-+                // center, scaled in-driver by RIGHT_GYRO_SCALE=0.15; the final
-+                // sensitivity is then applied by steam_deck's
-+                // IP_GYRO_GAIN_HANDLE (0.15 x 5.0 = 0.75, x4 raw = center match).
++                // [v13] Upstream v0.82.0 axis mapping (SI) with our handle scale
++                // on top. Final sensitivity is set by steam_deck's
++                // IP_GYRO_GAIN_HANDLE env gain.
 +                let out = map_gyro_axes(
 +                    state.right_gyro_x,
 +                    state.right_gyro_y,
@@ -881,33 +723,29 @@ index fddb1a7..a4bd0c1 100644
              }
  
              if !self
-@@ -503,11 +639,20 @@ impl Driver {
+@@ -520,16 +664,29 @@ impl Driver {
                      || state.right_gyro_y != old_state.right_gyro_y
                      || state.right_gyro_z != old_state.right_gyro_z)
              {
 -                events.push(Event::Axis(AxisEvent::MultiGyro(ImuAxisInput {
 -                    pitch: -(state.left_gyro_x + state.right_gyro_x) / 2,
--                    roll: (state.left_gyro_y + state.right_gyro_y) / 2,
--                    yaw: (state.left_gyro_z + state.right_gyro_z) / 2,
+-                    roll: -(state.left_gyro_y + state.right_gyro_y) / 2,
+-                    yaw: match self.gen {
+-                        LegionGoGen::Gen2 => -(state.left_gyro_z + state.right_gyro_z) / 2,
+-                        LegionGoGen::Gen1 => (state.left_gyro_z - state.right_gyro_z) / 2,
+-                    },
 -                })))
-+                // [v4] Center (MultiGyro, attached): the attached right_gyro_*
-+                // slot reports the CENTER BODY IMU (round 5e ground truth:
-+                // pan=Y, spin=Z, tilt=X), which is NOT the handle IMU. It uses
-+                // its OWN mapping map_center_gyro_axes + CENTER_GYRO_SCALE=1.0
-+                // (the handle's 0.105 truncated the small center raw to 0 ->
-+                // "very slow"). steam_deck IP_GYRO_GAIN_CENTER (env) sets the
-+                // final sensitivity. rawL is always 0 -> (L+R)/2 = R/2 (round 5c).
++                // [v13] Upstream v0.82.0 center mapping with our CENTER_GYRO_SCALE.
++                // (L+R)/2 with rawL=0 == R/2; scale applied after the average.
 +                let out = map_center_gyro_axes(
-+                    state.right_gyro_x,
-+                    state.right_gyro_y,
-+                    state.right_gyro_z,
++                    (state.left_gyro_x + state.right_gyro_x) / 2,
++                    (state.left_gyro_y + state.right_gyro_y) / 2,
++                    (state.left_gyro_z + state.right_gyro_z) / 2,
 +                    CENTER_GYRO_SCALE,
 +                );
 +                events.push(Event::Axis(AxisEvent::MultiGyro(out)));
              }
- 
-             // Touchpad events
-@@ -607,3 +752,15 @@ impl Driver {
+         }
          events
      }
  }
@@ -923,49 +761,78 @@ index fddb1a7..a4bd0c1 100644
 +fn controllers_attached() -> bool {
 +    crate::drivers::legion_state::is_attached_or_default()
 +}
-diff --git a/src/drivers/lego/mod.rs b/src/drivers/lego/mod.rs
-index 4151b07..7822e0b 100644
---- a/src/drivers/lego/mod.rs
-+++ b/src/drivers/lego/mod.rs
-@@ -5,8 +5,6 @@ pub mod hid_report;
- 
- use std::time::Duration;
- 
--use crate::input::capability::{Capability, Source};
--
- // Hardware ID's
- pub const VID: u16 = 0x17ef;
- pub const GP_IID: i32 = 0x02;
-@@ -60,12 +58,3 @@ pub const STICK_X_MIN: f64 = 0.0;
- pub const STICK_Y_MAX: f64 = 255.0;
- pub const STICK_Y_MIN: f64 = 0.0;
- pub const TRIGG_MAX: f64 = 255.0;
--
--const DEFAULT_EVENT_FILTER: [Capability; 6] = [
--    Capability::Accelerometer(Source::Left),
--    Capability::Accelerometer(Source::Right),
--    Capability::Accelerometer(Source::Center),
--    Capability::Gyroscope(Source::Left),
--    Capability::Gyroscope(Source::Right),
--    Capability::Gyroscope(Source::Center),
--];
+diff --git a/src/drivers/legion_state.rs b/src/drivers/legion_state.rs
+new file mode 100644
+index 0000000..867c2ca
+--- /dev/null
++++ b/src/drivers/legion_state.rs
+@@ -0,0 +1,47 @@
++//! Shared attach/detach state for Legion Go 2 controllers.
++//!
++//! The lego driver publishes the current docked/detached state here (derived
++//! from XInput report bytes 12-13, `l_con_state`/`r_con_state`). Other drivers
++//! in the same process (e.g. iio_imu) read it to decide which gyro source is
++//! active — WITHOUT any blocking USB/sysfs reads that could wedge the hub.
++
++use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
++
++/// Default assumption: controllers are DOCKED (attached). This matches the most
++/// common boot scenario (console in dock with ESO running). If the user boots
++/// detached, the first XInput report (~10 ms) will correct this.
++static ATTACHED: AtomicBool = AtomicBool::new(true);
++
++/// 0 = state has never been published yet; 1+ = at least one publish happened.
++static STATE_SET: AtomicU8 = AtomicU8::new(0);
++
++/// Publish the current attach state. Called by the lego driver whenever it sees
++/// a change in `l_con_state` (or on its very first report).
++pub fn set_attached(attached: bool) {
++    let _ = ATTACHED.swap(attached, Ordering::Relaxed);
++    STATE_SET.store(1, Ordering::Release);
++    // The atomics above remain the single source of truth for the
++    // gyro-source arbiter (iio_imu reads them via is_attached() /
++    // is_attached_or_default()). There is no orchestrator event bus to
++    // notify in the single-path build.
++}
++
++/// Returns the published attach state.
++/// - `None`: no XInput report has been received yet (driver just started).
++/// - `Some(true)`: controllers are docked/attached.
++/// - `Some(false)`: controllers are detached/wireless.
++pub fn is_attached() -> Option<bool> {
++    if STATE_SET.load(Ordering::Acquire) == 0 {
++        return None;
++    }
++    Some(ATTACHED.load(Ordering::Relaxed))
++}
++
++/// Convenience: returns the attach state, defaulting to `true` (docked) if no
++/// report has been received yet. Useful for initial filter setup.
++pub fn is_attached_or_default() -> bool {
++    match is_attached() {
++        Some(v) => v,
++        None => true,
++    }
++}
 diff --git a/src/drivers/mod.rs b/src/drivers/mod.rs
-index 8402fd2..90d6e38 100644
+index 5b845bc..66fd3d1 100644
 --- a/src/drivers/mod.rs
 +++ b/src/drivers/mod.rs
-@@ -2,8 +2,10 @@ pub mod dualsense;
+@@ -2,10 +2,12 @@ pub mod dualsense;
  pub mod flydigi_vader_4_pro;
  pub mod fts3528;
- pub mod gpd_win_mini;
+ pub mod gpd_device;
 +pub mod gyro_center;
  pub mod horipad_steam;
  pub mod iio_imu;
+ pub mod legion_go;
+ pub mod legion_go_s;
 +pub mod legion_state;
- pub mod lego;
- pub mod legos;
  pub mod msi_claw;
+ pub mod opineo;
+ pub mod oxp_hid;
 diff --git a/src/input/composite_device/client.rs b/src/input/composite_device/client.rs
-index ee8e4fe..8dbd410 100644
+index 30edf7a..2c2ffa1 100644
 --- a/src/input/composite_device/client.rs
 +++ b/src/input/composite_device/client.rs
 @@ -305,6 +305,20 @@ impl CompositeDeviceClient {
@@ -990,10 +857,10 @@ index ee8e4fe..8dbd410 100644
      /// new target devices, attach them to this device, and stop/remove any
      /// existing devices.
 diff --git a/src/input/composite_device/command.rs b/src/input/composite_device/command.rs
-index a326784..0ee0d6c 100644
+index 7c175de..50389cb 100644
 --- a/src/input/composite_device/command.rs
 +++ b/src/input/composite_device/command.rs
-@@ -51,6 +51,12 @@ pub enum CompositeCommand {
+@@ -52,6 +52,12 @@ pub enum CompositeCommand {
      SourceDeviceAdded(DeviceInfo),
      SourceDeviceRemoved(DeviceInfo),
      SourceDeviceStopped(DeviceInfo),
@@ -1007,7 +874,7 @@ index a326784..0ee0d6c 100644
      UpdateSourceCapabilities(String, HashSet<Capability>),
      UpdateTargetCapabilities(String, HashSet<Capability>),
 diff --git a/src/input/composite_device/mod.rs b/src/input/composite_device/mod.rs
-index 144372a..b3039c2 100644
+index 3cca2ba..f71d7ce 100644
 --- a/src/input/composite_device/mod.rs
 +++ b/src/input/composite_device/mod.rs
 @@ -19,7 +19,7 @@ use zbus::{object_server::Interface, Connection};
@@ -1045,9 +912,9 @@ index 144372a..b3039c2 100644
  /// The [InterceptMode] defines whether or not inputs should be routed over
  /// DBus instead of to the target devices. This can be used by overlays to
  /// intercept input.
-@@ -69,6 +79,29 @@ pub enum InterceptMode {
-     GamepadOnly,
- }
+@@ -73,6 +83,29 @@ pub enum InterceptMode {
+ /// userspace to see a valid input.
+ const MIN_EVENT_TIME: Duration = Duration::from_millis(16);
  
 +/// V18 fix: extract the config's `target_devices` as the single source of truth
 +/// for the target set. Unsupported kinds are skipped (with a warning) so a
@@ -1075,8 +942,8 @@ index 144372a..b3039c2 100644
  /// A [CompositeDevice] represents any number source input devices that
  /// can translate input to any target devices
  #[derive(Debug)]
-@@ -136,6 +169,17 @@ pub struct CompositeDevice {
-     source_device_persistent_ids: HashMap<String, Option<String>>,
+@@ -146,6 +179,17 @@ pub struct CompositeDevice {
+     persistent_id: Option<String>,
      /// Unique identifiers for running source devices. E.g. ["evdev://event0"]
      source_devices_used: Vec<String>,
 +    /// Ids of live sources that match a NON-blocked gamepad hidraw rule in the
@@ -1093,7 +960,7 @@ index 144372a..b3039c2 100644
      /// State of target devices attached to the composite device
      targets: CompositeDeviceTargets,
      /// Whether or not force feedback output events should be routed to
-@@ -178,6 +222,9 @@ impl CompositeDevice {
+@@ -188,6 +232,9 @@ impl CompositeDevice {
          let (tx, rx) = mpsc::channel(BUFFER_SIZE);
          let name = config.name.clone();
          let dbus = DBusInterfaceManager::new(conn.clone(), dbus_path.clone())?;
@@ -1103,9 +970,9 @@ index 144372a..b3039c2 100644
          let mut device = Self {
              dbus,
              config,
-@@ -205,7 +252,16 @@ impl CompositeDevice {
-             source_device_tasks: JoinSet::new(),
+@@ -217,7 +264,16 @@ impl CompositeDevice {
              source_device_persistent_ids: HashMap::new(),
+             persistent_id: None,
              source_devices_used: Vec::new(),
 -            targets: CompositeDeviceTargets::new(conn, dbus_path, tx.into(), manager),
 +            gamepad_hidraw_sources: HashSet::new(),
@@ -1121,7 +988,7 @@ index 144372a..b3039c2 100644
              ff_enabled: true,
              ff_effect_ids: (0..64).collect(),
              ff_effect_id_source_map: HashMap::new(),
-@@ -289,12 +345,12 @@ impl CompositeDevice {
+@@ -301,12 +357,12 @@ impl CompositeDevice {
          // Set persist value from config if set, used to determine
          // if CompositeDevice self-closes after all SourceDevices have
          // been removed.
@@ -1140,7 +1007,7 @@ index 144372a..b3039c2 100644
  
          // Loop and listen for command events
          log::debug!("CompositeDevice started");
-@@ -382,8 +438,30 @@ impl CompositeDevice {
+@@ -405,9 +461,30 @@ impl CompositeDevice {
                              log::error!("Failed to remove source device: {:?}", e);
                          }
                      }
@@ -1163,16 +1030,42 @@ index 144372a..b3039c2 100644
 +                        }
 +                    }
                      CompositeCommand::SetTargetDevices(target_types) => {
--                        if let Err(e) = self.targets.set_devices(target_types).await {
-+                        if let Err(e) = self
-+                            .targets
-+                            .set_devices(target_types, false)
-+                            .await
-+                        {
+                         let persistent_id = self.get_persistent_id().await;
+-                        if let Err(e) = self.targets.set_devices(target_types, &persistent_id).await
++                        if let Err(e) =
++                            self.targets
++                                .set_devices(target_types, &persistent_id, false)
++                                .await
+                         {
                              log::error!("Failed to set target devices: {e}");
                          }
-                     }
-@@ -451,6 +529,24 @@ impl CompositeDevice {
+@@ -416,8 +493,10 @@ impl CompositeDevice {
+                         self.targets.finish_target_creation(paths);
+                         if let Some(target_types) = self.targets.take_pending_set_devices() {
+                             let persistent_id = self.get_persistent_id().await;
+-                            if let Err(e) =
+-                                self.targets.set_devices(target_types, &persistent_id).await
++                            if let Err(e) = self
++                                .targets
++                                .set_devices(target_types, &persistent_id, false)
++                                .await
+                             {
+                                 log::error!("Failed to set target devices: {e}");
+                             }
+@@ -429,8 +508,10 @@ impl CompositeDevice {
+                         }
+                         if let Some(target_types) = self.targets.take_pending_set_devices() {
+                             let persistent_id = self.get_persistent_id().await;
+-                            if let Err(e) =
+-                                self.targets.set_devices(target_types, &persistent_id).await
++                            if let Err(e) = self
++                                .targets
++                                .set_devices(target_types, &persistent_id, false)
++                                .await
+                             {
+                                 log::error!("Failed to set target devices: {e}");
+                             }
+@@ -495,6 +576,24 @@ impl CompositeDevice {
                                  continue;
                              }
                          };
@@ -1197,7 +1090,7 @@ index 144372a..b3039c2 100644
                          let result = match self
                              .load_device_profile(Some(profile.clone()), Some(path.clone()))
                          {
-@@ -575,10 +671,49 @@ impl CompositeDevice {
+@@ -620,10 +719,49 @@ impl CompositeDevice {
              // If no source devices remain after processing the queue, stop
              // the device unless configured to persist.
              if devices_removed && self.source_devices_used.is_empty() {
@@ -1249,7 +1142,7 @@ index 144372a..b3039c2 100644
                      log::debug!(
                          "No source devices remain. Stopping CompositeDevice {}",
                          self.dbus.path()
-@@ -689,6 +824,222 @@ impl CompositeDevice {
+@@ -734,6 +872,222 @@ impl CompositeDevice {
          Ok(())
      }
  
@@ -1472,7 +1365,7 @@ index 144372a..b3039c2 100644
      /// Process a single event from a source device. Events are piped through
      /// a translation layer, then dispatched to the appropriate target device(s)
      async fn process_event(
-@@ -1571,12 +1922,38 @@ impl CompositeDevice {
+@@ -1589,12 +1943,38 @@ impl CompositeDevice {
  
      /// Executed whenever a source device is added to this [CompositeDevice].
      async fn on_source_device_added(&mut self, device: DeviceInfo) -> Result<(), Box<dyn Error>> {
@@ -1511,7 +1404,7 @@ index 144372a..b3039c2 100644
          // Signal to DBus that source devices have changed
          self.signal_sources_changed().await;
  
-@@ -1591,6 +1968,18 @@ impl CompositeDevice {
+@@ -1609,6 +1989,18 @@ impl CompositeDevice {
      async fn on_source_device_removed(&mut self, device: DeviceInfo) -> Result<(), Box<dyn Error>> {
          let path = device.path();
          let id = device.get_id();
@@ -1530,7 +1423,7 @@ index 144372a..b3039c2 100644
  
          // Remove any ffb effects this device registered
          let mut freed_effect_ids = Vec::new();
-@@ -1668,6 +2057,16 @@ impl CompositeDevice {
+@@ -1686,6 +2078,16 @@ impl CompositeDevice {
          };
          self.source_devices_blocked.remove(&id);
          self.source_device_persistent_ids.remove(&id);
@@ -1547,7 +1440,7 @@ index 144372a..b3039c2 100644
  
          // Signal to DBus that source devices have changed
          self.signal_sources_changed().await;
-@@ -1685,6 +2084,10 @@ impl CompositeDevice {
+@@ -1712,6 +2114,10 @@ impl CompositeDevice {
              self.source_devices_used
          );
  
@@ -1558,7 +1451,7 @@ index 144372a..b3039c2 100644
          Ok(())
      }
  
-@@ -1693,6 +2096,19 @@ impl CompositeDevice {
+@@ -1720,6 +2126,19 @@ impl CompositeDevice {
          &mut self,
          device: DeviceInfo,
      ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -1578,7 +1471,7 @@ index 144372a..b3039c2 100644
          // Check to see if this source device should be blocked.
          let mut is_blocked = false;
          let mut is_blocked_evdev = false;
-@@ -1781,6 +2197,23 @@ impl CompositeDevice {
+@@ -1808,6 +2227,23 @@ impl CompositeDevice {
          // Get the capabilities of the source device.
          let id = source_device.get_id();
          let persistent_id = source_device.get_persistent_id();
@@ -1602,7 +1495,7 @@ index 144372a..b3039c2 100644
          if !is_blocked {
              // Get the input capabilities of the source device and keep track
              // of them.
-@@ -1957,6 +2390,27 @@ impl CompositeDevice {
+@@ -1950,6 +2386,27 @@ impl CompositeDevice {
          Ok(())
      }
  
@@ -1631,10 +1524,10 @@ index 144372a..b3039c2 100644
          &mut self,
          activation_caps: Vec<Capability>,
 diff --git a/src/input/composite_device/targets.rs b/src/input/composite_device/targets.rs
-index f433c3a..327aae9 100644
+index e3a9d05..ba16123 100644
 --- a/src/input/composite_device/targets.rs
 +++ b/src/input/composite_device/targets.rs
-@@ -51,6 +51,12 @@ pub struct CompositeDeviceTargets {
+@@ -55,6 +55,12 @@ pub struct CompositeDeviceTargets {
      /// Map of DBusDevice DBus paths to their respective transmitter channel.
      /// E.g. {"/org/shadowblip/InputPlumber/devices/target/dbus0": <Sender>}
      target_dbus_devices: HashMap<String, TargetDeviceClient>,
@@ -1647,7 +1540,7 @@ index f433c3a..327aae9 100644
  }
  
  impl CompositeDeviceTargets {
-@@ -60,6 +66,7 @@ impl CompositeDeviceTargets {
+@@ -64,6 +70,7 @@ impl CompositeDeviceTargets {
          path: String,
          device: CompositeDeviceClient,
          manager: Sender<ManagerCommand>,
@@ -1655,15 +1548,15 @@ index f433c3a..327aae9 100644
      ) -> Self {
          Self {
              _dbus: dbus,
-@@ -71,6 +78,7 @@ impl CompositeDeviceTargets {
-             target_devices_queued: Default::default(),
+@@ -77,6 +84,7 @@ impl CompositeDeviceTargets {
+             pending_set_devices: None,
              target_devices_suspended: Default::default(),
              target_dbus_devices: Default::default(),
 +            config_targets,
          }
      }
  
-@@ -122,12 +130,45 @@ impl CompositeDeviceTargets {
+@@ -128,13 +136,46 @@ impl CompositeDeviceTargets {
      /// Set the given target devices on the composite device. This will create
      /// new target devices, attach them to this device, and stop/remove any
      /// existing devices.
@@ -1673,6 +1566,7 @@ index f433c3a..327aae9 100644
      pub async fn set_devices(
          &mut self,
          device_types: Vec<TargetDeviceTypeId>,
+         persistent_id: &str,
 +        resume: bool,
      ) -> Result<(), Box<dyn Error>> {
          let dbus_path = self.path.as_str();
@@ -1710,7 +1604,7 @@ index f433c3a..327aae9 100644
  
          // NOTE: If the device is suspended, we resume the device and use the new
          // targets, but we may want to prevent setting new targets alltogether.
-@@ -157,6 +198,28 @@ impl CompositeDeviceTargets {
+@@ -158,6 +199,28 @@ impl CompositeDeviceTargets {
          let device_types_map = self.target_kinds_running().await?;
          let device_types_running: Vec<TargetDeviceTypeId> =
              device_types_map.values().cloned().collect();
@@ -1739,30 +1633,30 @@ index f433c3a..327aae9 100644
          for kind in device_types.iter() {
              if device_types_running.contains(kind) {
                  log::debug!("[{dbus_path}] Target device {kind} already running, nothing to do.");
-@@ -184,6 +247,21 @@ impl CompositeDeviceTargets {
-         // Stop all old target devices that aren't going to persist
-         let mut stop_tasks = JoinSet::new();
-         for (path, target) in targets_to_stop.clone().into_iter() {
-+            // [detach] context: a target that is NOT in the new set is being
-+            // stopped (removed from the composite). deck-uhid must NOT appear
-+            // here when the config keeps it — if it does, that is the failure.
-+            match target.get_type().await {
-+                Ok(kind) => {
-+                    log::info!(
-+                        "[detach] stopping target kind={kind} path={path} (not in new set) for {dbus_path}"
-+                    );
+@@ -201,6 +264,21 @@ impl CompositeDeviceTargets {
+ 
+             // Stop all old target devices that aren't going to persist
+             for (path, target) in targets_to_stop {
++                // [detach] context: a target that is NOT in the new set is being
++                // stopped (removed from the composite). deck-uhid must NOT appear
++                // here when the config keeps it — if it does, that is the failure.
++                match target.get_type().await {
++                    Ok(kind) => {
++                        log::info!(
++                            "[detach] stopping target kind={kind} path={path} (not in new set) for {dbus_path}"
++                        );
++                    }
++                    Err(_) => {
++                        log::info!(
++                            "[detach] stopping target path={path} (not in new set) for {dbus_path}"
++                        );
++                    }
 +                }
-+                Err(_) => {
-+                    log::info!(
-+                        "[detach] stopping target path={path} (not in new set) for {dbus_path}"
-+                    );
-+                }
-+            }
-             log::debug!("[{dbus_path}] Stopping old target device: {path}");
-             self.target_devices.remove(&path);
-             for target_devices in self.target_devices_by_capability.values_mut() {
-@@ -276,6 +354,16 @@ impl CompositeDeviceTargets {
-         Ok(())
+                 log::debug!("[{dbus_path}] Stopping old target device: {path}");
+                 if let Err(e) = target.stop().await {
+                     log::error!("[{dbus_path}] Failed to stop old target device: {e}");
+@@ -308,6 +386,16 @@ impl CompositeDeviceTargets {
+         self.pending_set_devices.take()
      }
  
 +    /// Public read-only helper (logging support): return the list of target
@@ -1778,7 +1672,7 @@ index f433c3a..327aae9 100644
      /// Return a list of currently running target devices
      async fn target_kinds_running(
          &self,
-@@ -355,6 +443,23 @@ impl CompositeDeviceTargets {
+@@ -387,6 +475,23 @@ impl CompositeDeviceTargets {
      /// be held, or joysticks that are in a certain direction, etc.
      pub async fn clear_state(&self) {
          for (path, target) in &self.target_devices {
@@ -1802,7 +1696,7 @@ index f433c3a..327aae9 100644
              log::debug!("[{}] Clearing target device state: {path}", self.path);
              if let Err(e) = target.clear_state().await {
                  log::error!(
-@@ -388,6 +493,20 @@ impl CompositeDeviceTargets {
+@@ -420,6 +525,20 @@ impl CompositeDeviceTargets {
          for (path, target) in self.target_devices.clone() {
              let dbus_path = self.path.clone();
              tokio::task::spawn(async move {
@@ -1823,7 +1717,7 @@ index f433c3a..327aae9 100644
                  log::debug!("[{dbus_path}] Clearing target device state: {path}");
                  if let Err(e) = target.clear_state().await {
                      log::error!("[{dbus_path}] Failed to clear target device state {path}: {e}");
-@@ -400,6 +519,22 @@ impl CompositeDeviceTargets {
+@@ -432,6 +551,22 @@ impl CompositeDeviceTargets {
      pub async fn stop(&self) {
          let dbus_path = self.path.as_str();
          for (path, target) in &self.target_devices {
@@ -1846,7 +1740,7 @@ index f433c3a..327aae9 100644
              log::debug!("[{dbus_path}] Stopping target device: {path}");
              if let Err(e) = target.stop().await {
                  log::error!("[{dbus_path}] Failed to stop target device {path}: {e}");
-@@ -534,6 +669,35 @@ impl CompositeDeviceTargets {
+@@ -566,6 +701,35 @@ impl CompositeDeviceTargets {
          Ok(())
      }
  
@@ -1882,7 +1776,7 @@ index f433c3a..327aae9 100644
      /// Called when notified by the input manager that system suspend is about
      /// to happen.
      pub async fn handle_suspend(&mut self) {
-@@ -558,6 +722,22 @@ impl CompositeDeviceTargets {
+@@ -590,6 +754,22 @@ impl CompositeDeviceTargets {
                  }
              };
  
@@ -1905,20 +1799,20 @@ index f433c3a..327aae9 100644
              self.target_devices_suspended.push(target_type);
              self.target_devices.remove(&path);
              for target_devices in self.target_devices_by_capability.values_mut() {
-@@ -589,7 +769,7 @@ impl CompositeDeviceTargets {
+@@ -621,7 +801,7 @@ impl CompositeDeviceTargets {
          // Set the target devices back to the ones used before suspend
          let target_devices = self.target_devices_suspended.clone();
          self.target_devices_suspended.clear();
--        if let Err(err) = self.set_devices(target_devices).await {
-+        if let Err(err) = self.set_devices(target_devices, true).await {
+-        if let Err(err) = self.set_devices(target_devices, persistent_id).await {
++        if let Err(err) = self.set_devices(target_devices, persistent_id, true).await {
              log::error!("Failed to set restore target devices: {err:?}");
          }
      }
 diff --git a/src/input/manager.rs b/src/input/manager.rs
-index 1696f67..ea48718 100644
+index 2c55128..19f798f 100644
 --- a/src/input/manager.rs
 +++ b/src/input/manager.rs
-@@ -249,6 +249,13 @@ impl Manager {
+@@ -268,6 +268,13 @@ impl Manager {
          log::debug!("Starting input manager task...");
  
          self.listen_on_dbus();
@@ -1932,15 +1826,15 @@ index 1696f67..ea48718 100644
          let _ = tokio::join!(
              Self::discover_all_devices(&cmd_tx_all_devices),
              Self::watch_iio_devices(self.tx.clone()),
-@@ -903,6 +910,7 @@ impl Manager {
-         Ok(task)
+@@ -1063,6 +1070,7 @@ impl Manager {
+         Ok(())
      }
  
 +
      /// Called when a composite device stops running
      async fn on_composite_device_stopped(&mut self, path: String) -> Result<(), Box<dyn Error>> {
          log::debug!("Removing composite device: {}", path);
-@@ -958,10 +966,53 @@ impl Manager {
+@@ -1135,10 +1143,53 @@ impl Manager {
          id: String,
          device: DeviceInfo,
      ) -> Result<(), Box<dyn Error>> {
@@ -1992,13 +1886,13 @@ index 1696f67..ea48718 100644
 +            self.source_devices_used.remove(&id);
 +            if let Some(sources) = self.composite_device_sources.get_mut(&device_path) {
 +                if let Some(removed_source) = removed_source.as_ref() {
-+                    sources.retain(|item| item != removed_source);
++                    sources.retain(|(source, _)| source != removed_source);
 +                }
 +            }
          }
  
          // Check all existing composite devices to see if this device is part of
-@@ -1043,6 +1094,14 @@ impl Manager {
+@@ -1220,6 +1271,14 @@ impl Manager {
                  }
              }
  
@@ -2013,7 +1907,7 @@ index 1696f67..ea48718 100644
              log::info!("Found missing {} device, adding source device {id} to existing composite device: {composite_device:?}", device.kind());
              let Some(client) = self.composite_devices.get(composite_device.as_str()) else {
                  log::error!("No existing composite device found for key {composite_device:?}");
-@@ -1103,6 +1162,14 @@ impl Manager {
+@@ -1280,6 +1339,14 @@ impl Manager {
                          return Ok(());
                      }
                  }
@@ -2028,7 +1922,7 @@ index 1696f67..ea48718 100644
                  log::info!(
                      "Found a matching {} device {id} in config {path:?}, creating CompositeDevice",
                      device.kind()
-@@ -1134,40 +1201,79 @@ impl Manager {
+@@ -1311,40 +1378,79 @@ impl Manager {
      }
  
      /// Called when any source device is removed
@@ -2055,21 +1949,14 @@ index 1696f67..ea48718 100644
 +        );
          log::debug!("Source device removed: {dev_name}");
 -        let Some(composite_device_path) = self.source_devices_used.get(&id) else {
--            log::debug!("Source device not being managed by a composite device");
--            return Ok(());
--        };
- 
--        let Some(client) = self.composite_devices.get(composite_device_path) else {
--            return Err(format!("CompostiteDevice {} not found", composite_device_path).into());
--        };
++
 +        // Capture the composite path this source was mapped to (if any) before
 +        // we start cleaning up, so we can forward the removal to it.
 +        let composite_device_path = self.source_devices_used.get(&id).cloned();
 +        // Capture the config SourceDevice value (if present) so we can drop the
 +        // matching entry from composite_device_sources by value equality.
 +        let removed_source = self.source_devices.get(&id).cloned();
- 
--        client.remove_source_device(device).await?;
++
 +        // ---- Clean removal bookkeeping (unconditional, before any return) ----
 +        // Drop the id from the source-device map.
 +        self.source_devices.remove(&id);
@@ -2079,26 +1966,33 @@ index 1696f67..ea48718 100644
 +        if let Some(composite_path) = composite_device_path.as_ref() {
 +            if let Some(sources) = self.composite_device_sources.get_mut(composite_path) {
 +                if let Some(removed_source) = removed_source.as_ref() {
-+                    sources.retain(|item| item != removed_source);
++                    sources.retain(|(source, _)| source != removed_source);
 +                }
 +            }
 +        }
- 
--        let Some(device) = self.source_devices.get(&id) else {
--            return Err(format!("Device {} not found in source devices", id).into());
++
 +        let Some(composite_device_path) = composite_device_path else {
 +            log::info!(
 +                "[mgr-rm] source id={id} was NOT managed by any composite device (no-op after cleanup)"
 +            );
-+            log::debug!("Source device not being managed by a composite device");
-+            return Ok(());
+             log::debug!("Source device not being managed by a composite device");
+             return Ok(());
          };
  
--        let Some(sources) = self.composite_device_sources.get_mut(composite_device_path) else {
+-        let Some(client) = self.composite_devices.get(composite_device_path) else {
+-            return Err(format!("CompostiteDevice {} not found", composite_device_path).into());
+-        };
+-
+-        client.remove_source_device(device).await?;
+-
+-        if !self.source_devices.contains_key(&id) {
+-            return Err(format!("Device {} not found in source devices", id).into());
+-        }
 +        log::info!(
 +            "[detach] manager: source id={id} belonged to composite {composite_device_path}; forwarding removal"
 +        );
-+
+ 
+-        let Some(sources) = self.composite_device_sources.get_mut(composite_device_path) else {
 +        let Some(client) = self.composite_devices.get(&composite_device_path) else {
 +            log::error!(
 +                "[mgr-rm] CompositeDevice {composite_device_path} not found while removing source id={id} (bookkeeping already cleaned)"
@@ -2106,7 +2000,7 @@ index 1696f67..ea48718 100644
              return Err(format!("CompostiteDevice {} not found", composite_device_path).into());
          };
  
--        let idx = sources.iter().position(|item| item == device);
+-        let idx = sources.iter().position(|(_, source_id)| source_id == &id);
 -        if idx.is_none() {
 -            self.source_devices.remove(&id);
 -            return Err(format!("Device {} not found in composite device sources", id).into());
@@ -2126,7 +2020,7 @@ index 1696f67..ea48718 100644
  
          Ok(())
      }
-@@ -1530,7 +1636,7 @@ impl Manager {
+@@ -1718,7 +1824,7 @@ impl Manager {
          cmd_tx: mpsc::Sender<ManagerCommand>,
          watcher_rx: &mut mpsc::Receiver<WatchEvent>,
      ) {
@@ -2135,7 +2029,7 @@ index 1696f67..ea48718 100644
              match event {
                  WatchEvent::Create { name, base_path } => {
                      let subsystem = {
-@@ -1559,58 +1665,39 @@ impl Manager {
+@@ -1747,58 +1853,39 @@ impl Manager {
                          continue;
                      }
  
@@ -2188,7 +2082,7 @@ index 1696f67..ea48718 100644
 +                            return;
                          };
 -                        log::trace!("{base_path}/{name} is not yet initialized by udev");
--
+ 
 -                        tokio::time::sleep(Duration::from_millis(50)).await;
 -                        attempt += 1;
 -                    }
@@ -2200,7 +2094,7 @@ index 1696f67..ea48718 100644
 -                        log::warn!("Unable to create UdevDevice from {base_path}/{name}");
 -                        continue;
 -                    };
- 
+-
 -                    // Notify the manager that a device was added
 -                    log::debug!("Got inotify add action for {base_path}/{name}");
 -                    let result = cmd_tx
@@ -2225,7 +2119,7 @@ index 1696f67..ea48718 100644
                  }
                  WatchEvent::Delete { name, base_path } => {
                      let device = UdevDevice::from_devnode(base_path.as_str(), name.as_str());
-@@ -1628,6 +1715,49 @@ impl Manager {
+@@ -1816,6 +1903,49 @@ impl Manager {
          }
      }
  
@@ -2276,10 +2170,10 @@ index 1696f67..ea48718 100644
      async fn discover_all_devices(
          cmd_tx: &mpsc::Sender<ManagerCommand>,
 diff --git a/src/input/source/hidraw/legion_go2.rs b/src/input/source/hidraw/legion_go2.rs
-index c9ba70e..9e1e5ba 100644
+index c11b418..dd56927 100644
 --- a/src/input/source/hidraw/legion_go2.rs
 +++ b/src/input/source/hidraw/legion_go2.rs
-@@ -257,6 +257,10 @@ impl SourceInputDevice for LegionGo2Controller {
+@@ -273,6 +273,10 @@ impl SourceInputDevice for LegionGo2Controller {
          };
          Ok(filtered_events)
      }
@@ -2291,12 +2185,12 @@ index c9ba70e..9e1e5ba 100644
  
  impl SourceOutputDevice for LegionGo2Controller {}
 diff --git a/src/input/source/iio/accel_gyro_3d.rs b/src/input/source/iio/accel_gyro_3d.rs
-index 737daca..e42dd6d 100644
+index 9b807a6..b71f6a2 100644
 --- a/src/input/source/iio/accel_gyro_3d.rs
 +++ b/src/input/source/iio/accel_gyro_3d.rs
-@@ -84,6 +84,10 @@ impl SourceInputDevice for AccelGyro3dImu {
-         };
-         Ok(filtered_events)
+@@ -68,6 +68,10 @@ impl SourceInputDevice for AccelGyro3dImu {
+     fn get_default_event_filter(&self) -> Result<HashSet<Capability>, InputError> {
+         Ok(self.driver.get_default_event_filter()?)
      }
 +
 +    fn refresh_event_filter(&mut self) -> Option<HashSet<Capability>> {
@@ -2306,7 +2200,7 @@ index 737daca..e42dd6d 100644
  
  impl SourceOutputDevice for AccelGyro3dImu {}
 diff --git a/src/input/source/mod.rs b/src/input/source/mod.rs
-index a95a44a..d929ec9 100644
+index 5844fce..7b9dbf7 100644
 --- a/src/input/source/mod.rs
 +++ b/src/input/source/mod.rs
 @@ -39,8 +39,8 @@ pub mod tty;
@@ -2352,7 +2246,7 @@ index a95a44a..d929ec9 100644
                      for mut event in events.into_iter() {
                          if self.event_filter_enabled
 diff --git a/src/input/target/steam_deck.rs b/src/input/target/steam_deck.rs
-index e4199ea..37cf347 100644
+index a8bfd2f..4c5635b 100644
 --- a/src/input/target/steam_deck.rs
 +++ b/src/input/target/steam_deck.rs
 @@ -6,8 +6,10 @@ use std::{
@@ -2367,18 +2261,7 @@ index e4199ea..37cf347 100644
  };
  
  use virtual_usb::{
-@@ -33,8 +35,8 @@ use crate::{
-     },
-     input::{
-         capability::{
--            Capability, Gamepad, GamepadAxis, GamepadButton, GamepadTrigger, Touch, TouchButton,
--            Touchpad,
-+            Capability, Gamepad, GamepadAxis, GamepadButton, GamepadTrigger, Source, Touch,
-+            TouchButton, Touchpad,
-         },
-         composite_device::client::CompositeDeviceClient,
-         event::{
-@@ -48,6 +50,47 @@ use crate::{
+@@ -52,6 +54,47 @@ use crate::{
  
  use super::{InputError, OutputError, TargetInputDevice, TargetOutputDevice};
  
@@ -2426,7 +2309,7 @@ index e4199ea..37cf347 100644
  /// Configuration of the target SteamDeck device.
  #[derive(Debug, Clone)]
  pub struct SteamDeckConfig {
-@@ -70,6 +113,53 @@ impl Default for SteamDeckConfig {
+@@ -74,6 +117,53 @@ impl Default for SteamDeckConfig {
  // each other for chords.
  const MIN_CHORD_TIME: Duration = Duration::from_millis(80);
  
@@ -2478,10 +2361,10 @@ index e4199ea..37cf347 100644
 +}
 +
  pub struct SteamDeckDevice {
+     board_serial: String,
      chip_id: [u8; 15],
-     config: SteamDeckConfig,
-@@ -83,6 +173,9 @@ pub struct SteamDeckDevice {
-     queued_events: Vec<ScheduledNativeEvent>,
+@@ -90,6 +180,9 @@ pub struct SteamDeckDevice {
+     requested_string_attribute: StringAttribute,
      serial_number: String,
      state: PackedInputDataReport,
 +    // Prong 1: configuration received but not yet published (settle window).
@@ -2490,41 +2373,16 @@ index e4199ea..37cf347 100644
  }
  
  impl SteamDeckDevice {
-@@ -109,6 +202,8 @@ impl SteamDeckDevice {
-             queued_events: vec![],
-             serial_number: "1NPU7PLUMB3R".to_string(),
+@@ -123,6 +216,8 @@ impl SteamDeckDevice {
+             requested_string_attribute: StringAttribute::default(),
+             serial_number,
              state: PackedInputDataReport::default(),
 +            pending_config: None,
 +            publish_at: None,
          })
      }
  
-@@ -693,14 +788,21 @@ impl SteamDeckDevice {
-                 }
-                 Gamepad::Gyro => {
-                     if let InputValue::Vector3 { x, y, z } = value {
-+                        // Merged gyro stream: pick gain by which IMU is active
-+                        // (docked = center IMU, detached = right-handle IMU).
-+                        let source = if crate::drivers::legion_state::is_attached_or_default() {
-+                            Source::Center
-+                        } else {
-+                            Source::Right
-+                        };
-                         if let Some(x) = x {
--                            self.state.pitch = Integer::from_primitive(x as i16);
-+                            self.state.pitch = Integer::from_primitive(scale_gyro(x, &source));
-                         }
-                         if let Some(y) = y {
--                            self.state.yaw = Integer::from_primitive(y as i16);
-+                            self.state.yaw = Integer::from_primitive(scale_gyro(y, &source));
-                         }
-                         if let Some(z) = z {
--                            self.state.roll = Integer::from_primitive(z as i16);
-+                            self.state.roll = Integer::from_primitive(scale_gyro(z, &source));
-                         }
-                     }
-                 }
-@@ -769,16 +871,16 @@ impl SteamDeckDevice {
+@@ -772,25 +867,16 @@ impl SteamDeckDevice {
                      }
                  }
              },
@@ -2532,20 +2390,29 @@ index e4199ea..37cf347 100644
 +            Capability::Gyroscope(source) => {
                  if let InputValue::Vector3 { x, y, z } = value {
                      if let Some(x) = x {
--                        self.state.pitch = Integer::from_primitive(x as i16);
+-                        self.state.pitch = Integer::from_primitive(denormalize_gyro_value_i16(
+-                            x,
+-                            DECK_RAD_S_TO_GYRO_RAW,
+-                        ));
 +                        self.state.pitch = Integer::from_primitive(scale_gyro(x, &source));
                      }
                      if let Some(y) = y {
--                        self.state.yaw = Integer::from_primitive(y as i16);
+-                        self.state.roll = Integer::from_primitive(denormalize_gyro_value_i16(
+-                            y,
+-                            DECK_RAD_S_TO_GYRO_RAW,
+-                        ));
 +                        self.state.yaw = Integer::from_primitive(scale_gyro(y, &source));
                      }
                      if let Some(z) = z {
--                        self.state.roll = Integer::from_primitive(z as i16);
+-                        self.state.yaw = Integer::from_primitive(denormalize_gyro_value_i16(
+-                            -z,
+-                            DECK_RAD_S_TO_GYRO_RAW,
+-                        ));
 +                        self.state.roll = Integer::from_primitive(scale_gyro(z, &source));
                      }
                  }
              }
-@@ -893,6 +995,10 @@ impl TargetInputDevice for SteamDeckDevice {
+@@ -914,6 +1000,10 @@ impl TargetInputDevice for SteamDeckDevice {
      /// Stop the virtual USB read/write threads
      fn stop(&mut self) -> Result<(), InputError> {
          log::debug!("Stopping virtual Deck controller");
@@ -2556,7 +2423,7 @@ index e4199ea..37cf347 100644
          let xfer = {
              let Some(device) = self.device.as_mut() else {
                  return Ok(());
-@@ -928,29 +1034,85 @@ impl TargetOutputDevice for SteamDeckDevice {
+@@ -949,25 +1039,81 @@ impl TargetOutputDevice for SteamDeckDevice {
      /// Update the virtual device with its current state, and read unhandled
      /// USB transfers.
      fn poll(&mut self, _: &Option<CompositeDeviceClient>) -> Result<Vec<OutputEvent>, OutputError> {
@@ -2573,16 +2440,12 @@ index e4199ea..37cf347 100644
 -                    TryRecvError::Disconnected => self.config.clone(),
 -                },
 -            };
--            let mut device = SteamDeckDevice::create_virtual_device(&config)?;
+-            let mut device =
+-                SteamDeckDevice::create_virtual_device(&config, self.serial_number.as_ref())?;
 -            device.start()?;
 -            self.device = Some(device);
 -            self.config = config;
 -            self.config_rx = None;
--            self.serial_number = format!(
--                "{:04x?}-{:04x?}-1ae1c0b",
--                VID,
--                self.config.product_id.to_u32()
--            );
 +        // ---- Configuration / publication state machine ----
 +        // See the DECK_PUBLISH_SETTLE consts above. The virtual controller is
 +        // only created AFTER its configuration arrives AND the settle window has
@@ -2642,14 +2505,10 @@ index e4199ea..37cf347 100644
 +            }
 +            self.publish_at = None;
 +            if self.pending_config.take().is_some() {
-+                let mut device = SteamDeckDevice::create_virtual_device(&self.config)?;
++                let mut device =
++                    SteamDeckDevice::create_virtual_device(&self.config, self.serial_number.as_ref())?;
 +                device.start()?;
 +                self.device = Some(device);
-+                self.serial_number = format!(
-+                    "{:04x?}-{:04x?}-1ae1c0b",
-+                    VID,
-+                    self.config.product_id.to_u32()
-+                );
 +
 +                // If a previous virtual Deck controller was stopped (e.g. during
 +                // system suspend/resume or gamepad reordering) and this is its
@@ -2666,7 +2525,7 @@ index e4199ea..37cf347 100644
  
          // Increment the frame
 diff --git a/src/input/target/steam_deck_uhid.rs b/src/input/target/steam_deck_uhid.rs
-index 786f205..81ecc0e 100644
+index 0f79978..08f272a 100644
 --- a/src/input/target/steam_deck_uhid.rs
 +++ b/src/input/target/steam_deck_uhid.rs
 @@ -3,10 +3,16 @@ use std::{
@@ -2688,7 +2547,16 @@ index 786f205..81ecc0e 100644
  use packed_struct::{
      types::{Integer, SizedInteger},
      PackedStruct,
-@@ -48,6 +54,140 @@ use super::{
+@@ -39,7 +45,7 @@ use crate::{
+         },
+         output_capability::{Haptic, OutputCapability},
+         output_event::OutputEvent,
+-        target::{generate_deck_board_serial, generate_deck_serial},
++        target::generate_deck_board_serial,
+     },
+ };
+ 
+@@ -52,6 +58,140 @@ use super::{
  // each other for chords.
  const MIN_CHORD_TIME: Duration = Duration::from_millis(80);
  
@@ -2827,10 +2695,10 @@ index 786f205..81ecc0e 100644
 +}
 +
  pub struct SteamDeckUhidDevice {
+     board_serial: String,
      chip_id: [u8; 15],
-     config: SteamDeckConfig,
-@@ -60,6 +200,14 @@ pub struct SteamDeckUhidDevice {
-     queued_events: Vec<ScheduledNativeEvent>,
+@@ -67,6 +207,14 @@ pub struct SteamDeckUhidDevice {
+     requested_string_attribute: StringAttribute,
      serial_number: String,
      state: PackedInputDataReport,
 +    // Prong 1: configuration received but not yet published (settle window).
@@ -2844,11 +2712,19 @@ index 786f205..81ecc0e 100644
  }
  
  impl SteamDeckUhidDevice {
-@@ -77,17 +225,32 @@ impl SteamDeckUhidDevice {
-             device: None,
+@@ -79,7 +227,6 @@ impl SteamDeckUhidDevice {
+         config: SteamDeckConfig,
+         persistent_id: &str,
+     ) -> Result<Self, Box<dyn Error>> {
+-        let serial_number = generate_deck_serial(persistent_id);
+         let board_serial = generate_deck_board_serial(persistent_id);
+         Ok(Self {
+             board_serial,
+@@ -91,20 +238,32 @@ impl SteamDeckUhidDevice {
              lizard_mode_enabled: false,
              queued_events: vec![],
--            serial_number: "1NPU7PLUMB3R".to_string(),
+             requested_string_attribute: StringAttribute::default(),
+-            serial_number,
 +            serial_number: deck_uhid_serial(),
              state: PackedInputDataReport::default(),
 +            pending_config: None,
@@ -2860,7 +2736,11 @@ index 786f205..81ecc0e 100644
      }
  
      /// Create the virtual device to emulate
-     fn create_virtual_device(config: &SteamDeckConfig) -> Result<UHIDDevice<File>, Box<dyn Error>> {
+-    fn create_virtual_device(
+-        config: &SteamDeckConfig,
+-        serial_number: &str,
+-    ) -> Result<UHIDDevice<File>, Box<dyn Error>> {
++    fn create_virtual_device(config: &SteamDeckConfig) -> Result<UHIDDevice<File>, Box<dyn Error>> {
 +        // [uhid] create-fd marker: a fresh virtual deck UHID fd is being created.
 +        // If this fires on a detach/dock cycle it means the deck was torn down
 +        // and re-created (vs. kept alive through the persist-gate).
@@ -2872,14 +2752,14 @@ index 786f205..81ecc0e 100644
          let device = UHIDDevice::create(CreateParams {
              name: config.name.clone(),
              phys: String::from(""),
--            uniq: String::from(""),
+-            uniq: serial_number.to_string(),
 +            // v8.3: announce a stable, non-empty serial so Steam's registry key
 +            // is fixed (see DECK_UHID_SERIAL_DEFAULT / IP_DECK_UHID_SERIAL).
 +            uniq: deck_uhid_serial(),
              bus: Bus::USB,
              vendor: VID as u32,
              product: config.product_id.to_u32(),
-@@ -99,6 +262,122 @@ impl SteamDeckUhidDevice {
+@@ -116,6 +275,122 @@ impl SteamDeckUhidDevice {
          Ok(device)
      }
  
@@ -3002,7 +2882,7 @@ index 786f205..81ecc0e 100644
      /// Write the current device state to the device
      fn write_state(&mut self) -> Result<(), Box<dyn Error>> {
          let data = self.state.pack()?;
-@@ -625,6 +904,14 @@ impl TargetInputDevice for SteamDeckUhidDevice {
+@@ -666,6 +941,14 @@ impl TargetInputDevice for SteamDeckUhidDevice {
                  Ok(config) => config,
                  Err(e) => {
                      log::error!("Failed to get composite device config. Got error: {e:?}");
@@ -3017,7 +2897,7 @@ index 786f205..81ecc0e 100644
                      return;
                  }
              };
-@@ -636,9 +923,18 @@ impl TargetInputDevice for SteamDeckUhidDevice {
+@@ -677,9 +960,18 @@ impl TargetInputDevice for SteamDeckUhidDevice {
                      device_config.product_id = ProductId::LenovoLegionGo;
                  }
                  "Lenovo Legion Go 2" => {
@@ -3039,7 +2919,7 @@ index 786f205..81ecc0e 100644
                  }
                  "Lenovo Legion Go S" => {
                      device_config.vendor = "Lenovo".to_string();
-@@ -792,16 +1088,49 @@ impl TargetInputDevice for SteamDeckUhidDevice {
+@@ -833,16 +1125,49 @@ impl TargetInputDevice for SteamDeckUhidDevice {
  
      fn stop(&mut self) -> Result<(), InputError> {
          let Some(device) = self.device.as_mut() else {
@@ -3089,7 +2969,7 @@ index 786f205..81ecc0e 100644
      }
  }
  
-@@ -809,43 +1138,155 @@ impl TargetOutputDevice for SteamDeckUhidDevice {
+@@ -850,39 +1175,155 @@ impl TargetOutputDevice for SteamDeckUhidDevice {
      /// Update the virtual device with its current state, and read unhandled
      /// USB transfers.
      fn poll(&mut self, _: &Option<CompositeDeviceClient>) -> Result<Vec<OutputEvent>, OutputError> {
@@ -3106,15 +2986,11 @@ index 786f205..81ecc0e 100644
 -                    TryRecvError::Disconnected => self.config.clone(),
 -                },
 -            };
--            let device = SteamDeckUhidDevice::create_virtual_device(&config)?;
+-            let device =
+-                SteamDeckUhidDevice::create_virtual_device(&config, self.serial_number.as_ref())?;
 -            self.device = Some(device);
 -            self.config = config;
 -            self.config_rx = None;
--            self.serial_number = format!(
--                "{:04x?}-{:04x?}-1ae1c0b",
--                VID,
--                self.config.product_id.to_u32()
--            );
 +        // ---- Configuration / publication state machine ----
 +        //
 +        // The virtual controller is not created the instant its configuration
@@ -3271,7 +3147,7 @@ index 786f205..81ecc0e 100644
                      // Write the current state
                      self.write_state()?;
                      return Ok(vec![]);
-@@ -880,6 +1321,11 @@ impl TargetOutputDevice for SteamDeckUhidDevice {
+@@ -917,6 +1358,11 @@ impl TargetOutputDevice for SteamDeckUhidDevice {
              // send UHID_INPUT events to the kernel.
              uhid_virt::OutputEvent::Open => {
                  log::debug!("Open event received");
@@ -3284,7 +3160,7 @@ index 786f205..81ecc0e 100644
              }
              // This is sent when there are no more processes which read the HID data. It is
 diff --git a/src/main.rs b/src/main.rs
-index f203a8c..d2f5e68 100644
+index 20c6b95..043d896 100644
 --- a/src/main.rs
 +++ b/src/main.rs
 @@ -44,6 +44,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
@@ -3300,10 +3176,10 @@ index f203a8c..d2f5e68 100644
      // if InputPlumber is killed before it can restore the devices.
      if let Err(e) = unhide_all().await {
 diff --git a/src/udev/device.rs b/src/udev/device.rs
-index 667725b..2627f8b 100644
+index 719a91a..138d598 100644
 --- a/src/udev/device.rs
 +++ b/src/udev/device.rs
-@@ -777,10 +777,16 @@ impl Device {
+@@ -790,10 +790,16 @@ impl Device {
          // Create a match rule based on subsystem
          let match_rule = match subsystem.as_str() {
              "hidraw" => {
@@ -3324,7 +3200,7 @@ index 667725b..2627f8b 100644
              }
              "input" => {
                  let rule_fn = || {
-@@ -815,4 +821,34 @@ impl Device {
+@@ -828,4 +834,34 @@ impl Device {
          let id = fs::read_to_string(path).ok()?;
          Some(id.replace('\n', ""))
      }

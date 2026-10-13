@@ -63,18 +63,18 @@ INSTALL_DIR="/opt/inputplumber-legiongo2-runtime"
 # suffixes were removed — they carried no meaning and confused.
 INSTALLED_BINARY="$INSTALL_DIR/inputplumber-legiongo2"
 
-# Expected sha256 of the CURRENT fix binary — v13 (rebase onto InputPlumber v0.79.1).
+# Expected sha256 of the CURRENT fix binary — v14 (rebase onto InputPlumber v0.82.0).
 #
-# v13 = our custom Legion Go 2 gyro work REBASED (merged) onto upstream
-# InputPlumber v0.79.1 (previous releases were based on v0.77.4). Upstream's
-# go1/go2 driver split (913f12c), its own Legion Go 2 suspend fix (88c547a) and
-# the steam-deck debounce removal (50263d3) are adopted; our unique logic is
-# kept: gyro calibration (RIGHT_GYRO_SCALE/CENTER_GYRO_SCALE, center from right
-# slot), live attach/detach via legion_state, gyro_center IIO<->XInput arbiter,
-# composite keep-alive/reconcile + deck-feed re-arm (FIX-1/FIX-2), deck-uhid
-# survives suspend, monotonic frame counter, publish-settle, LG2 -> Generic
-# 0x12f0 override. Binary sha 31284eb5...
-EXPECTED_SHA256="31284eb54fbcf1bd1f5b11b2183aa706f9363122608f09545a55422171876bf8"
+# v14 = our custom Legion Go 2 gyro work REBASED (merged) onto upstream
+# InputPlumber v0.82.0 (previous release was based on v0.79.1). Upstream's
+# new source-tracking model (composite_device_sources as (source, serial)
+# pairs) and the refresh_event_filter poll-loop hook are adopted; our unique
+# logic is kept: gyro calibration (RIGHT_GYRO_SCALE/CENTER_GYRO_SCALE, center
+# from right slot), live attach/detach via legion_state, gyro_center
+# IIO<->XInput arbiter, composite keep-alive/reconcile + deck-feed re-arm
+# (FIX-1/FIX-2), deck-uhid survives suspend, monotonic frame counter,
+# publish-settle, LG2 -> Generic 0x12f0 override. Binary sha 258c82b6...
+EXPECTED_SHA256="258c82b6a42d2cda84cb1fe20894835a44bd3baeb31867de59c237074f9246fa"
 #
 # Behaviour preserved from V20 (6b578eb2), which self-healed a physical detach
 # on the desktop in <=2s without touching the deck-uhid:
@@ -100,9 +100,8 @@ EXPECTED_SHA256="31284eb54fbcf1bd1f5b11b2183aa706f9363122608f09545a55422171876bf
 # 2026-09-07 (todo 53a impl): FIX-1/FIX-2 deck-feed re-arm after source re-add/dock
 # (steam_deck_uhid.rs poll Empty-branch + always-close config handshake; mod.rs
 # on_source_device_added feed-rearm marker + targets.rs rearm_deck_feed helper).
-# Rollback: previous release (v12) binary is kept as
-# inputplumber-legiongo2.bak-v12 in the runtime dir — copy it back over the
-# installed binary and `systemctl restart inputplumber` to roll back.
+# Rollback: re-run the previous release (v13) tarball's install.sh — it
+# restores the v13 (0.79.1-based) binary over the installed one.
 
 # Resolve which source binary to install, in priority order:
 #   1) the fix binary shipped next to install.sh (the repo/tarball payload)
@@ -175,7 +174,7 @@ source_sha="$(sha256sum "$SOURCE_BINARY" | awk '{print $1}')"
 if [[ "$source_sha" == "$EXPECTED_SHA256" ]]; then
     echo "Source binary sha256 OK ($source_sha)"
 else
-    echo "WARNING: source binary sha256 mismatch — this is NOT the current v13 (0.79.1-based) build:"
+    echo "WARNING: source binary sha256 mismatch — this is NOT the current v14 (0.82.0-based) build:"
     echo "  expected: $EXPECTED_SHA256"
     echo "  actual:   $source_sha"
 fi
